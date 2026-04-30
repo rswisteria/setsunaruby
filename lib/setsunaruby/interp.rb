@@ -66,17 +66,20 @@ module Setsunaruby
       # ため、すべて mrb_int (start_pos / length) のみで表現する。
       @local_starts = []        # IntArray (各 slot の名前の start_pos)
       @local_lens   = []        # IntArray (各 slot の名前の length)
-      # Stage 2: スコープ管理。@scope_base 以降の @local_starts/@local_lens が
-      # 現在のスコープ。トップレベルは 0。method 内コンパイル時のみ前進する。
+      # @scope_base 以降の @local_starts/@local_lens が現在のスコープ。
+      # トップレベルは 0、method 内コンパイル時のみ前進する。
+      # @scope_base だけでは method 内か判定できない (トップレベルにローカル
+      # 変数 0 個の状態で def に入ると @scope_base = 0 のまま) ため、
+      # @in_method フラグも併用する。
       @scope_base  = 0
       @in_method   = false
-      # Stage 2: メソッドテーブル (並列 IntArray、spinel ルール 3 遵守)。
+      # メソッドテーブル (並列 IntArray、spinel ルール 3 遵守)。
       @method_name_starts  = []   # IntArray (メソッド名の start_pos)
       @method_name_lens    = []   # IntArray (メソッド名の length)
       @method_pcs          = []   # IntArray (本体の開始 PC)
       @method_arities      = []   # IntArray (パラメータ数)
       @method_local_counts = []   # IntArray (パラメータ含むローカル変数の総数)
-      # Stage 2: VM のコールフレーム (CFP) スタック。
+      # VM のコールフレームスタック (並列 IntArray)。
       # locals の縮小は @cur_base で行うので length 自体は記録しない。
       @cfp_pcs   = []   # IntArray (戻り PC)
       @cfp_bases = []   # IntArray (戻り後の @cur_base)
@@ -712,8 +715,6 @@ module Setsunaruby
         compile_block(node)
       elsif k == :method_def
         compile_method_def(node)
-      elsif k == :method_call
-        compile_method_call(node)
       elsif k == :return_stmt
         compile_return(node)
       else
@@ -915,13 +916,19 @@ module Setsunaruby
     end
 
     def find_method(name_packed)
-      pkg_start = name_packed >> 16
-      pkg_len   = name_packed & 0xffff
-      i = 0
+      find_in_table(@method_name_starts, @method_name_lens, 0, name_packed)
+    end
+
+    # 並列 IntArray (starts, lens) で構成された name table を線形探索する。
+    # start_idx 以降だけ走査するので、スコープ相対探索 (find_local) も同じ
+    # ヘルパーで賄える。見つかれば絶対 idx を、見つからなければ -1 を返す。
+    def find_in_table(starts, lens, start_idx, packed)
+      pkg_start = packed >> 16
+      pkg_len   = packed & 0xffff
+      i = start_idx
       result = -1
-      while i < @method_name_starts.length && result < 0
-        if @method_name_lens[i] == pkg_len &&
-           bytes_eq(@method_name_starts[i], pkg_start, pkg_len)
+      while i < starts.length && result < 0
+        if lens[i] == pkg_len && bytes_eq(starts[i], pkg_start, pkg_len)
           result = i
         end
         i += 1
@@ -929,6 +936,7 @@ module Setsunaruby
       result
     end
 
+    # local_count は body コンパイル後に compile_method_def が確定させる。
     def declare_method(name_packed, method_pc, arity)
       i = find_method(name_packed)
       if i < 0
@@ -936,10 +944,9 @@ module Setsunaruby
         @method_name_lens.push(name_packed & 0xffff)
         @method_pcs.push(method_pc)
         @method_arities.push(arity)
-        @method_local_counts.push(0)   # 後で確定
+        @method_local_counts.push(0)
         i = @method_name_starts.length - 1
       else
-        # 再定義 (Ruby は警告を出すだけだが、ここでは静かに上書き)。
         @method_pcs[i] = method_pc
         @method_arities[i] = arity
         @method_local_counts[i] = 0
@@ -1028,21 +1035,15 @@ module Setsunaruby
     # ローカル変数表 (packed (start, len) → slot idx)
     # packed は (start_in_bytes << 16) | len の 32bit 値。
     # 同一名 (= byte 等しい) は同じ slot を共有する。
-    # Stage 2: @scope_base 以降が現在のスコープ。slot idx はスコープ相対で返す
+    # @scope_base 以降が現在のスコープ。slot idx はスコープ相対で返す
     # (VM は @locals[@cur_base + idx] で実体にアクセス)。
     def find_local(packed)
-      pkg_start = packed >> 16
-      pkg_len   = packed & 0xffff
-      i = @scope_base
-      result = -1
-      while i < @local_starts.length && result < 0
-        if @local_lens[i] == pkg_len &&
-           bytes_eq(@local_starts[i], pkg_start, pkg_len)
-          result = i - @scope_base
-        end
-        i += 1
+      i = find_in_table(@local_starts, @local_lens, @scope_base, packed)
+      if i < 0
+        i
+      else
+        i - @scope_base
       end
-      result
     end
 
     def declare_local(packed)
@@ -1264,27 +1265,21 @@ module Setsunaruby
       argc = @method_arities[m_idx]
       local_count = @method_local_counts[m_idx]
 
-      # 1) パラメータ領域を確保 (NIL_VAL で argc 個 push)。
+      # local_count 個のスロットを NIL_VAL で確保したあと、末尾 argc 個を
+      # スタックから逆順 pop で上書きする。3 ループ版より hot path のループ
+      # overhead が 1 回分減る。
       new_base = @locals.length
       i = 0
-      while i < argc
+      while i < local_count
         @locals.push(ObjectVal::NIL_VAL)
         i += 1
       end
-      # 2) スタック上の引数 (top が最後の引数) を逆順に書き込んで slot 0..argc-1 を埋める。
       i = argc - 1
       while i >= 0
         @locals[new_base + i] = @stack.pop
         i -= 1
       end
-      # 3) 残りのローカル変数 (body 内宣言分) を NIL_VAL で初期化。
-      i = argc
-      while i < local_count
-        @locals.push(ObjectVal::NIL_VAL)
-        i += 1
-      end
 
-      # 4) コールフレームを保存して @pc / @cur_base を切替。
       @cfp_pcs.push(@pc)
       @cfp_bases.push(@cur_base)
       @cur_base = new_base
