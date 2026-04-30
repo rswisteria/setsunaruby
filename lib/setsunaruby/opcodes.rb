@@ -24,6 +24,10 @@ module Setsunaruby
     GE = 0x24
 
     PUTS = 0x30
+
+    CALL   = 0x40   # operand: SLEB128 method_idx
+    RETURN = 0x41
+
     HALT = 0xFF
   end
 end

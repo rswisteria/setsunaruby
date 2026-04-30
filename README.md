@@ -7,9 +7,9 @@ Ruby 文法を持つ、スタックマシン型プログラミング言語の処
 「刹那」(10⁻¹⁸) から命名。mruby / nanoruby / picoruby に続く、
 さらに小さな Ruby 系列という位置付け。
 
-## 現状: Stage 0 / 0.5 / 1 完了
+## 現状: Stage 0 / 0.5 / 1 / 2 完了
 
-スタックマシン上で **FizzBuzz が CRuby + spinel AOT 両方で動作**。
+スタックマシン上で **再帰 `fib(20)` / アッカーマン / tarai が CRuby + spinel AOT 両方で動作**。
 
 実装機能:
 
@@ -21,10 +21,15 @@ Ruby 文法を持つ、スタックマシン型プログラミング言語の処
 - 括弧によるグルーピング
 - `puts <expr>` (Ruby と完全一致の出力セマンティクス)
 - 行コメント `#` (マルチバイトコメント対応)
-- **ローカル変数の代入と参照** `x = 1`, `y = x + 1` (右結合)
-- **`if / elsif / else / end`** (Ruby 同様の式扱い、値を返す)
-- **`while / end`** ループ
-- **truthy/falsy**: `nil` と `false` のみ偽、それ以外は真 (0 も真)
+- ローカル変数の代入と参照 `x = 1`, `y = x + 1` (右結合)
+- `if / elsif / else / end` (Ruby 同様の式扱い、値を返す)
+- `while / end` ループ
+- truthy/falsy: `nil` と `false` のみ偽、それ以外は真 (0 も真)
+- **トップレベル `def name(p1, p2) ... end`** メソッド定義
+- **メソッド呼び出し** `name(arg1, arg2)` (引数 0 個は `()` 省略可)
+- **再帰** (自己再帰のみ。1 パスコンパイラのため相互再帰は不可)
+- **`return <expr>`** 早期離脱 (省略時の戻り値は最後の式)
+- **値渡しと独立スコープ** (メソッド内ローカルはトップレベルと別領域)
 
 ## クイックスタート
 
@@ -38,7 +43,7 @@ make build       # ./setsunaruby を生成
 # AOT 実行
 ./setsunaruby examples/hello.rb
 
-# テスト (CRuby 38件 + AOT 29件)
+# テスト (CRuby Stage 0:38 + Stage 1:28 + Stage 2:26 / AOT:47)
 make test-cruby
 make test-aot
 make test-all
@@ -109,6 +114,8 @@ CRuby の `VALUE` を踏襲したタグ付き即値方式。
 | ADD / SUB / MUL / DIV / MOD | 0x10–0x14 | – | 二項演算 |
 | EQ / LT / GT / LE / GE | 0x20–0x24 | – | 比較 |
 | PUTS | 0x30 | – | top を pop して出力、nil を push |
+| CALL | 0x40 | SLEB128 method_idx | メソッド呼び出し (引数 argc 個 pop、結果 push) |
+| RETURN | 0x41 | – | コールフレーム破棄して呼び出し元へ |
 | HALT | 0xFF | – | 終了 |
 
 ジャンプオフセットは patch up の都合で **固定 3 バイト SLEB128** (±1M バイト範囲)。
@@ -132,6 +139,11 @@ spinel の型推論で混同されるのを防いでいる。
 - `:if_expr` → `node_left` (cond)、`node_right` (then_body)、`node_operand` (else_body / nil)
 - `:while_stmt` → `node_left` (cond)、`node_right` (body)
 - `:seq` → `node_left` (current stmt)、`node_operand` (rest of seq)
+- `:method_def` → `node_int_value` (名前 packed)、`node_left` (`:param_cons` チェーン)、`node_operand` (body)
+- `:method_call` → `node_int_value` (名前 packed)、`node_left` (`:arg_cons` チェーン)
+- `:return_stmt` → `node_operand` (戻り値式)
+- `:param_cons` → `node_int_value` (param 名 packed)、`node_operand` (次の `:param_cons` or nil)
+- `:arg_cons` → `node_left` (引数式)、`node_operand` (次の `:arg_cons` or nil)
 
 ローカル変数名は **`@bytes` 上のバイト範囲 (start, len) で識別**。
 Symbol/sp_sym を経由すると spinel の Token フィールド型推論が崩壊するため、
@@ -144,7 +156,7 @@ Symbol/sp_sym を経由すると spinel の Token フィールド型推論が崩
 | 0 | 算術スタックマシン (式と puts のみ) | ✅ 完了 |
 | 0.5 | spinel 互換 + AOT ビルド | ✅ 完了 |
 | 1 | ローカル変数 + 制御構造 (if/while) | ✅ 完了 (FizzBuzz 動作) |
-| 2 | メソッド定義 + 呼び出し + 再帰 | 未着手 |
+| 2 | メソッド定義 + 呼び出し + 再帰 | ✅ 完了 (fib(20) / アッカーマン / tarai 動作) |
 | JIT | ホットメソッド検出 + コード生成 | 未着手 |
 | 3+ | 文字列・配列・ブロック・クラス・例外 | 未着手 |
 | ∞ | 自己ホスト (setsunaruby を setsunaruby で動かす) | 究極目標 |
@@ -165,11 +177,13 @@ Symbol/sp_sym を経由すると spinel の Token フィールド型推論が崩
 ├── examples/
 │   ├── hello.rb
 │   ├── arith.rb
-│   └── fizzbuzz.rb           # Stage 1: ローカル変数 + 制御構造のショーケース
+│   ├── fizzbuzz.rb           # Stage 1: ローカル変数 + 制御構造のショーケース
+│   └── fib.rb                # Stage 2: 再帰のショーケース
 ├── test/
 │   ├── test_stage0.rb        # CRuby Stage 0 テスト (38件)
 │   ├── test_stage1.rb        # CRuby Stage 1 テスト (28件)
-│   └── test_aot.rb           # AOT テスト (36件)
+│   ├── test_stage2.rb        # CRuby Stage 2 テスト (26件)
+│   └── test_aot.rb           # AOT テスト (47件)
 ├── setsunaruby               # spinel ビルド成果物 (gitignore)
 └── Makefile
 ```
