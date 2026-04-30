@@ -20,6 +20,7 @@ module Setsunaruby
     RP    = 41
     STAR_BYTE  = 42
     PLUS_BYTE  = 43
+    COMMA_BYTE = 44
     MINUS_BYTE = 45
     SLASH_BYTE = 47
     PCT   = 37
@@ -44,8 +45,10 @@ module Setsunaruby
     KW_ELSIF_BYTES = [101, 108, 115, 105, 102].freeze         # "elsif"
     KW_ELSE_BYTES  = [101, 108, 115, 101].freeze              # "else"
     KW_END_BYTES   = [101, 110, 100].freeze                   # "end"
-    KW_WHILE_BYTES = [119, 104, 105, 108, 101].freeze         # "while"
-    KW_THEN_BYTES  = [116, 104, 101, 110].freeze              # "then"
+    KW_WHILE_BYTES  = [119, 104, 105, 108, 101].freeze        # "while"
+    KW_THEN_BYTES   = [116, 104, 101, 110].freeze             # "then"
+    KW_DEF_BYTES    = [100, 101, 102].freeze                  # "def"
+    KW_RETURN_BYTES = [114, 101, 116, 117, 114, 110].freeze   # "return"
 
     def initialize
       @src       = ""
@@ -63,6 +66,21 @@ module Setsunaruby
       # ため、すべて mrb_int (start_pos / length) のみで表現する。
       @local_starts = []        # IntArray (各 slot の名前の start_pos)
       @local_lens   = []        # IntArray (各 slot の名前の length)
+      # Stage 2: スコープ管理。@scope_base 以降の @local_starts/@local_lens が
+      # 現在のスコープ。トップレベルは 0。method 内コンパイル時のみ前進する。
+      @scope_base  = 0
+      @in_method   = false
+      # Stage 2: メソッドテーブル (並列 IntArray、spinel ルール 3 遵守)。
+      @method_name_starts  = []   # IntArray (メソッド名の start_pos)
+      @method_name_lens    = []   # IntArray (メソッド名の length)
+      @method_pcs          = []   # IntArray (本体の開始 PC)
+      @method_arities      = []   # IntArray (パラメータ数)
+      @method_local_counts = []   # IntArray (パラメータ含むローカル変数の総数)
+      # Stage 2: VM のコールフレーム (CFP) スタック。
+      # locals の縮小は @cur_base で行うので length 自体は記録しない。
+      @cfp_pcs   = []   # IntArray (戻り PC)
+      @cfp_bases = []   # IntArray (戻り後の @cur_base)
+      @cur_base  = 0    # 現在実行中の locals base
     end
 
     def run_file(path)
@@ -79,6 +97,16 @@ module Setsunaruby
       @pc           = 0
       @local_starts = []
       @local_lens   = []
+      @scope_base   = 0
+      @in_method    = false
+      @method_name_starts  = []
+      @method_name_lens    = []
+      @method_pcs          = []
+      @method_arities      = []
+      @method_local_counts = []
+      @cfp_pcs   = []
+      @cfp_bases = []
+      @cur_base  = 0
 
       @cur_token = next_token
       while !at_end?
@@ -195,6 +223,10 @@ module Setsunaruby
         result = TokenKind::KW_WHILE
       elsif match_bytes(start, len, KW_THEN_BYTES)
         result = TokenKind::KW_THEN
+      elsif match_bytes(start, len, KW_DEF_BYTES)
+        result = TokenKind::KW_DEF
+      elsif match_bytes(start, len, KW_RETURN_BYTES)
+        result = TokenKind::KW_RETURN
       end
       result
     end
@@ -237,6 +269,9 @@ module Setsunaruby
       elsif b == RP
         @lex_pos += 1
         Token.new(TokenKind::RPAREN, 0, "", @line)
+      elsif b == COMMA_BYTE
+        @lex_pos += 1
+        Token.new(TokenKind::COMMA, 0, "", @line)
       elsif b == EQ
         if @lex_pos + 1 < @bytes.length && @bytes[@lex_pos + 1] == EQ
           @lex_pos += 2
@@ -303,6 +338,8 @@ module Setsunaruby
     # statement := 'puts' expression
     #            | 'if' ... 'end'
     #            | 'while' ... 'end'
+    #            | 'def' name '(' params ')' body 'end'
+    #            | 'return' [expression]
     #            | expression  (代入や var_ref を含む)
     def parse_statement
       k = @cur_token.kind
@@ -314,6 +351,10 @@ module Setsunaruby
         return parse_if
       elsif k == TokenKind::KW_WHILE
         return parse_while
+      elsif k == TokenKind::KW_DEF
+        return parse_def
+      elsif k == TokenKind::KW_RETURN
+        return parse_return
       else
         return parse_expression
       end
@@ -427,6 +468,79 @@ module Setsunaruby
       ASTNode.new(:while_stmt, 0, false, :nop, cond, body, nil)
     end
 
+    # def name [( param (, param)* )] body end
+    # メソッド定義はトップレベル文。引数 0 個のときは括弧省略可。
+    def parse_def
+      @cur_token = next_token  # consume `def`
+      if @cur_token.kind != TokenKind::IDENT
+        raise "Parse error: line #{@cur_token.line}: メソッド名が必要です"
+      end
+      name_packed = @cur_token.int_value
+      @cur_token = next_token
+
+      params = nil
+      if @cur_token.kind == TokenKind::LPAREN
+        @cur_token = next_token
+        params = parse_param_list
+        expect(TokenKind::RPAREN)
+      end
+      skip_newlines
+      body = parse_block
+      expect(TokenKind::KW_END)
+      ASTNode.new(:method_def, name_packed, false, :nop, params, nil, body)
+    end
+
+    # 0 個以上のパラメータを :param_cons リンクリストとしてパース。
+    # node_int_value: パラメータ名 packed
+    # node_operand:   次の :param_cons または nil
+    def parse_param_list
+      if @cur_token.kind == TokenKind::RPAREN
+        return nil
+      end
+      if @cur_token.kind != TokenKind::IDENT
+        raise "Parse error: line #{@cur_token.line}: パラメータ名が必要です"
+      end
+      pkt = @cur_token.int_value
+      @cur_token = next_token
+      rest = nil
+      if @cur_token.kind == TokenKind::COMMA
+        @cur_token = next_token
+        rest = parse_param_list
+      end
+      ASTNode.new(:param_cons, pkt, false, :nop, nil, nil, rest)
+    end
+
+    # 0 個以上の引数式を :arg_cons リンクリストとしてパース。
+    # node_left:    引数の式 AST
+    # node_operand: 次の :arg_cons または nil
+    def parse_arg_list
+      if @cur_token.kind == TokenKind::RPAREN
+        return nil
+      end
+      arg = parse_expression
+      rest = nil
+      if @cur_token.kind == TokenKind::COMMA
+        @cur_token = next_token
+        rest = parse_arg_list
+      end
+      ASTNode.new(:arg_cons, 0, false, :nop, arg, nil, rest)
+    end
+
+    # return [expression]
+    def parse_return
+      @cur_token = next_token  # consume `return`
+      k = @cur_token.kind
+      val = nil
+      if k == TokenKind::NEWLINE || k == TokenKind::EOF ||
+         k == TokenKind::KW_END  || k == TokenKind::KW_ELSE ||
+         k == TokenKind::KW_ELSIF
+        val = ASTNode.new(:nil_lit, 0, false, :nop, nil, nil, nil)
+      else
+        val = parse_expression
+      end
+      ASTNode.new(:return_stmt, 0, false, :nop, nil, nil, val)
+    end
+
     def skip_then_or_newlines
       if @cur_token.kind == TokenKind::KW_THEN
         @cur_token = next_token
@@ -495,6 +609,13 @@ module Setsunaruby
           value = parse_expression
           # :assign は名前 packed を node_int_value に格納
           return ASTNode.new(:assign, packed, false, :nop, value, nil, nil)
+        elsif @cur_token.kind == TokenKind::LPAREN
+          # メソッド呼び出し: ident '(' args ')'
+          @cur_token = next_token
+          args = parse_arg_list
+          expect(TokenKind::RPAREN)
+          left_node = ASTNode.new(:method_call, packed, false, :nop, args, nil, nil)
+          return parse_expression_from(left_node, line)
         else
           left_node = ASTNode.new(:var_ref, packed, false, :nop, nil, nil, nil)
           return parse_expression_from(left_node, line)
@@ -545,7 +666,14 @@ module Setsunaruby
       elsif k == TokenKind::IDENT
         packed = @cur_token.int_value   # (start << 16) | len の packed 値
         @cur_token = next_token
-        ASTNode.new(:var_ref, packed, false, :nop, nil, nil, nil)
+        if @cur_token.kind == TokenKind::LPAREN
+          @cur_token = next_token
+          args = parse_arg_list
+          expect(TokenKind::RPAREN)
+          ASTNode.new(:method_call, packed, false, :nop, args, nil, nil)
+        else
+          ASTNode.new(:var_ref, packed, false, :nop, nil, nil, nil)
+        end
       elsif k == TokenKind::LPAREN
         @cur_token = next_token
         expr = parse_expression
@@ -582,6 +710,12 @@ module Setsunaruby
         compile_while(node)
       elsif k == :seq
         compile_block(node)
+      elsif k == :method_def
+        compile_method_def(node)
+      elsif k == :method_call
+        compile_method_call(node)
+      elsif k == :return_stmt
+        compile_return(node)
       else
         compile_expr(node)
       end
@@ -622,9 +756,23 @@ module Setsunaruby
         compile_expr(node.node_operand)
         @bytecode.push(Op::SUB)
       elsif k == :var_ref
-        idx = lookup_local(node.node_int_value)
-        @bytecode.push(Op::LOAD_LOCAL)
-        encode_signed(idx)
+        pkt = node.node_int_value
+        idx = find_local(pkt)
+        if idx >= 0
+          @bytecode.push(Op::LOAD_LOCAL)
+          encode_signed(idx)
+        else
+          # Ruby と同様、ローカルとして未定義なら 0 引数メソッド呼び出しに解決する。
+          m_idx = find_method(pkt)
+          if m_idx < 0
+            raise "Compile error: line #{@cur_token.line}: undefined local variable or method"
+          end
+          if @method_arities[m_idx] != 0
+            raise "Compile error: line #{@cur_token.line}: 引数の個数が一致しません (期待 #{@method_arities[m_idx]}, 実際 0)"
+          end
+          @bytecode.push(Op::CALL)
+          encode_signed(m_idx)
+        end
       elsif k == :assign
         # 式の中の代入 (例: x = (y = 1))
         compile_expr(node.node_left)
@@ -641,6 +789,8 @@ module Setsunaruby
         # 式の中の puts (puts は nil を push する)
         compile_expr(node.node_operand)
         @bytecode.push(Op::PUTS)
+      elsif k == :method_call
+        compile_method_call(node)
       else
         raise "Compiler bug: unknown expression kind #{k}"
       end
@@ -664,6 +814,137 @@ module Setsunaruby
       end
       patch_jump(jend_pos, @bytecode.length)
       nil
+    end
+
+    def compile_method_def(node)
+      if @in_method
+        raise "Compile error: メソッド定義はトップレベルでのみ許可されています"
+      end
+
+      # トップレベル制御フローからメソッド本体を skip するためのジャンプ。
+      skip_jump_pos = emit_jump(Op::JUMP)
+      method_pc = @bytecode.length
+
+      name_packed = node.node_int_value
+      arity = count_arg_chain(node.node_left)
+      m_idx = declare_method(name_packed, method_pc, arity)
+
+      # 新しいスコープに進入。@local_starts/@local_lens は共有のまま、
+      # @scope_base 以降を「現在のスコープ」とみなす。
+      saved_scope_base = @scope_base
+      @scope_base = @local_starts.length
+      @in_method = true
+
+      # パラメータを slot 0..argc-1 に登録。declare_local は @scope_base 相対の
+      # slot idx (= 0..argc-1) を返す。
+      declare_params(node.node_left)
+
+      # body をコンパイル (compile_stmt は常に値を 1 つスタックに残す)。
+      compile_stmt(node.node_operand)
+      @bytecode.push(Op::RETURN)
+
+      # メソッドのローカル変数総数 (パラメータ + body 内宣言) を確定。
+      @method_local_counts[m_idx] = @local_starts.length - @scope_base
+
+      # スコープから抜ける。method 内で使ったローカル名は捨てる。
+      while @local_starts.length > @scope_base
+        @local_starts.pop
+        @local_lens.pop
+      end
+      @scope_base = saved_scope_base
+      @in_method = false
+
+      patch_jump(skip_jump_pos, @bytecode.length)
+      # def 文自体の値は nil (compile_stmt の不変条件「1 値残す」を維持)。
+      @bytecode.push(Op::PUSH_NIL)
+      nil
+    end
+
+    def compile_method_call(node)
+      name_packed = node.node_int_value
+      m_idx = find_method(name_packed)
+      if m_idx < 0
+        raise "Compile error: line #{@cur_token.line}: 未定義のメソッド呼び出しです"
+      end
+      expected = @method_arities[m_idx]
+      argc = count_arg_chain(node.node_left)
+      if expected != argc
+        raise "Compile error: line #{@cur_token.line}: 引数の個数が一致しません (期待 #{expected}, 実際 #{argc})"
+      end
+      # 引数を左から右の順に評価して push (stack top が最後の引数)。
+      cur = node.node_left
+      while cur != nil
+        compile_expr(cur.node_left)
+        cur = cur.node_operand
+      end
+      @bytecode.push(Op::CALL)
+      encode_signed(m_idx)
+      nil
+    end
+
+    def compile_return(node)
+      if !@in_method
+        raise "Compile error: return はメソッド内でのみ使用できます"
+      end
+      compile_expr(node.node_operand)
+      @bytecode.push(Op::RETURN)
+      # compile_stmt の「常に 1 値を残す」契約を保つための死コード。
+      # 実際の制御フローは到達しない。
+      @bytecode.push(Op::PUSH_NIL)
+      nil
+    end
+
+    # arg_cons / param_cons リンクリストの長さを数える。
+    # spinel が `cur = node` の代入で型推論を壊すため、別ローカル変数を作らず
+    # パラメータ自身を再代入してループする。
+    def count_arg_chain(node)
+      c = 0
+      while node != nil
+        c += 1
+        node = node.node_operand
+      end
+      c
+    end
+
+    def declare_params(node)
+      while node != nil
+        declare_local(node.node_int_value)
+        node = node.node_operand
+      end
+      nil
+    end
+
+    def find_method(name_packed)
+      pkg_start = name_packed >> 16
+      pkg_len   = name_packed & 0xffff
+      i = 0
+      result = -1
+      while i < @method_name_starts.length && result < 0
+        if @method_name_lens[i] == pkg_len &&
+           bytes_eq(@method_name_starts[i], pkg_start, pkg_len)
+          result = i
+        end
+        i += 1
+      end
+      result
+    end
+
+    def declare_method(name_packed, method_pc, arity)
+      i = find_method(name_packed)
+      if i < 0
+        @method_name_starts.push(name_packed >> 16)
+        @method_name_lens.push(name_packed & 0xffff)
+        @method_pcs.push(method_pc)
+        @method_arities.push(arity)
+        @method_local_counts.push(0)   # 後で確定
+        i = @method_name_starts.length - 1
+      else
+        # 再定義 (Ruby は警告を出すだけだが、ここでは静かに上書き)。
+        @method_pcs[i] = method_pc
+        @method_arities[i] = arity
+        @method_local_counts[i] = 0
+      end
+      i
     end
 
     def compile_while(node)
@@ -747,15 +1028,17 @@ module Setsunaruby
     # ローカル変数表 (packed (start, len) → slot idx)
     # packed は (start_in_bytes << 16) | len の 32bit 値。
     # 同一名 (= byte 等しい) は同じ slot を共有する。
+    # Stage 2: @scope_base 以降が現在のスコープ。slot idx はスコープ相対で返す
+    # (VM は @locals[@cur_base + idx] で実体にアクセス)。
     def find_local(packed)
       pkg_start = packed >> 16
       pkg_len   = packed & 0xffff
-      i = 0
+      i = @scope_base
       result = -1
       while i < @local_starts.length && result < 0
         if @local_lens[i] == pkg_len &&
            bytes_eq(@local_starts[i], pkg_start, pkg_len)
-          result = i
+          result = i - @scope_base
         end
         i += 1
       end
@@ -767,7 +1050,7 @@ module Setsunaruby
       if i < 0
         @local_starts.push(packed >> 16)
         @local_lens.push(packed & 0xffff)
-        i = @local_starts.length - 1
+        i = @local_starts.length - 1 - @scope_base
       end
       i
     end
@@ -816,10 +1099,10 @@ module Setsunaruby
           @stack.pop
         elsif op == Op::STORE_LOCAL
           idx = decode_signed
-          @locals[idx] = @stack[@stack.length - 1]   # top を「読む」(pop しない)
+          @locals[@cur_base + idx] = @stack[@stack.length - 1]   # top を「読む」(pop しない)
         elsif op == Op::LOAD_LOCAL
           idx = decode_signed
-          @stack.push(@locals[idx])
+          @stack.push(@locals[@cur_base + idx])
         elsif op == Op::JUMP
           rel = decode_signed_3
           @pc = @pc + rel
@@ -853,6 +1136,10 @@ module Setsunaruby
           v = @stack.pop
           puts to_puts_string(v)
           @stack.push(ObjectVal::NIL_VAL)   # Stage 1: puts は nil を返す
+        elsif op == Op::CALL
+          exec_call
+        elsif op == Op::RETURN
+          exec_return
         elsif op == Op::HALT
           return nil
         else
@@ -969,6 +1256,51 @@ module Setsunaruby
       rhs = @stack.pop
       lhs = @stack.pop
       @stack.push(box_bool(lhs == rhs))
+      nil
+    end
+
+    def exec_call
+      m_idx = decode_signed
+      argc = @method_arities[m_idx]
+      local_count = @method_local_counts[m_idx]
+
+      # 1) パラメータ領域を確保 (NIL_VAL で argc 個 push)。
+      new_base = @locals.length
+      i = 0
+      while i < argc
+        @locals.push(ObjectVal::NIL_VAL)
+        i += 1
+      end
+      # 2) スタック上の引数 (top が最後の引数) を逆順に書き込んで slot 0..argc-1 を埋める。
+      i = argc - 1
+      while i >= 0
+        @locals[new_base + i] = @stack.pop
+        i -= 1
+      end
+      # 3) 残りのローカル変数 (body 内宣言分) を NIL_VAL で初期化。
+      i = argc
+      while i < local_count
+        @locals.push(ObjectVal::NIL_VAL)
+        i += 1
+      end
+
+      # 4) コールフレームを保存して @pc / @cur_base を切替。
+      @cfp_pcs.push(@pc)
+      @cfp_bases.push(@cur_base)
+      @cur_base = new_base
+      @pc = @method_pcs[m_idx]
+      nil
+    end
+
+    def exec_return
+      v = @stack.pop
+      # 自スコープのローカル領域を破棄 (caller の base に戻す)。
+      while @locals.length > @cur_base
+        @locals.pop
+      end
+      @cur_base = @cfp_bases.pop
+      @pc = @cfp_pcs.pop
+      @stack.push(v)
       nil
     end
 

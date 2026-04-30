@@ -110,11 +110,86 @@ assert_output(File.read(File.expand_path('../examples/fizzbuzz.rb', __dir__)),
               }.join("\n") + "\n",
               "FizzBuzz 1-30")
 
+# ---- Stage 2: メソッド定義 + 呼び出し + 再帰 ----
+assert_output("def add(a, b)\n  a + b\nend\nputs add(3, 4)\n", "7\n", "メソッド 2 引数")
+assert_output("def f\n  42\nend\nputs f\n",                   "42\n", "引数なしメソッド")
+assert_output("def sq(x)\n  x * x\nend\nputs sq(7)\n",        "49\n", "メソッド呼び出し (式中)")
+fib_aot = <<~RUBY
+  def fib(n)
+    if n < 2
+      n
+    else
+      fib(n - 1) + fib(n - 2)
+    end
+  end
+  puts fib(10)
+  puts fib(20)
+RUBY
+assert_output(fib_aot, "55\n6765\n", "fib(20) 受け入れ条件")
+fact_aot = <<~RUBY
+  def fact(n)
+    if n <= 1
+      1
+    else
+      n * fact(n - 1)
+    end
+  end
+  puts fact(10)
+RUBY
+assert_output(fact_aot, "3628800\n", "factorial(10)")
+ack_aot = <<~RUBY
+  def ack(m, n)
+    if m == 0
+      n + 1
+    elsif n == 0
+      ack(m - 1, 1)
+    else
+      ack(m - 1, ack(m, n - 1))
+    end
+  end
+  puts ack(3, 3)
+RUBY
+assert_output(ack_aot, "61\n", "アッカーマン関数")
+tarai_aot = <<~RUBY
+  def tarai(x, y, z)
+    if x <= y
+      y
+    else
+      tarai(tarai(x - 1, y, z), tarai(y - 1, z, x), tarai(z - 1, x, y))
+    end
+  end
+  puts tarai(6, 3, 0)
+RUBY
+assert_output(tarai_aot, "6\n", "tarai 関数")
+early_aot = <<~RUBY
+  def abs(n)
+    if n < 0
+      return -n
+    end
+    n
+  end
+  puts abs(-7)
+  puts abs(3)
+RUBY
+assert_output(early_aot, "7\n3\n", "return で早期離脱")
+scope_aot = <<~RUBY
+  def f
+    x = 99
+    x
+  end
+  x = 1
+  puts f
+  puts x
+RUBY
+assert_output(scope_aot, "99\n1\n", "メソッド内ローカルとトップレベルの分離")
+
 # ---- エラー系 ----
 assert_fails("puts 1 / 0\n",     "ゼロ除算")
 assert_fails("puts true + 1\n",  "型エラー")
 assert_fails("puts (1 + 2\n",    "閉じ括弧不足")
 assert_fails("puts y\n",          "未定義変数")
+assert_fails("def f(a)\n  a\nend\nputs f(1, 2)\n", "引数 過剰 (Stage 2)")
+assert_fails("return 1\n",                          "トップレベル return 禁止 (Stage 2)")
 
 puts ""
 puts "#{$pass} passed, #{$fail} failed (AOT)"

@@ -10,9 +10,11 @@ module Setsunaruby
     KW_ELSIF = :kw_elsif
     KW_ELSE  = :kw_else
     KW_END   = :kw_end
-    KW_WHILE = :kw_while
-    KW_THEN  = :kw_then
-    PLUS     = :plus
+    KW_WHILE  = :kw_while
+    KW_THEN   = :kw_then
+    KW_DEF    = :kw_def
+    KW_RETURN = :kw_return
+    PLUS      = :plus
     MINUS    = :minus
     STAR     = :star
     SLASH    = :slash
@@ -25,6 +27,7 @@ module Setsunaruby
     GE       = :ge
     LPAREN   = :lparen
     RPAREN   = :rparen
+    COMMA    = :comma
     NEWLINE  = :newline
     EOF      = :eof
   end
