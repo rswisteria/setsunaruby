@@ -13,8 +13,15 @@ build:
 run-cruby:
 	ruby $(ENTRY) $(ARGS)
 
-test:
+test: test-cruby
+
+test-cruby:
 	ruby test/test_stage0.rb
+
+test-aot: build
+	ruby test/test_aot.rb
+
+test-all: test-cruby test-aot
 
 clean:
 	rm -f setsunaruby setsunaruby.c
