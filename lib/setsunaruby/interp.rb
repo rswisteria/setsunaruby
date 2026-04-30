@@ -6,17 +6,10 @@ require_relative 'object'
 module Setsunaruby
   # Lexer / Parser / Compiler / VM を統合した1パス実行器。
   #
-  # 設計理由: spinel の whole-program 型推論は、Token / ASTNode のような
-  # ユーザクラスの配列 (PtrArray) を保持すると instance variable の型が
-  # sp_RbVal (poly) に決め打ちされ、下流のメソッドの型推論が連鎖的に崩壊
-  # して segfault に至る。
-  #
-  # 解決策: 中間配列を持たないストリーミング処理。
-  #   - tokenize → parse: 単一の lookahead Token (@cur_token) のみ保持
-  #   - parse → compile: parse_statement が返した ASTNode を即 compile_statement へ
-  #   - compile → vm: 全 statement を compile し終わってから run
-  # 結果として残る配列は @bytecode (IntArray) と @stack (IntArray) のみで、
-  # spinel の型推論が安定する。
+  # Stage 1 で追加: ローカル変数 + 制御構造 (if/while)。
+  # 中間配列の保持を避けるストリーミング処理は維持し、コンパイル時に
+  # ローカル変数名 (Symbol) を @local_names IntArray (sp_sym 配列) に
+  # 蓄積する。VM 実行時は @locals IntArray (obj_id) を slot 番号でアクセス。
   class Interp
     # ---- ASCII コード定数 (Lexer 用) ----
     NL    = 10
@@ -41,20 +34,35 @@ module Setsunaruby
     A_UC  = 65
     Z_UC  = 90
 
-    KW_PUTS_BYTES  = [112, 117, 116, 115].freeze
-    KW_TRUE_BYTES  = [116, 114, 117, 101].freeze
-    KW_FALSE_BYTES = [102, 97, 108, 115, 101].freeze
-    KW_NIL_BYTES   = [110, 105, 108].freeze
+    # キーワードバイト列。spinel の sp_String / const char* 不整合を避けるため
+    # 文字列ではなくバイト配列で直接比較する。
+    KW_PUTS_BYTES  = [112, 117, 116, 115].freeze              # "puts"
+    KW_TRUE_BYTES  = [116, 114, 117, 101].freeze              # "true"
+    KW_FALSE_BYTES = [102, 97, 108, 115, 101].freeze          # "false"
+    KW_NIL_BYTES   = [110, 105, 108].freeze                   # "nil"
+    KW_IF_BYTES    = [105, 102].freeze                        # "if"
+    KW_ELSIF_BYTES = [101, 108, 115, 105, 102].freeze         # "elsif"
+    KW_ELSE_BYTES  = [101, 108, 115, 101].freeze              # "else"
+    KW_END_BYTES   = [101, 110, 100].freeze                   # "end"
+    KW_WHILE_BYTES = [119, 104, 105, 108, 101].freeze         # "while"
+    KW_THEN_BYTES  = [116, 104, 101, 110].freeze              # "then"
 
     def initialize
       @src       = ""
       @bytes     = []
       @lex_pos   = 0
       @line      = 1
-      @cur_token = nil          # lookahead 1
+      @cur_token = nil
       @bytecode  = []           # IntArray
       @stack     = []           # IntArray
       @pc        = 0
+      @locals    = []           # IntArray (obj_id を slot 番号でアクセス)
+      # ローカル変数名は「@bytes 上のバイト範囲」で識別する (Symbol 不使用)。
+      # 同じ名前の変数は同じ slot を共有する。
+      # spinel に Symbol/sp_sym を扱わせると Token フィールドの型推論が崩壊する
+      # ため、すべて mrb_int (start_pos / length) のみで表現する。
+      @local_starts = []        # IntArray (各 slot の名前の start_pos)
+      @local_lens   = []        # IntArray (各 slot の名前の length)
     end
 
     def run_file(path)
@@ -62,17 +70,17 @@ module Setsunaruby
     end
 
     def run_string(src)
-      @src      = src
-      @bytes    = src.bytes
-      @lex_pos  = 0
-      @line     = 1
-      @bytecode = []
-      @stack    = []
-      @pc       = 0
+      @src          = src
+      @bytes        = src.bytes
+      @lex_pos      = 0
+      @line         = 1
+      @bytecode     = []
+      @stack        = []
+      @pc           = 0
+      @local_starts = []
+      @local_lens   = []
 
-      # 最初のトークンを先読み
       @cur_token = next_token
-      # parse and compile in one pass
       while !at_end?
         skip_newlines
         if at_end?
@@ -80,9 +88,19 @@ module Setsunaruby
         end
         stmt = parse_statement
         consume_terminator
-        compile_statement(stmt)
+        compile_stmt(stmt)
+        @bytecode.push(Op::POP)
       end
       @bytecode.push(Op::HALT)
+
+      # @locals を local 数分 NIL_VAL で初期化
+      @locals = []
+      i = 0
+      while i < @local_starts.length
+        @locals.push(ObjectVal::NIL_VAL)
+        i += 1
+      end
+
       run_vm
       nil
     end
@@ -91,7 +109,6 @@ module Setsunaruby
     # Lexer (1トークンずつ返す)
     # ============================================================
 
-    # 次のトークンを返す。EOF に達したら EOF Token を返す。
     def next_token
       while @lex_pos < @bytes.length
         b = @bytes[@lex_pos]
@@ -110,7 +127,7 @@ module Setsunaruby
         elsif digit?(b)
           return read_number
         elsif ident_start?(b)
-          return read_keyword
+          return read_ident_or_keyword
         else
           return read_punct(b)
         end
@@ -139,17 +156,21 @@ module Setsunaruby
       Token.new(TokenKind::INT, n, "", @line)
     end
 
-    def read_keyword
+    def read_ident_or_keyword
       start = @lex_pos
       while @lex_pos < @bytes.length && ident_cont?(@bytes[@lex_pos])
         @lex_pos += 1
       end
       len = @lex_pos - start
       kw = match_keyword(start, len)
-      if kw == :nop
-        raise "Lexer error: line #{@line}: Stage 0 はキーワードのみサポート (puts/true/false/nil)"
+      if kw != :nop
+        return Token.new(kw, 0, "", @line)
       end
-      Token.new(kw, 0, "", @line)
+      # IDENT: 名前は @bytes 上の (start, len) で識別する。
+      # 識別子の最大長を 2^16 と仮定し、(start << 16) | len を int_value に格納。
+      # Symbol/String を経由せず純粋に整数で扱うことで spinel の型推論を安定させる。
+      packed = (start << 16) | len
+      Token.new(TokenKind::IDENT, packed, "", @line)
     end
 
     def match_keyword(start, len)
@@ -162,6 +183,18 @@ module Setsunaruby
         result = TokenKind::KW_FALSE
       elsif match_bytes(start, len, KW_NIL_BYTES)
         result = TokenKind::KW_NIL
+      elsif match_bytes(start, len, KW_IF_BYTES)
+        result = TokenKind::KW_IF
+      elsif match_bytes(start, len, KW_ELSIF_BYTES)
+        result = TokenKind::KW_ELSIF
+      elsif match_bytes(start, len, KW_ELSE_BYTES)
+        result = TokenKind::KW_ELSE
+      elsif match_bytes(start, len, KW_END_BYTES)
+        result = TokenKind::KW_END
+      elsif match_bytes(start, len, KW_WHILE_BYTES)
+        result = TokenKind::KW_WHILE
+      elsif match_bytes(start, len, KW_THEN_BYTES)
+        result = TokenKind::KW_THEN
       end
       result
     end
@@ -209,7 +242,8 @@ module Setsunaruby
           @lex_pos += 2
           Token.new(TokenKind::EQ_EQ, 0, "", @line)
         else
-          raise "Lexer error: line #{@line}: '=' alone is not valid in Stage 0"
+          @lex_pos += 1
+          Token.new(TokenKind::EQ, 0, "", @line)
         end
       elsif b == LT_BYTE
         if @lex_pos + 1 < @bytes.length && @bytes[@lex_pos + 1] == EQ
@@ -250,7 +284,7 @@ module Setsunaruby
     def consume_terminator
       k = @cur_token.kind
       if k == TokenKind::NEWLINE || k == TokenKind::EOF
-        # OK; NEWLINE は次の skip_newlines で消費される
+        # OK
       else
         raise "Parse error: line #{@cur_token.line}: 文の終端 (改行 or EOF) が必要です"
       end
@@ -266,71 +300,34 @@ module Setsunaruby
       nil
     end
 
+    # statement := 'puts' expression
+    #            | 'if' ... 'end'
+    #            | 'while' ... 'end'
+    #            | expression  (代入や var_ref を含む)
     def parse_statement
-      if @cur_token.kind == TokenKind::KW_PUTS
+      k = @cur_token.kind
+      if k == TokenKind::KW_PUTS
         @cur_token = next_token
         expr = parse_expression
-        ASTNode.new(:puts_stmt, 0, false, :nop, nil, nil, expr)
+        return ASTNode.new(:puts_stmt, 0, false, :nop, nil, nil, expr)
+      elsif k == TokenKind::KW_IF
+        return parse_if
+      elsif k == TokenKind::KW_WHILE
+        return parse_while
       else
-        raise "Parse error: line #{@cur_token.line}: Stage 0 では文は 'puts <expr>' のみ可"
+        return parse_expression
       end
     end
 
-    def parse_expression
-      parse_comparison
+    # 既に primary を 1 つ読み終えた状態から、続く演算子を取り込んで式を完成させる。
+    def parse_expression_from(left, _line)
+      left = parse_multiplicative_from(left)
+      left = parse_additive_continue(left)
+      left = parse_comparison_continue(left)
+      left
     end
 
-    def parse_comparison
-      left = parse_additive
-      tk = @cur_token.kind
-      op = :nop
-      if tk == TokenKind::EQ_EQ
-        op = :eq
-      elsif tk == TokenKind::LT
-        op = :lt
-      elsif tk == TokenKind::GT
-        op = :gt
-      elsif tk == TokenKind::LE
-        op = :le
-      elsif tk == TokenKind::GE
-        op = :ge
-      end
-      if op != :nop
-        @cur_token = next_token
-        right = parse_additive
-        # 連鎖チェック (もう一度判定)
-        tk2 = @cur_token.kind
-        if tk2 == TokenKind::EQ_EQ || tk2 == TokenKind::LT || tk2 == TokenKind::GT ||
-           tk2 == TokenKind::LE   || tk2 == TokenKind::GE
-          raise "Parse error: line #{@cur_token.line}: 比較演算子の連鎖は許可されていません"
-        end
-        ASTNode.new(:bin_op, 0, false, op, left, right, nil)
-      else
-        left
-      end
-    end
-
-    def parse_additive
-      node = parse_multiplicative
-      loop do
-        k = @cur_token.kind
-        if k == TokenKind::PLUS
-          @cur_token = next_token
-          rhs = parse_multiplicative
-          node = ASTNode.new(:bin_op, 0, false, :add, node, rhs, nil)
-        elsif k == TokenKind::MINUS
-          @cur_token = next_token
-          rhs = parse_multiplicative
-          node = ASTNode.new(:bin_op, 0, false, :sub, node, rhs, nil)
-        else
-          break
-        end
-      end
-      node
-    end
-
-    def parse_multiplicative
-      node = parse_unary
+    def parse_multiplicative_from(node)
       loop do
         k = @cur_token.kind
         if k == TokenKind::STAR
@@ -350,6 +347,175 @@ module Setsunaruby
         end
       end
       node
+    end
+
+    def parse_additive_continue(node)
+      loop do
+        k = @cur_token.kind
+        if k == TokenKind::PLUS
+          @cur_token = next_token
+          rhs = parse_multiplicative
+          node = ASTNode.new(:bin_op, 0, false, :add, node, rhs, nil)
+        elsif k == TokenKind::MINUS
+          @cur_token = next_token
+          rhs = parse_multiplicative
+          node = ASTNode.new(:bin_op, 0, false, :sub, node, rhs, nil)
+        else
+          break
+        end
+      end
+      node
+    end
+
+    def parse_comparison_continue(left)
+      tk = @cur_token.kind
+      op = :nop
+      if tk == TokenKind::EQ_EQ
+        op = :eq
+      elsif tk == TokenKind::LT
+        op = :lt
+      elsif tk == TokenKind::GT
+        op = :gt
+      elsif tk == TokenKind::LE
+        op = :le
+      elsif tk == TokenKind::GE
+        op = :ge
+      end
+      if op != :nop
+        @cur_token = next_token
+        right = parse_additive
+        tk2 = @cur_token.kind
+        if tk2 == TokenKind::EQ_EQ || tk2 == TokenKind::LT || tk2 == TokenKind::GT ||
+           tk2 == TokenKind::LE   || tk2 == TokenKind::GE
+          raise "Parse error: line #{@cur_token.line}: 比較演算子の連鎖は許可されていません"
+        end
+        ASTNode.new(:bin_op, 0, false, op, left, right, nil)
+      else
+        left
+      end
+    end
+
+    def parse_if
+      # 'if' は既に @cur_token
+      @cur_token = next_token
+      cond = parse_expression
+      skip_then_or_newlines
+      then_body = parse_block
+      else_body = nil
+      k = @cur_token.kind
+      if k == TokenKind::KW_ELSIF
+        # elsif は新しい if としてネスト
+        else_body = parse_if
+      elsif k == TokenKind::KW_ELSE
+        @cur_token = next_token
+        skip_newlines
+        else_body = parse_block
+        expect(TokenKind::KW_END)
+      else
+        expect(TokenKind::KW_END)
+      end
+      ASTNode.new(:if_expr, 0, false, :nop, cond, then_body, else_body)
+    end
+
+    def parse_while
+      # 'while' は既に @cur_token
+      @cur_token = next_token
+      cond = parse_expression
+      skip_do_or_newlines
+      body = parse_block
+      expect(TokenKind::KW_END)
+      ASTNode.new(:while_stmt, 0, false, :nop, cond, body, nil)
+    end
+
+    def skip_then_or_newlines
+      if @cur_token.kind == TokenKind::KW_THEN
+        @cur_token = next_token
+      end
+      skip_newlines
+    end
+
+    def skip_do_or_newlines
+      # while には Ruby だと do があるが Stage 1 では NEWLINE のみ受ける
+      skip_newlines
+    end
+
+    # 複数文を右結合の :seq チェーンに組み立てる。
+    # 終端: end / else / elsif / EOF。
+    # 文の区切りは NEWLINE またはブロック終端キーワード (else/elsif/end) を許す。
+    # これにより `if true then 10 else 20 end` のような単一行も書ける。
+    def parse_block
+      skip_newlines
+      if at_block_end?
+        return ASTNode.new(:nil_lit, 0, false, :nop, nil, nil, nil)
+      end
+      first = parse_statement
+      consume_block_terminator
+      skip_newlines
+      if at_block_end?
+        return first
+      end
+      rest = parse_block
+      ASTNode.new(:seq, 0, false, :nop, first, nil, rest)
+    end
+
+    def consume_block_terminator
+      k = @cur_token.kind
+      if k == TokenKind::NEWLINE || k == TokenKind::EOF ||
+         k == TokenKind::KW_END  || k == TokenKind::KW_ELSE ||
+         k == TokenKind::KW_ELSIF
+        # OK (NEWLINE は呼び出し元の skip_newlines で消費)
+      else
+        raise "Parse error: line #{@cur_token.line}: 文の終端 (改行/end/else/elsif) が必要です"
+      end
+      nil
+    end
+
+    def at_block_end?
+      k = @cur_token.kind
+      k == TokenKind::KW_END || k == TokenKind::KW_ELSE ||
+        k == TokenKind::KW_ELSIF || k == TokenKind::EOF
+    end
+
+    # expression := IDENT '=' expression       (代入は右結合)
+    #             | comparison
+    # 代入は最も低い優先順位で右結合。`x = y = 1` は `x = (y = 1)` となる。
+    def parse_expression
+      if @cur_token.kind == TokenKind::IDENT
+        # IDENT の int_value は (start << 16) | len の packed 値。
+        # 名前識別はこの packed 値そのもので比較できる (同じバイト列なら同じ start)。
+        # ただし複数回出現する同名識別子は start が違うので、コンパイル時に
+        # 「@local_starts/@local_lens に登録されている既存名と byte-equal な範囲かどうか」を
+        # 判定して slot を共有する。
+        # parser 段階では packed 値をそのまま node_int_value に乗せて compiler に渡す。
+        packed = @cur_token.int_value
+        line   = @cur_token.line
+        @cur_token = next_token
+        if @cur_token.kind == TokenKind::EQ
+          @cur_token = next_token
+          value = parse_expression
+          # :assign は名前 packed を node_int_value に格納
+          return ASTNode.new(:assign, packed, false, :nop, value, nil, nil)
+        else
+          left_node = ASTNode.new(:var_ref, packed, false, :nop, nil, nil, nil)
+          return parse_expression_from(left_node, line)
+        end
+      end
+      parse_comparison
+    end
+
+    def parse_comparison
+      left = parse_additive
+      parse_comparison_continue(left)
+    end
+
+    def parse_additive
+      node = parse_multiplicative
+      parse_additive_continue(node)
+    end
+
+    def parse_multiplicative
+      node = parse_unary
+      parse_multiplicative_from(node)
     end
 
     def parse_unary
@@ -376,29 +542,59 @@ module Setsunaruby
       elsif k == TokenKind::KW_NIL
         @cur_token = next_token
         ASTNode.new(:nil_lit, 0, false, :nop, nil, nil, nil)
+      elsif k == TokenKind::IDENT
+        packed = @cur_token.int_value   # (start << 16) | len の packed 値
+        @cur_token = next_token
+        ASTNode.new(:var_ref, packed, false, :nop, nil, nil, nil)
       elsif k == TokenKind::LPAREN
         @cur_token = next_token
         expr = parse_expression
         expect(TokenKind::RPAREN)
         expr
+      elsif k == TokenKind::KW_IF
+        parse_if
+      elsif k == TokenKind::KW_WHILE
+        parse_while
       else
         raise "Parse error: line #{@cur_token.line}: 式が必要です"
       end
     end
 
-    # comparison_op は parse_comparison にインライン化済み (spinel の param 型推論
-    # 問題回避のため)。
-
     # ============================================================
     # Compiler
     # ============================================================
 
-    def compile_statement(stmt)
-      if stmt.node_kind == :puts_stmt
-        compile_expr(stmt.node_operand)
-        @bytecode.push(Op::PUTS)
+    # compile_stmt は常にスタックに値を 1 つ残す (CRuby YARV の式扱いと同じ)。
+    def compile_stmt(node)
+      k = node.node_kind
+      if k == :puts_stmt
+        compile_expr(node.node_operand)
+        @bytecode.push(Op::PUTS)   # 値を pop して出力、nil を push (Stage 1 で変更)
+      elsif k == :assign
+        compile_expr(node.node_left)
+        idx = declare_local(node.node_int_value)
+        @bytecode.push(Op::STORE_LOCAL)
+        encode_signed(idx)
+        # STORE_LOCAL は値を残す (代入式の値)
+      elsif k == :if_expr
+        compile_if(node)
+      elsif k == :while_stmt
+        compile_while(node)
+      elsif k == :seq
+        compile_block(node)
       else
-        raise "Compiler bug: unknown statement kind #{stmt.node_kind}"
+        compile_expr(node)
+      end
+      nil
+    end
+
+    def compile_block(node)
+      if node.node_kind == :seq
+        compile_stmt(node.node_left)
+        @bytecode.push(Op::POP)
+        compile_block(node.node_operand)
+      else
+        compile_stmt(node)
       end
       nil
     end
@@ -425,9 +621,61 @@ module Setsunaruby
         encode_signed(0)
         compile_expr(node.node_operand)
         @bytecode.push(Op::SUB)
+      elsif k == :var_ref
+        idx = lookup_local(node.node_int_value)
+        @bytecode.push(Op::LOAD_LOCAL)
+        encode_signed(idx)
+      elsif k == :assign
+        # 式の中の代入 (例: x = (y = 1))
+        compile_expr(node.node_left)
+        idx = declare_local(node.node_int_value)
+        @bytecode.push(Op::STORE_LOCAL)
+        encode_signed(idx)
+      elsif k == :if_expr
+        compile_if(node)
+      elsif k == :while_stmt
+        compile_while(node)
+      elsif k == :seq
+        compile_block(node)
+      elsif k == :puts_stmt
+        # 式の中の puts (puts は nil を push する)
+        compile_expr(node.node_operand)
+        @bytecode.push(Op::PUTS)
       else
         raise "Compiler bug: unknown expression kind #{k}"
       end
+      nil
+    end
+
+    def compile_if(node)
+      # cond
+      compile_expr(node.node_left)
+      jif_pos = emit_jump(Op::JUMP_IF_FALSE)
+      # then 節
+      compile_block(node.node_right)
+      # then の末尾でジャンプして else を skip
+      jend_pos = emit_jump(Op::JUMP)
+      # else ラベル
+      patch_jump(jif_pos, @bytecode.length)
+      if node.node_operand.nil?
+        @bytecode.push(Op::PUSH_NIL)
+      else
+        compile_block(node.node_operand)
+      end
+      patch_jump(jend_pos, @bytecode.length)
+      nil
+    end
+
+    def compile_while(node)
+      loop_start = @bytecode.length
+      compile_expr(node.node_left)
+      jexit_pos = emit_jump(Op::JUMP_IF_FALSE)
+      compile_block(node.node_right)
+      @bytecode.push(Op::POP)            # body の値を破棄
+      back_jump_pos = emit_jump(Op::JUMP)
+      patch_jump(back_jump_pos, loop_start)
+      patch_jump(jexit_pos, @bytecode.length)
+      @bytecode.push(Op::PUSH_NIL)        # while 全体の値は nil
       nil
     end
 
@@ -459,6 +707,7 @@ module Setsunaruby
       result
     end
 
+    # 可変長 SLEB128 (整数リテラル / STORE_LOCAL/LOAD_LOCAL の slot idx 用)
     def encode_signed(n)
       more = true
       while more
@@ -472,6 +721,76 @@ module Setsunaruby
         @bytecode.push(byte)
       end
       nil
+    end
+
+    # ジャンプ用に固定 3バイト SLEB128 を emit する (placeholder)。返り値は patch 用の position。
+    # 3 バイトで -1048576..1048575 まで表現可能。
+    def emit_jump(opcode)
+      @bytecode.push(opcode)
+      pos = @bytecode.length
+      @bytecode.push(0x80)   # placeholder (continuation)
+      @bytecode.push(0x80)   # placeholder (continuation)
+      @bytecode.push(0x00)   # placeholder (terminator, will be overwritten)
+      pos
+    end
+
+    # placeholder 位置を patch する。
+    # rel オフセットは「ジャンプオペランド直後 (= pos + 3) から target_abs まで」。
+    def patch_jump(placeholder_pos, target_abs)
+      rel = target_abs - (placeholder_pos + 3)
+      @bytecode[placeholder_pos]     = (rel & 0x7f) | 0x80
+      @bytecode[placeholder_pos + 1] = ((rel >> 7) & 0x7f) | 0x80
+      @bytecode[placeholder_pos + 2] = (rel >> 14) & 0x7f
+      nil
+    end
+
+    # ローカル変数表 (packed (start, len) → slot idx)
+    # packed は (start_in_bytes << 16) | len の 32bit 値。
+    # 同一名 (= byte 等しい) は同じ slot を共有する。
+    def find_local(packed)
+      pkg_start = packed >> 16
+      pkg_len   = packed & 0xffff
+      i = 0
+      result = -1
+      while i < @local_starts.length && result < 0
+        if @local_lens[i] == pkg_len &&
+           bytes_eq(@local_starts[i], pkg_start, pkg_len)
+          result = i
+        end
+        i += 1
+      end
+      result
+    end
+
+    def declare_local(packed)
+      i = find_local(packed)
+      if i < 0
+        @local_starts.push(packed >> 16)
+        @local_lens.push(packed & 0xffff)
+        i = @local_starts.length - 1
+      end
+      i
+    end
+
+    def lookup_local(packed)
+      i = find_local(packed)
+      if i < 0
+        raise "Compile error: line #{@cur_token.line}: undefined local variable"
+      end
+      i
+    end
+
+    # @bytes 上の 2 範囲 [a..a+len) と [b..b+len) が同一バイト列か?
+    def bytes_eq(a, b, len)
+      result = true
+      j = 0
+      while j < len && result
+        if @bytes[a + j] != @bytes[b + j]
+          result = false
+        end
+        j += 1
+      end
+      result
     end
 
     # ============================================================
@@ -493,6 +812,23 @@ module Setsunaruby
           @stack.push(ObjectVal::FALSE_VAL)
         elsif op == Op::PUSH_NIL
           @stack.push(ObjectVal::NIL_VAL)
+        elsif op == Op::POP
+          @stack.pop
+        elsif op == Op::STORE_LOCAL
+          idx = decode_signed
+          @locals[idx] = @stack[@stack.length - 1]   # top を「読む」(pop しない)
+        elsif op == Op::LOAD_LOCAL
+          idx = decode_signed
+          @stack.push(@locals[idx])
+        elsif op == Op::JUMP
+          rel = decode_signed_3
+          @pc = @pc + rel
+        elsif op == Op::JUMP_IF_FALSE
+          rel = decode_signed_3
+          v = @stack.pop
+          if !truthy?(v)
+            @pc = @pc + rel
+          end
         elsif op == Op::ADD
           exec_arith(:add)
         elsif op == Op::SUB
@@ -516,6 +852,7 @@ module Setsunaruby
         elsif op == Op::PUTS
           v = @stack.pop
           puts to_puts_string(v)
+          @stack.push(ObjectVal::NIL_VAL)   # Stage 1: puts は nil を返す
         elsif op == Op::HALT
           return nil
         else
@@ -527,6 +864,10 @@ module Setsunaruby
 
     def fixnum?(v)
       (v & 1) == 1
+    end
+
+    def truthy?(v)
+      v != ObjectVal::NIL_VAL && v != ObjectVal::FALSE_VAL
     end
 
     def box_int(n)
@@ -559,6 +900,7 @@ module Setsunaruby
       end
     end
 
+    # 可変長 SLEB128 デコード (bytecode から @pc 起点で)
     def decode_signed
       result = 0
       shift = 0
@@ -570,10 +912,23 @@ module Setsunaruby
         shift += 7
         if (b & 0x80) == 0
           if (b & 0x40) != 0
-            result = result | (-1 << shift)
+            result = result | (0 - (1 << shift))
           end
           done = true
         end
+      end
+      result
+    end
+
+    # 固定 3バイト SLEB128 デコード (jump offset 用)
+    def decode_signed_3
+      b0 = @bytecode[@pc]
+      b1 = @bytecode[@pc + 1]
+      b2 = @bytecode[@pc + 2]
+      @pc += 3
+      result = (b0 & 0x7f) | ((b1 & 0x7f) << 7) | ((b2 & 0x7f) << 14)
+      if (b2 & 0x40) != 0
+        result = result | (0 - (1 << 21))
       end
       result
     end

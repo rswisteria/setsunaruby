@@ -6,11 +6,18 @@ module Setsunaruby
     KW_TRUE  = :kw_true
     KW_FALSE = :kw_false
     KW_NIL   = :kw_nil
+    KW_IF    = :kw_if
+    KW_ELSIF = :kw_elsif
+    KW_ELSE  = :kw_else
+    KW_END   = :kw_end
+    KW_WHILE = :kw_while
+    KW_THEN  = :kw_then
     PLUS     = :plus
     MINUS    = :minus
     STAR     = :star
     SLASH    = :slash
     PERCENT  = :percent
+    EQ       = :eq
     EQ_EQ    = :eq_eq
     LT       = :lt
     GT       = :gt
@@ -24,7 +31,7 @@ module Setsunaruby
 end
 
 # spinel の名前空間プレフィックス処理が一部のコード生成パス (volatile 宣言など) で
-# 落ちることがあるため、Token クラスはトップレベルに置いて名前を一致させる。
+# 落ちることがあるため、Token クラスはトップレベルに置いて C 名 sp_Token に揃える。
 class Token
   attr_accessor :kind, :int_value, :str_value, :line
 

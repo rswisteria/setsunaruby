@@ -97,7 +97,7 @@ assert_raises("puts 1 / 0\n",     "ゼロ除算")
 assert_raises("puts 1 / (1 - 1)\n","ゼロ除算 (式)")
 assert_raises("puts true + 1\n",  "型エラー (bool + int)")
 assert_raises("puts 1 < 2 < 3\n", "比較演算子の連鎖禁止")
-assert_raises("1 + 2\n",          "puts なしの文")
+assert_output("1 + 2\n",          "",       "puts なし式文 (Stage 1 で式文許可)")
 assert_raises("puts (1 + 2\n",    "閉じ括弧不足")
 assert_raises("puts 1 ++ 2\n",    "二重演算子")
 

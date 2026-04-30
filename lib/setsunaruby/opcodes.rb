@@ -1,9 +1,15 @@
 module Setsunaruby
   module Op
-    PUSH_INT   = 0x01
-    PUSH_TRUE  = 0x02
-    PUSH_FALSE = 0x03
-    PUSH_NIL   = 0x04
+    PUSH_INT       = 0x01
+    PUSH_TRUE      = 0x02
+    PUSH_FALSE     = 0x03
+    PUSH_NIL       = 0x04
+
+    POP            = 0x05
+    STORE_LOCAL    = 0x06   # operand: SLEB128 idx (variable-length)
+    LOAD_LOCAL     = 0x07   # operand: SLEB128 idx (variable-length)
+    JUMP           = 0x08   # operand: 3-byte fixed-width SLEB128 offset
+    JUMP_IF_FALSE  = 0x09   # operand: 3-byte fixed-width SLEB128 offset
 
     ADD = 0x10
     SUB = 0x11
