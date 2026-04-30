@@ -7,9 +7,9 @@ Ruby 文法を持つ、スタックマシン型プログラミング言語の処
 「刹那」(10⁻¹⁸) から命名。mruby / nanoruby / picoruby に続く、
 さらに小さな Ruby 系列という位置付け。
 
-## 現状: Stage 0 + Stage 0.5 完了
+## 現状: Stage 0 / 0.5 / 1 完了
 
-最小のスタックマシンが **CRuby + spinel AOT 両方で動作**。
+スタックマシン上で **FizzBuzz が CRuby + spinel AOT 両方で動作**。
 
 実装機能:
 
@@ -21,6 +21,10 @@ Ruby 文法を持つ、スタックマシン型プログラミング言語の処
 - 括弧によるグルーピング
 - `puts <expr>` (Ruby と完全一致の出力セマンティクス)
 - 行コメント `#` (マルチバイトコメント対応)
+- **ローカル変数の代入と参照** `x = 1`, `y = x + 1` (右結合)
+- **`if / elsif / else / end`** (Ruby 同様の式扱い、値を返す)
+- **`while / end`** ループ
+- **truthy/falsy**: `nil` と `false` のみ偽、それ以外は真 (0 も真)
 
 ## クイックスタート
 
@@ -42,12 +46,14 @@ make test-all
 
 ## ベンチマーク
 
-| 実行系 | hello.rb 実行時間 |
-|---|---|
-| CRuby (`ruby bin/setsunaruby.rb`) | ~80 ms |
-| spinel AOT (`./setsunaruby`) | ~22 ms |
+| ワークロード | CRuby | AOT | speedup |
+|---|---:|---:|---:|
+| hello.rb (最小) | ~55 ms | ~3 ms | 約 19x |
+| Stage 0 平均 (5種類 × 2000行) | ~80 ms | ~4 ms | 約 18x |
+| **FizzBuzz N=5000 (Stage 1 ループ)** | **73 ms** | **2.5 ms** | **約 29x** |
 
-AOT 版は約4倍高速。spinel の C コード生成と GC 最適化の効果。
+ループや分岐を含む実用的なワークロードで AOT 版は CRuby 比 約 30 倍高速。
+spinel の C コード生成 + GC 最適化 + ネイティブ実行の効果。`make bench` で再現可能。
 
 ## アーキテクチャ
 
@@ -89,16 +95,24 @@ CRuby の `VALUE` を踏襲したタグ付き即値方式。
 
 ### バイトコード
 
-1 バイトのオペコード + 可変長オペランド。整数リテラルは SLEB128 で埋め込む。
+1 バイトのオペコード + 可変長 / 固定長オペランド。
 
-| Opcode | Hex | 動作 |
-|---|---|---|
-| PUSH_INT | 0x01 | SLEB128 整数を push |
-| PUSH_TRUE / PUSH_FALSE / PUSH_NIL | 0x02 / 0x03 / 0x04 | 即値 push |
-| ADD / SUB / MUL / DIV / MOD | 0x10–0x14 | 二項演算 |
-| EQ / LT / GT / LE / GE | 0x20–0x24 | 比較 |
-| PUTS | 0x30 | top を pop して出力 |
-| HALT | 0xFF | 終了 |
+| Opcode | Hex | オペランド | 動作 |
+|---|---|---|---|
+| PUSH_INT | 0x01 | SLEB128 整数 | 即値 push |
+| PUSH_TRUE / PUSH_FALSE / PUSH_NIL | 0x02–0x04 | – | 即値 push |
+| POP | 0x05 | – | 破棄 |
+| STORE_LOCAL | 0x06 | SLEB128 idx | top を local[idx] に格納 (POPしない) |
+| LOAD_LOCAL | 0x07 | SLEB128 idx | local[idx] を push |
+| JUMP | 0x08 | 固定 3byte SLEB128 | 無条件相対ジャンプ |
+| JUMP_IF_FALSE | 0x09 | 固定 3byte SLEB128 | top を pop し偽ならジャンプ |
+| ADD / SUB / MUL / DIV / MOD | 0x10–0x14 | – | 二項演算 |
+| EQ / LT / GT / LE / GE | 0x20–0x24 | – | 比較 |
+| PUTS | 0x30 | – | top を pop して出力、nil を push |
+| HALT | 0xFF | – | 終了 |
+
+ジャンプオフセットは patch up の都合で **固定 3 バイト SLEB128** (±1M バイト範囲)。
+他の整数オペランド (整数リテラル、ローカル変数 idx) は通常の可変長 SLEB128。
 
 ### AST 表現
 
@@ -107,12 +121,21 @@ CRuby の `VALUE` を踏襲したタグ付き即値方式。
 spinel の型推論で混同されるのを防いでいる。
 
 `node_kind` の値:
-- `:int_lit` → `node_int_value`
+- `:int_lit` → `node_int_value` (Integer 値)
 - `:bool_lit` → `node_bool_value`
 - `:nil_lit`
-- `:bin_op` → `node_op`, `node_left`, `node_right`
+- `:bin_op` → `node_op` (Symbol)、`node_left`、`node_right`
 - `:unary_minus` → `node_operand`
 - `:puts_stmt` → `node_operand`
+- `:assign` → `node_int_value` (変数名の packed (start<<16)|len)、`node_left` (値式)
+- `:var_ref` → `node_int_value` (同上)
+- `:if_expr` → `node_left` (cond)、`node_right` (then_body)、`node_operand` (else_body / nil)
+- `:while_stmt` → `node_left` (cond)、`node_right` (body)
+- `:seq` → `node_left` (current stmt)、`node_operand` (rest of seq)
+
+ローカル変数名は **`@bytes` 上のバイト範囲 (start, len) で識別**。
+Symbol/sp_sym を経由すると spinel の Token フィールド型推論が崩壊するため、
+すべて整数 packed 値で表現。
 
 ## ロードマップ
 
@@ -120,7 +143,7 @@ spinel の型推論で混同されるのを防いでいる。
 |---|---|---|
 | 0 | 算術スタックマシン (式と puts のみ) | ✅ 完了 |
 | 0.5 | spinel 互換 + AOT ビルド | ✅ 完了 |
-| 1 | ローカル変数 + 制御構造 (if/while) | 未着手 |
+| 1 | ローカル変数 + 制御構造 (if/while) | ✅ 完了 (FizzBuzz 動作) |
 | 2 | メソッド定義 + 呼び出し + 再帰 | 未着手 |
 | JIT | ホットメソッド検出 + コード生成 | 未着手 |
 | 3+ | 文字列・配列・ブロック・クラス・例外 | 未着手 |
@@ -141,10 +164,12 @@ spinel の型推論で混同されるのを防いでいる。
 │       └── interp.rb         # Lexer/Parser/Compiler/VM 統合クラス
 ├── examples/
 │   ├── hello.rb
-│   └── arith.rb
+│   ├── arith.rb
+│   └── fizzbuzz.rb           # Stage 1: ローカル変数 + 制御構造のショーケース
 ├── test/
-│   ├── test_stage0.rb        # CRuby 38 テスト
-│   └── test_aot.rb           # AOT 29 テスト
+│   ├── test_stage0.rb        # CRuby Stage 0 テスト (38件)
+│   ├── test_stage1.rb        # CRuby Stage 1 テスト (28件)
+│   └── test_aot.rb           # AOT テスト (36件)
 ├── setsunaruby               # spinel ビルド成果物 (gitignore)
 └── Makefile
 ```
