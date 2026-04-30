@@ -1,0 +1,18 @@
+# spinel AOT ビルド成果物
+/setsunaruby
+/setsunaruby.c
+/*.c
+
+# OS
+.DS_Store
+
+# Editor
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Ruby
+*.rbc
+.bundle/
