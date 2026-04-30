@@ -23,5 +23,11 @@ test-aot: build
 
 test-all: test-cruby test-aot
 
+bench: build
+	ruby benchmark/run_bench.rb
+
+bench-regen:
+	ruby benchmark/gen_benchmarks.rb
+
 clean:
 	rm -f setsunaruby setsunaruby.c
