@@ -3,6 +3,8 @@ module Setsunaruby
   # SoA (`@hir_kind/op0/op1/op2`) で 1 命令 = (kind, op0, op1, op2) の 4 つ組。
   # 値域は Op:: と被らない 0x100+ にしてある (spinel の whole-program 推論で
   # 同値の異モジュール定数が混同されるリスクを避けるため)。
+  # 値域は 0x100 単位でグルーピング (0x100 系=値ロード/スタック制御、
+  # 0x110/0x120=二項演算、0x130/0x140=I/O・関数)。空番は将来の同系列追加用に予約。
   module HirOp
     LOAD_CONST    = 0x101   # op0 = HirConstTag, op1 = INT のとき raw 整数値
     LOAD_LOCAL    = 0x102   # op0 = slot idx

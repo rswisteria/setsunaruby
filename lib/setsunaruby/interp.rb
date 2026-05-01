@@ -1402,6 +1402,8 @@ module Setsunaruby
       pending_jump_ids     = []
       pending_jump_targets = []
 
+      # decode_signed が @pc を進めるため一時的に借用する。VM 実行中の値は
+      # build_and_dump_hir 終了時に復元する (exec_call の続行に影響させない)。
       saved_pc = @pc
       @pc = start_pc
       while @pc < end_pc
@@ -1429,7 +1431,12 @@ module Setsunaruby
           hir_id = emit_hir(HirOp::POP, 0, 0, 0)
         elsif op == Op::STORE_LOCAL
           slot = decode_signed
-          v = sstack[sstack.length - 1]   # peek (bytecode の挙動: 値は残す)
+          # peek (bytecode の挙動: 値は残す)。空 sstack から `nil` が混入すると
+          # @hir_op1 の IntArray 推論が壊れる (spinel ルール 3) ためフェイルファスト。
+          if sstack.length == 0
+            raise "JIT-2 bug: STORE_LOCAL with empty sstack at pc=#{bc_pc}"
+          end
+          v = sstack[sstack.length - 1]
           hir_id = emit_hir(HirOp::STORE_LOCAL, slot, v, 0)
         elsif op == Op::LOAD_LOCAL
           slot = decode_signed
@@ -1507,6 +1514,10 @@ module Setsunaruby
         elsif op == Op::CALL
           callee_idx = decode_signed
           arity = @method_arities[callee_idx]
+          # underflow から `nil` が @hir_call_args (IntArray) に混入するのを防ぐ。
+          if sstack.length < arity
+            raise "JIT-2 bug: CALL underflow (need #{arity}, have #{sstack.length}) at pc=#{bc_pc}"
+          end
           args_start = @hir_call_args.length
           ai = sstack.length - arity
           ae = sstack.length
