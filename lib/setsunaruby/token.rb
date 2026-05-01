@@ -15,6 +15,7 @@ module Setsunaruby
     KW_DEF    = :kw_def
     KW_RETURN = :kw_return
     KW_DO     = :kw_do     # `do ... end` ブロック開始 (Stage 3c.1)
+    KW_YIELD  = :kw_yield  # `yield` (Stage 3c.2)
     STR      = :str        # 文字列リテラル (Stage 3a)。int_value = strlit_idx
     PLUS      = :plus
     MINUS    = :minus

@@ -43,6 +43,15 @@ module Setsunaruby
     ARRAY_SET = 0x46
     ARRAY_LEN = 0x47
 
+    # Stage 3c.2: 一般ブロック付きメソッド呼び出しと yield。
+    # CALL_WITH_BLOCK は CALL と同じだが、メソッドフレームに block_pc と block_arity を
+    # 関連付ける。block_arity は yield argc とのランタイム不一致を検出するため。
+    # YIELD は現在のフレームの block_pc に飛び、引数を caller's scope へ渡す。
+    # BLOCK_RETURN は block の終端、yield の続きへ復帰する。
+    CALL_WITH_BLOCK = 0x48   # operands: SLEB128 method_idx, SLEB128 block_pc, SLEB128 block_arity
+    YIELD           = 0x49   # operand: SLEB128 argc
+    BLOCK_RETURN    = 0x4A
+
     HALT = 0xFF
   end
 end
