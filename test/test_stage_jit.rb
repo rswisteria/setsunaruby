@@ -335,6 +335,65 @@ assert_includes(opt_section, "Lt ",  "JIT-3a: fib の Lt は LoadLocal を含む
 assert_includes(opt_section, "Add ", "JIT-3a: fib(n-1) + fib(n-2) の Add は Call を含むので残る")
 assert_includes(opt_section, "Sub ", "JIT-3a: n - 1 の Sub も残る")
 
+# ============================================================
+# JIT-3b1: basic block + CFG + clean_cfg
+# ============================================================
+
+# ---- fib の HIR が BB 単位でダンプされる ----
+ENV["SETSUNARUBY_DUMP_HIR"] = "1"
+fib_bb_src = <<~RUBY
+  def fib(n)
+    if n < 2
+      n
+    else
+      fib(n - 1) + fib(n - 2)
+    end
+  end
+  puts fib(10)
+RUBY
+begin
+  out, err = run_capture(fib_bb_src)
+ensure
+  ENV.delete("SETSUNARUBY_DUMP_HIR")
+end
+raw_section, opt_section = split_dump_sections(err)
+assert_eq(out, "55\n", "JIT-3b1: fib(10) 結果不変")
+assert_includes(raw_section, "BB0:",                  "JIT-3b1: BB0 が出る")
+assert_includes(raw_section, "BB1 (preds: BB0)",      "JIT-3b1: BB1 の preds 表示")
+assert_includes(raw_section, "BB3 (preds: BB1, BB2)", "JIT-3b1: BB3 の合流点 preds")
+assert_includes(raw_section, "JumpIfFalse v2, BB2",   "JIT-3b1: Jump target が BB 表記")
+assert_includes(raw_section, "Jump BB3",              "JIT-3b1: Jump も BB 表記")
+
+# ---- 早期 return パターン: unreachable BB が clean_cfg で削除される ----
+ENV["SETSUNARUBY_DUMP_HIR"] = "1"
+abs_clean_src = <<~RUBY
+  def abs(n)
+    if n < 0
+      return -n
+    end
+    n
+  end
+  i = 0
+  while i < 100
+    abs(-7)
+    i = i + 1
+  end
+  puts abs(-7)
+RUBY
+begin
+  out, err = run_capture(abs_clean_src)
+ensure
+  ENV.delete("SETSUNARUBY_DUMP_HIR")
+end
+raw_section, opt_section = split_dump_sections(err)
+assert_eq(out, "7\n", "JIT-3b1: abs(-7) 結果不変")
+# raw では unreachable BB (早期 return 直後の死コード) が存在する
+assert_includes(raw_section, "BB2:",  "JIT-3b1: raw では BB2 (unreachable) が出る")
+# optimized では unreachable BB が消えている
+assert_excludes(opt_section, "BB2:",  "JIT-3b1: optimized で unreachable BB が clean されている")
+# 合流先の preds リストも更新されている (BB2 が消えるので merge BB の preds は BB3 のみ)
+assert_includes(opt_section, "(preds: BB3)", "JIT-3b1: clean 後 merge BB の preds が更新")
+
 puts ""
-puts "#{$pass} passed, #{$fail} failed (JIT-1/2/3a)"
+puts "#{$pass} passed, #{$fail} failed (JIT-1/2/3a/3b1)"
 exit($fail == 0 ? 0 : 1)

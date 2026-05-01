@@ -93,6 +93,12 @@ module Setsunaruby
       @hir_op2       = []   # IntArray
       @hir_call_args = []   # IntArray (CALL の引数 hir_id を flat に並べる)
       @hir_deleted   = []   # IntArray (JIT-3: 0=alive, 1=dead。eliminate_dead_code が mark)
+      # JIT-3b: basic block 構造 (CFG)。pass_build_cfg が構築する。
+      @hir_bb        = []   # IntArray (各 hir_id の所属 BB id)
+      @bb_first_insn = []   # IntArray (各 BB の最初の hir_id)
+      @bb_last_insn  = []   # IntArray (各 BB の最後の hir_id)
+      @bb_succ0      = []   # IntArray (JUMP_IF_FALSE の jump target / JUMP の target / フォールスルー)
+      @bb_succ1      = []   # IntArray (JUMP_IF_FALSE の fallthrough、それ以外は -1)
       # spinel AOT で ENV が解釈されない場合は常に false 相当 (HIR ダンプは CRuby のみ)。
       @dump_hir      = ENV["SETSUNARUBY_DUMP_HIR"] == "1"
       # VM のコールフレームスタック (並列 IntArray)。
@@ -131,6 +137,11 @@ module Setsunaruby
       @hir_op2       = []
       @hir_call_args = []
       @hir_deleted   = []
+      @hir_bb        = []
+      @bb_first_insn = []
+      @bb_last_insn  = []
+      @bb_succ0      = []
+      @bb_succ1      = []
       @dump_hir      = ENV["SETSUNARUBY_DUMP_HIR"] == "1"
       @cfp_pcs   = []
       @cfp_bases = []
@@ -1384,6 +1395,11 @@ module Setsunaruby
       @hir_op2  = []
       @hir_call_args = []
       @hir_deleted   = []
+      @hir_bb        = []
+      @bb_first_insn = []
+      @bb_last_insn  = []
+      @bb_succ0      = []
+      @bb_succ1      = []
 
       start_pc = @method_pcs[m_idx]
       end_pc   = @method_body_ends[m_idx]
@@ -1564,12 +1580,16 @@ module Setsunaruby
         pi += 1
       end
 
+      pass_build_cfg
       dump_hir(m_idx, "raw")
       optimize_hir
       dump_hir(m_idx, "optimized")
       nil
     end
 
+    # `@hir_bb` は emit_hir では設定しない。pass_build_cfg が後付けで全 insn に
+    # 一括で割り当てる。最適化パスで insn を追加する際は @hir_bb への push も
+    # 忘れないこと (将来 phi 挿入を入れる JIT-3b2 で問題になりうる)。
     def emit_hir(kind, op0, op1, op2)
       @hir_kind.push(kind)
       @hir_op0.push(op0)
@@ -1581,14 +1601,58 @@ module Setsunaruby
 
     def dump_hir(m_idx, label)
       STDERR.puts "ZJIT HIR (#{label}) for method idx=#{m_idx}:"
-      i = 0
-      while i < @hir_kind.length
+      b = 0
+      while b < @bb_first_insn.length
+        if bb_alive_count(b) > 0
+          pred_str = format_bb_preds(b)
+          STDERR.puts "  BB#{b}#{pred_str}:"
+          i = @bb_first_insn[b]
+          last = @bb_last_insn[b]
+          while i <= last
+            if @hir_deleted[i] == 0
+              STDERR.puts "    v#{i} = #{format_hir_insn(i)}"
+            end
+            i += 1
+          end
+        end
+        b += 1
+      end
+      nil
+    end
+
+    # BB 内で生きている (deleted=0) insn の数。0 ならその BB は完全に消えている。
+    def bb_alive_count(b)
+      count = 0
+      i = @bb_first_insn[b]
+      last = @bb_last_insn[b]
+      while i <= last
         if @hir_deleted[i] == 0
-          STDERR.puts "  v#{i} = #{format_hir_insn(i)}"
+          count += 1
         end
         i += 1
       end
-      nil
+      count
+    end
+
+    def format_bb_preds(b)
+      result = ""
+      count = 0
+      i = 0
+      while i < @bb_first_insn.length
+        if (@bb_succ0[i] == b || @bb_succ1[i] == b) && bb_alive_count(i) > 0
+          if count == 0
+            result = " (preds: BB" + i.to_s
+          else
+            result = result + ", BB" + i.to_s
+          end
+          count += 1
+        end
+        i += 1
+      end
+      if count > 0
+        result = result + ")"
+      end
+      result
     end
 
     def format_hir_insn(i)
@@ -1614,9 +1678,9 @@ module Setsunaruby
       elsif kind == HirOp::POP
         result = "Pop"
       elsif kind == HirOp::JUMP
-        result = "Jump v#{op0}"
+        result = "Jump BB#{@hir_bb[op0]}"
       elsif kind == HirOp::JUMP_IF_FALSE
-        result = "JumpIfFalse v#{op0}, v#{op1}"
+        result = "JumpIfFalse v#{op0}, BB#{@hir_bb[op1]}"
       elsif kind == HirOp::ADD
         result = "Add v#{op0}, v#{op1}"
       elsif kind == HirOp::SUB
@@ -1669,6 +1733,7 @@ module Setsunaruby
     def optimize_hir
       pass_fold_constants
       pass_eliminate_dead_code
+      pass_clean_cfg
       nil
     end
 
@@ -1860,6 +1925,148 @@ module Setsunaruby
         result = true
       end
       result
+    end
+
+    # ============================================================
+    # JIT-3b1: CFG (basic block) 構築 + clean_cfg
+    # ============================================================
+
+    # メソッド先頭 / jump target / jump-or-return の直後で BB を切る。
+    # 各 insn を BB に割り当て、各 BB の (first_insn, last_insn, succ0, succ1) を確定する。
+    # CFG 構造は後段で書き換わらない (fold_constants は kind を LOAD_CONST に変えるが
+    # JUMP/JUMP_IF_FALSE/RETURN は変えない、また pass_eliminate_dead_code は
+    # side_effect? が JUMP/JUMP_IF_FALSE/RETURN を保護するので削除されない)
+    # ので、build_and_dump_hir で 1 度だけ呼ぶ。
+    def pass_build_cfg
+      n = @hir_kind.length
+      if n == 0
+        return nil
+      end
+      is_bb_start = []
+      i = 0
+      while i < n
+        is_bb_start.push(0)
+        i += 1
+      end
+      is_bb_start[0] = 1
+      i = 0
+      while i < n
+        k = @hir_kind[i]
+        if k == HirOp::JUMP
+          is_bb_start[@hir_op0[i]] = 1
+          if i + 1 < n
+            is_bb_start[i + 1] = 1
+          end
+        elsif k == HirOp::JUMP_IF_FALSE
+          is_bb_start[@hir_op1[i]] = 1
+          if i + 1 < n
+            is_bb_start[i + 1] = 1
+          end
+        elsif k == HirOp::RETURN
+          if i + 1 < n
+            is_bb_start[i + 1] = 1
+          end
+        end
+        i += 1
+      end
+      current_bb = -1
+      i = 0
+      while i < n
+        if is_bb_start[i] == 1
+          if current_bb >= 0
+            @bb_last_insn[current_bb] = i - 1
+          end
+          current_bb = @bb_first_insn.length
+          @bb_first_insn.push(i)
+          @bb_last_insn.push(i)
+        end
+        @hir_bb.push(current_bb)
+        i += 1
+      end
+      if current_bb >= 0
+        @bb_last_insn[current_bb] = n - 1
+      end
+      # 後継を確定する。
+      # - JUMP:           succ0 = jump target、succ1 = -1
+      # - JUMP_IF_FALSE:  succ0 = 偽分岐 (= jump target、@hir_op1)、succ1 = 真分岐 (fallthrough)
+      # - RETURN:         succ0 = succ1 = -1
+      # - その他の終端 (フォールスルー): succ0 = next BB、succ1 = -1
+      b = 0
+      while b < @bb_first_insn.length
+        last = @bb_last_insn[b]
+        k = @hir_kind[last]
+        if k == HirOp::JUMP
+          @bb_succ0.push(@hir_bb[@hir_op0[last]])
+          @bb_succ1.push(-1)
+        elsif k == HirOp::JUMP_IF_FALSE
+          @bb_succ0.push(@hir_bb[@hir_op1[last]])
+          if last + 1 < n
+            @bb_succ1.push(@hir_bb[last + 1])
+          else
+            # 現行 compiler では JUMP_IF_FALSE の後には必ず then ブロックか PUSH_NIL が続く。
+            # この raise は将来コード生成パターンが拡張されたときの早期検出用。
+            raise "CFG bug: JUMP_IF_FALSE at HIR tail (id=#{last}), fallthrough BB missing"
+          end
+        elsif k == HirOp::RETURN
+          @bb_succ0.push(-1)
+          @bb_succ1.push(-1)
+        else
+          if last + 1 < n
+            @bb_succ0.push(@hir_bb[last + 1])
+          else
+            @bb_succ0.push(-1)
+          end
+          @bb_succ1.push(-1)
+        end
+        b += 1
+      end
+      nil
+    end
+
+    # BB0 (エントリ) から BFS で到達可能な BB を列挙し、未到達 BB の insn を deleted=1 に。
+    # queue は先頭インデックスを進めるだけの単純実装 (shift 不使用、IntArray 親和)。
+    def pass_clean_cfg
+      nbb = @bb_first_insn.length
+      if nbb == 0
+        return nil
+      end
+      visited = []
+      i = 0
+      while i < nbb
+        visited.push(0)
+        i += 1
+      end
+      queue = []
+      queue.push(0)
+      visited[0] = 1
+      qhead = 0
+      while qhead < queue.length
+        b = queue[qhead]
+        qhead += 1
+        s0 = @bb_succ0[b]
+        if s0 >= 0 && visited[s0] == 0
+          visited[s0] = 1
+          queue.push(s0)
+        end
+        s1 = @bb_succ1[b]
+        if s1 >= 0 && visited[s1] == 0
+          visited[s1] = 1
+          queue.push(s1)
+        end
+      end
+      b = 0
+      while b < nbb
+        if visited[b] == 0
+          j    = @bb_first_insn[b]
+          last = @bb_last_insn[b]
+          while j <= last
+            @hir_deleted[j] = 1
+            j += 1
+          end
+        end
+        b += 1
+      end
+      nil
     end
   end
 end
