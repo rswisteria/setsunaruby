@@ -99,6 +99,11 @@ module Setsunaruby
       @bb_last_insn  = []   # IntArray (各 BB の最後の hir_id)
       @bb_succ0      = []   # IntArray (JUMP_IF_FALSE の jump target / JUMP の target / フォールスルー)
       @bb_succ1      = []   # IntArray (JUMP_IF_FALSE の fallthrough、それ以外は -1)
+      # JIT-3b2: dominator tree + dominance frontier (CFG 分析、phi 配置の前提)。
+      @bb_idom       = []   # IntArray (各 BB の immediate dominator BB id、root は自分)
+      @bb_df_starts  = []   # IntArray (各 BB の DF chunk の開始 offset)
+      @bb_df_counts  = []   # IntArray (各 BB の DF サイズ)
+      @bb_df_flat    = []   # IntArray (DF の BB id を flat に並べる)
       # spinel AOT で ENV が解釈されない場合は常に false 相当 (HIR ダンプは CRuby のみ)。
       @dump_hir      = ENV["SETSUNARUBY_DUMP_HIR"] == "1"
       # VM のコールフレームスタック (並列 IntArray)。
@@ -142,6 +147,10 @@ module Setsunaruby
       @bb_last_insn  = []
       @bb_succ0      = []
       @bb_succ1      = []
+      @bb_idom       = []
+      @bb_df_starts  = []
+      @bb_df_counts  = []
+      @bb_df_flat    = []
       @dump_hir      = ENV["SETSUNARUBY_DUMP_HIR"] == "1"
       @cfp_pcs   = []
       @cfp_bases = []
@@ -1400,6 +1409,10 @@ module Setsunaruby
       @bb_last_insn  = []
       @bb_succ0      = []
       @bb_succ1      = []
+      @bb_idom       = []
+      @bb_df_starts  = []
+      @bb_df_counts  = []
+      @bb_df_flat    = []
 
       start_pc = @method_pcs[m_idx]
       end_pc   = @method_body_ends[m_idx]
@@ -1584,6 +1597,7 @@ module Setsunaruby
       dump_hir(m_idx, "raw")
       optimize_hir
       dump_hir(m_idx, "optimized")
+      dump_cfg_analysis(m_idx)
       nil
     end
 
@@ -1734,6 +1748,8 @@ module Setsunaruby
       pass_fold_constants
       pass_eliminate_dead_code
       pass_clean_cfg
+      pass_compute_dominators
+      pass_compute_df
       nil
     end
 
@@ -2067,6 +2083,218 @@ module Setsunaruby
         b += 1
       end
       nil
+    end
+
+    # ============================================================
+    # JIT-3b2: dominator tree + dominance frontier
+    # ============================================================
+
+    # Cooper et al. の "A Simple, Fast Dominance Algorithm" の素朴反復版。
+    # BB 数が小さいので O(N^3) 程度でも問題ない。reverse postorder ではなく
+    # 単純に BB id 昇順で走査し、idom が変化しなくなるまで繰り返す。
+    # 到達不能 BB (clean_cfg で全 insn が deleted のもの) は idom = -1 のまま残す。
+    def pass_compute_dominators
+      nbb = @bb_first_insn.length
+      i = 0
+      while i < nbb
+        @bb_idom.push(-1)
+        i += 1
+      end
+      if nbb == 0
+        return nil
+      end
+      @bb_idom[0] = 0
+      preds_starts = []
+      preds_counts = []
+      preds_flat   = []
+      build_preds_table(nbb, preds_starts, preds_counts, preds_flat)
+      changed = 1
+      while changed != 0
+        changed = 0
+        b = 1
+        while b < nbb
+          if bb_alive_count(b) > 0
+            new_idom = compute_new_idom(b, preds_starts, preds_counts, preds_flat)
+            if new_idom != -1 && @bb_idom[b] != new_idom
+              @bb_idom[b] = new_idom
+              changed = 1
+            end
+          end
+          b += 1
+        end
+      end
+      nil
+    end
+
+    def build_preds_table(nbb, preds_starts, preds_counts, preds_flat)
+      b = 0
+      while b < nbb
+        preds_starts.push(preds_flat.length)
+        cnt = 0
+        p = 0
+        while p < nbb
+          if @bb_succ0[p] == b || @bb_succ1[p] == b
+            preds_flat.push(p)
+            cnt += 1
+          end
+          p += 1
+        end
+        preds_counts.push(cnt)
+        b += 1
+      end
+      nil
+    end
+
+    def compute_new_idom(b, preds_starts, preds_counts, preds_flat)
+      result = -1
+      pi = 0
+      pcount = preds_counts[b]
+      pstart = preds_starts[b]
+      while pi < pcount
+        p = preds_flat[pstart + pi]
+        if @bb_idom[p] != -1
+          if result == -1
+            result = p
+          else
+            result = dom_intersect(result, p)
+          end
+        end
+        pi += 1
+      end
+      result
+    end
+
+    # b1, b2 の共通 dominator を求める。b1 のチェーンを visited に記録し、
+    # b2 のチェーンを遡って最初に visited な BB を返す。
+    # idom が -1 のチェーンに当たったら break (収束途中の状態)。
+    def dom_intersect(b1, b2)
+      nbb = @bb_first_insn.length
+      visited = []
+      i = 0
+      while i < nbb
+        visited.push(0)
+        i += 1
+      end
+      cur = b1
+      visited[cur] = 1
+      parent = @bb_idom[cur]
+      while parent != cur && parent != -1
+        cur = parent
+        visited[cur] = 1
+        parent = @bb_idom[cur]
+      end
+      cur = b2
+      while visited[cur] == 0
+        parent = @bb_idom[cur]
+        if parent == cur || parent == -1
+          # 収束途中で共通祖先が確定しない (次の iter で再評価される)
+          return cur
+        end
+        cur = parent
+      end
+      cur
+    end
+
+    # Cytron らの DF 計算。各合流点 b について、各 pred p から b の idom まで
+    # 遡る間の各 BB に b を DF として記録する。
+    def pass_compute_df
+      nbb = @bb_first_insn.length
+      if nbb == 0
+        return nil
+      end
+      preds_starts = []
+      preds_counts = []
+      preds_flat   = []
+      build_preds_table(nbb, preds_starts, preds_counts, preds_flat)
+      # 合流点判定 + 各 BB が他 BB の DF に含まれるかをフラグ matrix で集計。
+      is_df = []
+      i = 0
+      total = nbb * nbb
+      while i < total
+        is_df.push(0)
+        i += 1
+      end
+      b = 0
+      while b < nbb
+        if preds_counts[b] >= 2 && @bb_idom[b] != -1
+          pi = 0
+          while pi < preds_counts[b]
+            p = preds_flat[preds_starts[b] + pi]
+            # unreachable pred (clean_cfg で削除された BB) は idom=-1 のままで
+            # 走査すると `is_df[dead_bb * nbb + b]` に誤って書き込まれて、JIT-3b3 で
+            # phi 配置を狂わせる。pred ループ入口でガードする。
+            if @bb_idom[p] != -1
+              runner = p
+              while runner != @bb_idom[b] && runner != -1
+                is_df[runner * nbb + b] = 1
+                parent = @bb_idom[runner]
+                if parent == runner || parent == -1
+                  runner = -1
+                else
+                  runner = parent
+                end
+              end
+            end
+            pi += 1
+          end
+        end
+        b += 1
+      end
+      # フラグ matrix を SoA flat に変換。
+      b = 0
+      while b < nbb
+        @bb_df_starts.push(@bb_df_flat.length)
+        cnt = 0
+        y = 0
+        while y < nbb
+          if is_df[b * nbb + y] == 1
+            @bb_df_flat.push(y)
+            cnt += 1
+          end
+          y += 1
+        end
+        @bb_df_counts.push(cnt)
+        b += 1
+      end
+      nil
+    end
+
+    def dump_cfg_analysis(m_idx)
+      STDERR.puts "ZJIT CFG analysis for method idx=#{m_idx}:"
+      b = 0
+      while b < @bb_first_insn.length
+        if bb_alive_count(b) > 0
+          idom_str = format_bb_idom(b)
+          df_str   = format_bb_df(b)
+          STDERR.puts "  BB#{b}: idom=#{idom_str}, DF={#{df_str}}"
+        end
+        b += 1
+      end
+      nil
+    end
+
+    def format_bb_idom(b)
+      result = "?"
+      ib = @bb_idom[b]
+      if ib >= 0
+        result = "BB" + ib.to_s
+      end
+      result
+    end
+
+    def format_bb_df(b)
+      result = ""
+      start = @bb_df_starts[b]
+      count = @bb_df_counts[b]
+      i = 0
+      while i < count
+        if i > 0
+          result = result + ", "
+        end
+        result = result + "BB" + @bb_df_flat[start + i].to_s
+        i += 1
+      end
+      result
     end
   end
 end
