@@ -90,6 +90,15 @@ spinel の whole-program 型推論は厳しい。以下を破ると AOT ビル�
     `name.to_sym` を Token に乗せると Token のフィールド型が Token* と推論される
     壊滅的なバグが起きる。`@bytes` 上の `(start << 16) | len` の packed 値で扱う。
 
+12. **ローカル bool 変数を「if 分岐切り替えのフラグ」として使わない**。
+    `first = true; while ... ; if first ; A ; first = false ; else ; B ; end ; end`
+    のような可変 bool ローカル変数を分岐に使うと、whole-program 推論が破壊され
+    無関係なクラス (例: ASTNode) のフィールドが `sp_RbVal` (poly) と推論されて
+    `iv_node_left = sp_RbVal` の型不整合でビルドエラーになる (JIT-3b の CFG 構築
+    パスで顕在化)。代わりに `count = 0` の Integer カウンタで `if count == 0`
+    判定するか、戻り値の式で bool を直接構築する。`fixnum?` `truthy?` 等の述語
+    メソッドは bool 戻り値を直接返す形 (中間 bool ローカル変数なし) なら問題ない。
+
 新しい AST kind や opcode を追加するときも上記すべてを守ること。Stage 1 までで
 これらを破るとビルドが通らないことを実証済み。
 
