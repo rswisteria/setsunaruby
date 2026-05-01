@@ -1734,8 +1734,8 @@ module Setsunaruby
     # `[i] = v` はその場で `@heap_arr_pool[start + i] = v`。
 
     def heap_array_alloc(size)
-      # スタックからの pop はトップから逆順なので一旦ローカル IntArray に逆順で退避し、
-      # その後 @heap_arr_pool に正順で push する。NIL_VAL 一時埋めの中間 pass を省ける。
+      # スタックからの pop はトップから逆順なので、一旦ローカル IntArray に逆順で退避してから
+      # @heap_arr_pool に正順で push する。
       reversed = []
       i = 0
       while i < size
@@ -1754,29 +1754,30 @@ module Setsunaruby
       box_heap(@heap_kind.length - 1)
     end
 
-    # `a[i]` (read)。範囲外 (idx >= len) は Ruby と同じく nil。
-    # 負 index は Stage 3b スコープ外として明示エラー。
-    def heap_array_get(arr_id, idx)
-      arr_idx = unbox_heap(arr_id)
-      len = @heap_lens[arr_idx]
+    # 配列 obj_id と idx を渡すと、共通の検証 (負 index 拒否) を行ってから
+    # heap slot idx を返す。範囲外判定は呼び出し側の責務 (read=nil/write=raise が違うため)。
+    def heap_array_resolve(arr_id, idx)
       if idx < 0
         raise "IndexError: 負 index は Stage 3b スコープ外"
       end
-      if idx >= len
+      unbox_heap(arr_id)
+    end
+
+    # `a[i]` (read)。範囲外 (idx >= len) は Ruby と同じく nil。
+    def heap_array_get(arr_id, idx)
+      arr_idx = heap_array_resolve(arr_id, idx)
+      if idx >= @heap_lens[arr_idx]
         ObjectVal::NIL_VAL
       else
         @heap_arr_pool[@heap_starts[arr_idx] + idx]
       end
     end
 
-    # `a[i] = v` (write)。範囲外への代入は Ruby は nil 埋めで拡張するが、
-    # Stage 3b では明示エラーで簡素化。値は呼び出し元が代入式の値として push する。
+    # `a[i] = v` (write)。Ruby は範囲外で nil 埋めで自動拡張するが、Stage 3b では
+    # 明示エラーにする (auto-extend は別 PR で扱う余地)。
     def heap_array_set(arr_id, idx, val)
-      arr_idx = unbox_heap(arr_id)
+      arr_idx = heap_array_resolve(arr_id, idx)
       len = @heap_lens[arr_idx]
-      if idx < 0
-        raise "IndexError: 負 index は Stage 3b スコープ外"
-      end
       if idx >= len
         raise "IndexError: 範囲外への代入は Stage 3b スコープ外 (idx=#{idx}, len=#{len})"
       end
@@ -1789,13 +1790,8 @@ module Setsunaruby
     def heap_array_push_bang(arr_id, val)
       arr_idx = unbox_heap(arr_id)
       ll = @heap_lens[arr_idx]
-      old_start = @heap_starts[arr_idx]
       new_start = @heap_arr_pool.length
-      i = 0
-      while i < ll
-        @heap_arr_pool.push(@heap_arr_pool[old_start + i])
-        i += 1
-      end
+      arr_pool_copy(@heap_starts[arr_idx], ll)
       @heap_arr_pool.push(val)
       @heap_starts[arr_idx] = new_start
       @heap_lens[arr_idx]   = ll + 1
@@ -1804,6 +1800,17 @@ module Setsunaruby
 
     def heap_array_len(arr_id)
       @heap_lens[unbox_heap(arr_id)]
+    end
+
+    # @heap_arr_pool[src..src+len-1] を末尾に append する追記専用コピー。
+    # str_pool_copy の配列版 (両者とも追記専用 IntArray アリーナ)。
+    def arr_pool_copy(src, len)
+      i = 0
+      while i < len
+        @heap_arr_pool.push(@heap_arr_pool[src + i])
+        i += 1
+      end
+      nil
     end
 
     # 可変長 SLEB128 デコード (bytecode から @pc 起点で)
@@ -2714,7 +2721,6 @@ module Setsunaruby
         use_counts[@hir_op0[i]] += 1
         use_counts[@hir_op1[i]] += 1
       elsif binop_kind?(kind)
-        # arith / compare / fixnum_* / LSHIFT を全部包む
         use_counts[@hir_op0[i]] += 1
         use_counts[@hir_op1[i]] += 1
       elsif kind == HirOp::ARRAY_NEW
@@ -3459,7 +3465,6 @@ module Setsunaruby
         if kind == HirOp::JUMP_IF_FALSE
           @hir_op0[i] = resolve_rename(@hir_op0[i])
         elsif binop_kind?(kind)
-          # arith / compare / fixnum_* / LSHIFT を統合 (op0 = lhs, op1 = rhs)
           @hir_op0[i] = resolve_rename(@hir_op0[i])
           @hir_op1[i] = resolve_rename(@hir_op1[i])
         elsif kind == HirOp::ARRAY_NEW
