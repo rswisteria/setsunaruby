@@ -11,6 +11,12 @@ module Setsunaruby
   # ローカル変数名 (Symbol) を @local_names IntArray (sp_sym 配列) に
   # 蓄積する。VM 実行時は @locals IntArray (obj_id) を slot 番号でアクセス。
   class Interp
+    # JIT-1 (ZJIT 風プロファイル収集): カウンタが JIT_HOT_THRESHOLD と
+    # 「==」になる瞬間だけ log_jit_hot を呼ぶ。sentinel フラグなしに初回到達
+    # のみを検出できる (以降カウンタは増え続けるが等値にならない)。
+    JIT_ENABLED       = true
+    JIT_HOT_THRESHOLD = 100
+
     # ---- ASCII コード定数 (Lexer 用) ----
     NL    = 10
     TAB   =  9
@@ -79,6 +85,8 @@ module Setsunaruby
       @method_pcs          = []   # IntArray (本体の開始 PC)
       @method_arities      = []   # IntArray (パラメータ数)
       @method_local_counts = []   # IntArray (パラメータ含むローカル変数の総数)
+      # JIT-1: メソッド呼び出し回数 (m_idx インデックスで @method_pcs と並列)
+      @jit_call_counts = []
       # VM のコールフレームスタック (並列 IntArray)。
       # locals の縮小は @cur_base で行うので length 自体は記録しない。
       @cfp_pcs   = []   # IntArray (戻り PC)
@@ -107,6 +115,7 @@ module Setsunaruby
       @method_pcs          = []
       @method_arities      = []
       @method_local_counts = []
+      @jit_call_counts = []
       @cfp_pcs   = []
       @cfp_bases = []
       @cur_base  = 0
@@ -945,11 +954,13 @@ module Setsunaruby
         @method_pcs.push(method_pc)
         @method_arities.push(arity)
         @method_local_counts.push(0)
+        @jit_call_counts.push(0)
         i = @method_name_starts.length - 1
       else
         @method_pcs[i] = method_pc
         @method_arities[i] = arity
         @method_local_counts[i] = 0
+        @jit_call_counts[i] = 0   # 再定義: 新しい本体に対して hot 判定をやり直す
       end
       i
     end
@@ -1262,6 +1273,10 @@ module Setsunaruby
 
     def exec_call
       m_idx = decode_signed
+      @jit_call_counts[m_idx] = @jit_call_counts[m_idx] + 1
+      if JIT_ENABLED && @jit_call_counts[m_idx] == JIT_HOT_THRESHOLD
+        log_jit_hot(m_idx)
+      end
       argc = @method_arities[m_idx]
       local_count = @method_local_counts[m_idx]
 
@@ -1285,6 +1300,12 @@ module Setsunaruby
       @cur_base = new_base
       @pc = @method_pcs[m_idx]
       nil
+    end
+
+    # 名前ではなく idx で識別する。`@bytes` から名前を復元する文字列処理が
+    # spinel で安全に動くか未検証なため、Integer のみで運用する (CLAUDE.md ルール 11)。
+    def log_jit_hot(m_idx)
+      STDERR.puts "ZJIT: hot method detected (idx=#{m_idx})"
     end
 
     def exec_return

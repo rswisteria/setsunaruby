@@ -19,6 +19,7 @@ test-cruby:
 	ruby test/test_stage0.rb
 	ruby test/test_stage1.rb
 	ruby test/test_stage2.rb
+	ruby test/test_stage_jit.rb
 
 test-aot: build
 	ruby test/test_aot.rb
