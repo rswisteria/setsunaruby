@@ -14,6 +14,7 @@ module Setsunaruby
     KW_THEN   = :kw_then
     KW_DEF    = :kw_def
     KW_RETURN = :kw_return
+    STR      = :str        # 文字列リテラル (Stage 3a)。int_value = strlit_idx
     PLUS      = :plus
     MINUS    = :minus
     STAR     = :star
@@ -25,6 +26,7 @@ module Setsunaruby
     GT       = :gt
     LE       = :le
     GE       = :ge
+    LSHIFT   = :lshift     # `<<` (Stage 3a で文字列追加)
     LPAREN   = :lparen
     RPAREN   = :rparen
     COMMA    = :comma

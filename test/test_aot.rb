@@ -183,7 +183,24 @@ scope_aot = <<~RUBY
 RUBY
 assert_output(scope_aot, "99\n1\n", "メソッド内ローカルとトップレベルの分離")
 
+# ---- Stage 3a: 文字列 ----
+assert_output(%(puts "hello"\n),                      "hello\n",        "STR: ASCII リテラル")
+assert_output(%(puts "a\\nb"\n),                      "a\nb\n",         "STR: \\n escape")
+assert_output(%(puts "a\\tb"\n),                      "a\tb\n",         "STR: \\t escape")
+assert_output(%(puts "foo" + "bar"\n),                "foobar\n",       "STR: + 連結")
+assert_output(%(s = "ab" + "cd" + "ef"\nputs s\n),    "abcdef\n",       "STR: + 3 連結")
+assert_output(%(s = "abc"\ns << "de"\nputs s\n),      "abcde\n",        "STR: << 拡張")
+assert_output(%(a = "abc"\nb = a\na << "X"\nputs b\n), "abcX\n",        "STR: << 共有参照")
+assert_output(%(puts "abc" == "abc"\n),               "true\n",         "STR: == 同一内容")
+assert_output(%(puts "abc" == "abd"\n),               "false\n",        "STR: == 異内容")
+assert_output(%(puts "1" == 1\n),                     "false\n",        "STR: == 異型は false")
+assert_output(File.read(File.expand_path('../examples/string.rb', __dir__)),
+              "hello, setsunaruby\ntab\there\nline1\nline2\nStage 3a\n*****\nok\n",
+              "examples/string.rb")
+
 # ---- エラー系 ----
+assert_fails(%(puts "a" + 1\n),  "STR: + 型エラー")
+assert_fails(%(puts 1 << 1\n),   "STR: << は文字列のみ (Fixnum 不可)")
 assert_fails("puts 1 / 0\n",     "ゼロ除算")
 assert_fails("puts true + 1\n",  "型エラー")
 assert_fails("puts (1 + 2\n",    "閉じ括弧不足")

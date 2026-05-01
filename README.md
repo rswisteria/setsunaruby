@@ -7,7 +7,7 @@ Ruby 文法を持つ、スタックマシン型プログラミング言語の処
 「刹那」(10⁻¹⁸) から命名。mruby / nanoruby / picoruby に続く、
 さらに小さな Ruby 系列という位置付け。
 
-## 現状: Stage 0 / 0.5 / 1 / 2 / JIT-1 / JIT-2 / JIT-3a / JIT-3b1 / JIT-3b2 / JIT-3b3 / JIT-3c / JIT-4 (案 A) 完了
+## 現状: Stage 0 / 0.5 / 1 / 2 / 3a / JIT-1 / JIT-2 / JIT-3a / JIT-3b1 / JIT-3b2 / JIT-3b3 / JIT-3c / JIT-4 (案 A) 完了
 
 スタックマシン上で **再帰 `fib(20)` / アッカーマン / tarai が CRuby + spinel AOT 両方で動作**。
 
@@ -30,6 +30,10 @@ Ruby 文法を持つ、スタックマシン型プログラミング言語の処
 - **再帰** (自己再帰のみ。1 パスコンパイラのため相互再帰は不可)
 - **`return <expr>`** 早期離脱 (省略時の戻り値は最後の式)
 - **値渡しと独立スコープ** (メソッド内ローカルはトップレベルと別領域)
+- **文字列リテラル `"..."`** (escape: `\n` `\t` `\r` `\\` `\"` `\0`)
+- **文字列の連結 `+`** (新オブジェクトを返す immutable concat)
+- **文字列の追加 `<<`** (relocate-and-grow による in-place 拡張、共有参照に反映)
+- **文字列の比較 `==`** (バイト列の値比較、異型は常に false)
 
 ## クイックスタート
 
@@ -48,6 +52,8 @@ make test-cruby
 make test-aot
 make test-all
 ```
+
+(テスト件数は `make test-cruby` 出力で確認できる。Stage 3a 追加で +36 件。)
 
 ## ベンチマーク
 
@@ -96,7 +102,7 @@ CRuby の `VALUE` を踏襲したタグ付き即値方式。
 | false | 2 |
 | true | 4 |
 | Fixnum | `(n << 1) \| 1` (LSB=1) |
-| ヒープオブジェクト (Stage 1+) | `(idx << 3) \| 0b110` |
+| ヒープオブジェクト (Stage 3a 〜) | `(idx << 3) \| 0b110` |
 
 ### バイトコード
 
@@ -116,7 +122,13 @@ CRuby の `VALUE` を踏襲したタグ付き即値方式。
 | PUTS | 0x30 | – | top を pop して出力、nil を push |
 | CALL | 0x40 | SLEB128 method_idx | メソッド呼び出し (引数 argc 個 pop、結果 push) |
 | RETURN | 0x41 | – | コールフレーム破棄して呼び出し元へ |
+| PUSH_STR | 0x42 | SLEB128 strlit_idx | リテラル表からヒープ String を新規確保して push |
+| STR_LSHIFT | 0x43 | – | `<<`: lhs を relocate-and-grow で in-place 拡張、lhs を push |
 | HALT | 0xFF | – | 終了 |
+
+`+` (ADD) と `==` (EQ) は VM で多相化されており、両辺がヒープ String の場合は文字列
+連結 / 値比較として動作する。それ以外の組み合わせは Stage 0 の既存挙動 (整数 / 同値) を
+踏襲する。
 
 ジャンプオフセットは patch up の都合で **固定 3 バイト SLEB128** (±1M バイト範囲)。
 他の整数オペランド (整数リテラル、ローカル変数 idx) は通常の可変長 SLEB128。
@@ -144,6 +156,7 @@ spinel の型推論で混同されるのを防いでいる。
 - `:return_stmt` → `node_operand` (戻り値式)
 - `:param_cons` → `node_int_value` (param 名 packed)、`node_operand` (次の `:param_cons` or nil)
 - `:arg_cons` → `node_left` (引数式)、`node_operand` (次の `:arg_cons` or nil)
+- `:str_lit` → `node_int_value` (`@strlit_starts/lens` への idx。escape 解決後のバイトは `@str_pool` に格納済み)
 
 ローカル変数名は **`@bytes` 上のバイト範囲 (start, len) で識別**。
 Symbol/sp_sym を経由すると spinel の Token フィールド型推論が崩壊するため、
@@ -166,7 +179,8 @@ Symbol/sp_sym を経由すると spinel の Token フィールド型推論が崩
 | JIT-3c | プロファイル収集 + type_specialize + GuardFixnum | ✅ 完了 (Fixnum 特化命令) |
 | JIT-4 (案 A) | HIR → LIR lowering + arm64 エンコーダ + ダンプ (実機実行なし) | ✅ 完了 (アセンブリ + 機械語 hex を STDERR に出力) |
 | JIT-4 (案 C) | mmap + W^X + 関数ポインタ呼び出しでの実機実行 | 未着手 (spinel 拡張が前提) |
-| 3+ | 文字列・配列・ブロック・クラス・例外 | 未着手 |
+| 3a | 文字列リテラル・連結 (`+` `<<`) ・比較 (`==`) ・puts | ✅ 完了 |
+| 3b〜3e | 配列・ブロック・クラス・例外 | 未着手 |
 | ∞ | 自己ホスト (setsunaruby を setsunaruby で動かす) | 究極目標 |
 
 ## ディレクトリ構成
@@ -188,13 +202,15 @@ Symbol/sp_sym を経由すると spinel の Token フィールド型推論が崩
 │   ├── hello.rb
 │   ├── arith.rb
 │   ├── fizzbuzz.rb           # Stage 1: ローカル変数 + 制御構造のショーケース
-│   └── fib.rb                # Stage 2: 再帰のショーケース
+│   ├── fib.rb                # Stage 2: 再帰のショーケース
+│   └── string.rb             # Stage 3a: 文字列リテラル/+ /<< /== のショーケース
 ├── test/
 │   ├── test_stage0.rb        # CRuby Stage 0 テスト (38件)
 │   ├── test_stage1.rb        # CRuby Stage 1 テスト (28件)
 │   ├── test_stage2.rb        # CRuby Stage 2 テスト (26件)
+│   ├── test_stage3a.rb       # CRuby Stage 3a テスト (36件)
 │   ├── test_stage_jit.rb     # CRuby JIT-1/2/3a/3b1/3b2/3b3/3c/4 テスト (108件)
-│   └── test_aot.rb           # AOT テスト (47件)
+│   └── test_aot.rb           # AOT テスト (Stage 0/1/2/3a + JIT)
 ├── setsunaruby               # spinel ビルド成果物 (gitignore)
 └── Makefile
 ```
