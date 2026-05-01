@@ -122,6 +122,12 @@ module Setsunaruby
       # その hir_id を「reaching def の hir_id」に向ける。最後に apply_rename_targets で
       # 全 use を置換する。
       @hir_rename_target = []
+      # JIT-3c: 型プロファイルと特化用の bc_pc 逆引き。
+      # @profile_fixnum_pc[bc_pc] = 1 ならその PC の算術/比較が一度でも Fixnum で
+      # 実行された (= 特化候補)。@hir_bc_pc[hir_id] = その insn の出処 bytecode PC
+      # (-1 = bytecode 由来でない: LoadParam / Phi / GuardFixnum 等)。
+      @profile_fixnum_pc = []
+      @hir_bc_pc         = []
       # spinel AOT で ENV が解釈されない場合は常に false 相当 (HIR ダンプは CRuby のみ)。
       @dump_hir      = ENV["SETSUNARUBY_DUMP_HIR"] == "1"
       # VM のコールフレームスタック (並列 IntArray)。
@@ -178,6 +184,9 @@ module Setsunaruby
       @bb_dom_children_flat   = []
       @hir_phi_args      = []
       @hir_rename_target = []
+      @hir_bc_pc         = []
+      # @profile_fixnum_pc は bytecode コンパイル完了後に length 分一括確保するため、
+      # 冒頭リセットには含めない (= run_string 後半で `[] + push` 経由で初期化)。
       @dump_hir      = ENV["SETSUNARUBY_DUMP_HIR"] == "1"
       @cfp_pcs   = []
       @cfp_bases = []
@@ -195,6 +204,15 @@ module Setsunaruby
         @bytecode.push(Op::POP)
       end
       @bytecode.push(Op::HALT)
+
+      # JIT-3c: 型プロファイル配列を bytecode 全長分 0 で確保。VM の exec_arith /
+      # exec_compare が `@profile_fixnum_pc[bc_pc] = 1` で観測フラグを立てる。
+      @profile_fixnum_pc = []
+      i = 0
+      while i < @bytecode.length
+        @profile_fixnum_pc.push(0)
+        i += 1
+      end
 
       # @locals を local 数分 NIL_VAL で初期化
       @locals = []
@@ -1305,6 +1323,8 @@ module Setsunaruby
       if !fixnum?(lhs) || !fixnum?(rhs)
         raise "TypeError: arithmetic requires Integer operands"
       end
+      # JIT-3c: Fixnum 確定後に観測フラグ (= 「Fixnum で実行された」を意味する)。
+      @profile_fixnum_pc[@pc - 1] = 1
       a = unbox_int(lhs)
       b = unbox_int(rhs)
       result = 0
@@ -1332,8 +1352,12 @@ module Setsunaruby
     end
 
     def exec_eq
+      # JIT-3c: EQ は型違いも許容するが、両辺 Fixnum なら特化対象として観測。
       rhs = @stack.pop
       lhs = @stack.pop
+      if fixnum?(lhs) && fixnum?(rhs)
+        @profile_fixnum_pc[@pc - 1] = 1
+      end
       @stack.push(box_bool(lhs == rhs))
       nil
     end
@@ -1397,6 +1421,8 @@ module Setsunaruby
       if !fixnum?(lhs) || !fixnum?(rhs)
         raise "TypeError: comparison requires Integer operands"
       end
+      # JIT-3c: Fixnum 確定後に観測フラグ (exec_arith / exec_eq と同じ規約)。
+      @profile_fixnum_pc[@pc - 1] = 1
       a = unbox_int(lhs)
       b = unbox_int(rhs)
       r = false
@@ -1449,6 +1475,7 @@ module Setsunaruby
       @bb_dom_children_flat   = []
       @hir_phi_args      = []
       @hir_rename_target = []
+      @hir_bc_pc         = []
 
       # JIT-3b3: BB0 先頭にメソッドパラメータの初期 reaching def (LoadParam) を arity 個 emit。
       # rename DFS の時点で「未定義変数」エッジケースを避けるための前提セットアップ。
@@ -1617,6 +1644,8 @@ module Setsunaruby
         end
         if hir_id >= 0
           bc_to_hir[bc_pc] = hir_id
+          # JIT-3c: 出処 PC を記録 (pass_type_specialize での逆引きに使う)。
+          @hir_bc_pc[hir_id] = bc_pc
         end
       end
       @pc = saved_pc
@@ -1646,6 +1675,7 @@ module Setsunaruby
       pass_build_dom_children
       pass_insert_phis(m_idx)
       pass_rename_vars(m_idx)
+      pass_type_specialize
       dump_hir(m_idx, "optimized")
       dump_cfg_analysis(m_idx)
       nil
@@ -1654,12 +1684,15 @@ module Setsunaruby
     # `@hir_bb` は emit_hir では設定しない。pass_build_cfg が後付けで全 insn に
     # 一括で割り当てる。最適化パスで insn を追加する際は @hir_bb への push も
     # 忘れないこと (将来 phi 挿入を入れる JIT-3b2 で問題になりうる)。
+    # @hir_bc_pc は -1 で初期化。bytecode 走査ループが該当 hir_id を上書きする。
+    # Phi/GuardFixnum など bytecode 由来でない insn は -1 のまま。
     def emit_hir(kind, op0, op1, op2)
       @hir_kind.push(kind)
       @hir_op0.push(op0)
       @hir_op1.push(op1)
       @hir_op2.push(op2)
       @hir_deleted.push(0)
+      @hir_bc_pc.push(-1)
       @hir_kind.length - 1
     end
 
@@ -1681,6 +1714,8 @@ module Setsunaruby
             end
             i += 1
           end
+          # JIT-3c: 型特化で挿入された GuardFixnum を BB 末尾範囲外から拾って末尾表示。
+          dump_guards_for_bb(b)
         end
         b += 1
       end
@@ -1688,9 +1723,19 @@ module Setsunaruby
     end
 
     def dump_phis_for_bb(b)
+      dump_special_for_bb(b, HirOp::PHI)
+    end
+
+    def dump_guards_for_bb(b)
+      dump_special_for_bb(b, HirOp::GUARD_FIXNUM)
+    end
+
+    # phi / guard など、@bb_first_insn..@bb_last_insn 範囲外で BB 所属を @hir_bb で
+    # 記録する非通常 insn を、指定 kind で BB ごとに表示するヘルパー。
+    def dump_special_for_bb(b, target_kind)
       i = 0
       while i < @hir_kind.length
-        if @hir_kind[i] == HirOp::PHI && @hir_bb[i] == b && @hir_deleted[i] == 0
+        if @hir_kind[i] == target_kind && @hir_bb[i] == b && @hir_deleted[i] == 0
           STDERR.puts "    v#{i} = #{format_hir_insn(i)}"
         end
         i += 1
@@ -1791,6 +1836,28 @@ module Setsunaruby
         result = format_call_insn(op0, op1, op2)
       elsif kind == HirOp::RETURN
         result = "Return v#{op0}"
+      elsif kind == HirOp::GUARD_FIXNUM
+        result = "GuardFixnum v#{op0}"
+      elsif kind == HirOp::FIXNUM_ADD
+        result = "FixnumAdd v#{op0}, v#{op1}"
+      elsif kind == HirOp::FIXNUM_SUB
+        result = "FixnumSub v#{op0}, v#{op1}"
+      elsif kind == HirOp::FIXNUM_MUL
+        result = "FixnumMul v#{op0}, v#{op1}"
+      elsif kind == HirOp::FIXNUM_DIV
+        result = "FixnumDiv v#{op0}, v#{op1}"
+      elsif kind == HirOp::FIXNUM_MOD
+        result = "FixnumMod v#{op0}, v#{op1}"
+      elsif kind == HirOp::FIXNUM_EQ
+        result = "FixnumEq v#{op0}, v#{op1}"
+      elsif kind == HirOp::FIXNUM_LT
+        result = "FixnumLt v#{op0}, v#{op1}"
+      elsif kind == HirOp::FIXNUM_GT
+        result = "FixnumGt v#{op0}, v#{op1}"
+      elsif kind == HirOp::FIXNUM_LE
+        result = "FixnumLe v#{op0}, v#{op1}"
+      elsif kind == HirOp::FIXNUM_GE
+        result = "FixnumGe v#{op0}, v#{op1}"
       end
       result
     end
@@ -1848,6 +1915,20 @@ module Setsunaruby
 
     def compare_kind?(kind)
       kind >= HirOp::EQ && kind <= HirOp::GE
+    end
+
+    def fixnum_arith_kind?(kind)
+      kind >= HirOp::FIXNUM_ADD && kind <= HirOp::FIXNUM_MOD
+    end
+
+    def fixnum_compare_kind?(kind)
+      kind >= HirOp::FIXNUM_EQ && kind <= HirOp::FIXNUM_GE
+    end
+
+    # 二項算術/比較 (op0 = lhs, op1 = rhs の use パターン) の統合述語。
+    # accumulate_uses が将来の特化命令追加でも壊れないようまとめる。
+    def binop_kind?(kind)
+      arith_kind?(kind) || compare_kind?(kind) || fixnum_arith_kind?(kind) || fixnum_compare_kind?(kind)
     end
 
     def try_fold_binop(i, kind)
@@ -1966,9 +2047,11 @@ module Setsunaruby
       elsif kind == HirOp::JUMP_IF_FALSE
         use_counts[@hir_op0[i]] += 1
         use_counts[@hir_op1[i]] += 1
-      elsif arith_kind?(kind) || compare_kind?(kind)
+      elsif binop_kind?(kind)
         use_counts[@hir_op0[i]] += 1
         use_counts[@hir_op1[i]] += 1
+      elsif kind == HirOp::GUARD_FIXNUM
+        use_counts[@hir_op0[i]] += 1
       elsif kind == HirOp::PUTS
         use_counts[@hir_op0[i]] += 1
       elsif kind == HirOp::CALL
@@ -2024,6 +2107,12 @@ module Setsunaruby
         result = true   # 直接 use がなくても reaching def の起点なので削除しない
       elsif kind == HirOp::PHI
         result = true   # 現行のパス順では DCE は phi 挿入前だが、将来順序が変わっても誤削除されないよう保護
+      elsif kind == HirOp::GUARD_FIXNUM
+        result = true   # side exit を起こすので削除しない
+      elsif kind == HirOp::FIXNUM_DIV
+        result = true   # ゼロ除算で raise しうる
+      elsif kind == HirOp::FIXNUM_MOD
+        result = true
       end
       result
     end
@@ -2522,6 +2611,7 @@ module Setsunaruby
       @hir_op2.push(arity)
       @hir_deleted.push(0)
       @hir_bb.push(bb)
+      @hir_bc_pc.push(-1)
       @hir_kind.length - 1
     end
 
@@ -2699,6 +2789,81 @@ module Setsunaruby
         i += 1
       end
       nil
+    end
+
+    # ============================================================
+    # JIT-3c: type_specialize (Fixnum 特化 + GuardFixnum 挿入)
+    # ============================================================
+
+    # 各 ADD/SUB/MUL/DIV/MOD/EQ/LT/GT/LE/GE 命令について、対応する bytecode PC が
+    # @profile_fixnum_pc で観測されていれば Fixnum 特化版に kind 変更し、両 op に
+    # GuardFixnum を 1 個ずつ挿入。GuardFixnum は @hir_kind 末尾に append され
+    # @hir_bb で論理 BB を持つ (phi と同じ非通常 insn パターン)。
+    def pass_type_specialize
+      n_initial = @hir_kind.length
+      i = 0
+      while i < n_initial
+        if @hir_deleted[i] == 0
+          kind = @hir_kind[i]
+          if arith_kind?(kind) || compare_kind?(kind)
+            bc_pc = @hir_bc_pc[i]
+            if bc_pc >= 0 && @profile_fixnum_pc[bc_pc] == 1
+              specialize_binop(i, kind)
+            end
+          end
+        end
+        i += 1
+      end
+      nil
+    end
+
+    def specialize_binop(i, kind)
+      bb = @hir_bb[i]
+      lhs = @hir_op0[i]
+      rhs = @hir_op1[i]
+      guard_lhs = emit_guard_fixnum_at(bb, lhs)
+      guard_rhs = emit_guard_fixnum_at(bb, rhs)
+      @hir_kind[i] = fixnum_kind_for(kind)
+      @hir_op0[i]  = guard_lhs
+      @hir_op1[i]  = guard_rhs
+      nil
+    end
+
+    def emit_guard_fixnum_at(bb, value_hir_id)
+      @hir_kind.push(HirOp::GUARD_FIXNUM)
+      @hir_op0.push(value_hir_id)
+      @hir_op1.push(0)
+      @hir_op2.push(0)
+      @hir_deleted.push(0)
+      @hir_bb.push(bb)
+      @hir_bc_pc.push(-1)
+      @hir_kind.length - 1
+    end
+
+    def fixnum_kind_for(kind)
+      result = kind
+      if kind == HirOp::ADD
+        result = HirOp::FIXNUM_ADD
+      elsif kind == HirOp::SUB
+        result = HirOp::FIXNUM_SUB
+      elsif kind == HirOp::MUL
+        result = HirOp::FIXNUM_MUL
+      elsif kind == HirOp::DIV
+        result = HirOp::FIXNUM_DIV
+      elsif kind == HirOp::MOD
+        result = HirOp::FIXNUM_MOD
+      elsif kind == HirOp::EQ
+        result = HirOp::FIXNUM_EQ
+      elsif kind == HirOp::LT
+        result = HirOp::FIXNUM_LT
+      elsif kind == HirOp::GT
+        result = HirOp::FIXNUM_GT
+      elsif kind == HirOp::LE
+        result = HirOp::FIXNUM_LE
+      elsif kind == HirOp::GE
+        result = HirOp::FIXNUM_GE
+      end
+      result
     end
   end
 end

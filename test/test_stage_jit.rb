@@ -564,6 +564,77 @@ assert_eq(out, "45\n", "JIT-3b3: sum_to(10) = 45 (loop 結果不変)")
 assert_includes(opt_section, "Phi ", "JIT-3b3: while ループで phi 挿入")
 assert_excludes(opt_section, "StoreLocal", "JIT-3b3: while ループでも StoreLocal が消える")
 
+# ============================================================
+# JIT-3c: 型プロファイル + GuardFixnum + Fixnum 特化
+# ============================================================
+
+# ---- fib で算術/比較が Fixnum 特化される ----
+ENV["SETSUNARUBY_DUMP_HIR"] = "1"
+fib_typespec_src = <<~RUBY
+  def fib(n)
+    if n < 2
+      n
+    else
+      fib(n - 1) + fib(n - 2)
+    end
+  end
+  puts fib(10)
+RUBY
+begin
+  out, err = run_capture(fib_typespec_src)
+ensure
+  ENV.delete("SETSUNARUBY_DUMP_HIR")
+end
+raw_section, opt_section = split_dump_sections(err)
+assert_eq(out, "55\n", "JIT-3c: fib(10) 結果不変")
+# raw では generic Lt/Sub/Add
+assert_includes(raw_section, "Lt v",  "JIT-3c: raw に generic Lt")
+assert_includes(raw_section, "Sub v", "JIT-3c: raw に generic Sub")
+assert_includes(raw_section, "Add v", "JIT-3c: raw に generic Add")
+# optimized では FixnumLt/FixnumSub/FixnumAdd に特化
+assert_includes(opt_section, "FixnumLt ",  "JIT-3c: optimized で Lt → FixnumLt")
+assert_includes(opt_section, "FixnumSub ", "JIT-3c: optimized で Sub → FixnumSub")
+assert_includes(opt_section, "FixnumAdd ", "JIT-3c: optimized で Add → FixnumAdd")
+# GuardFixnum が各オペランドに挿入される
+assert_includes(opt_section, "GuardFixnum ", "JIT-3c: GuardFixnum が挿入される")
+
+# ---- 観測されない算術は特化されない (= プロファイル収集が機能) ----
+# 観測されない opcode を作るには、ホット検出前のメソッドで実行されない
+# arith があれば良い。実用的にはメソッド本体内で常に実行されるので、
+# 別の方法: 実行されないと観測フラグが立たない → 分岐の片側でしか実行されない
+# 算術を持つメソッドを作る。choose(true) を 100 回呼ぶと else 側 (x = 200) は
+# 一度も実行されないが、x の代入自体には算術がない。fib の場合は全 arith が
+# 必ず実行される。検証は fib の特化済みケースで十分。
+
+# ---- choose で if-else 各分岐の合流に GuardFixnum/Phi/特化が共存 ----
+ENV["SETSUNARUBY_DUMP_HIR"] = "1"
+arith_phi_src = <<~RUBY
+  def add_or_sub(c, a, b)
+    if c
+      r = a + b
+    else
+      r = a - b
+    end
+    r
+  end
+RUBY
+THRESHOLD.times { arith_phi_src << "add_or_sub(true, 7, 3)\n" }
+arith_phi_src << "puts add_or_sub(true, 10, 4)\nputs add_or_sub(false, 10, 4)\n"
+begin
+  out, err = run_capture(arith_phi_src)
+ensure
+  ENV.delete("SETSUNARUBY_DUMP_HIR")
+end
+_raw, opt_section = split_dump_sections(err)
+assert_eq(out, "14\n6\n", "JIT-3c: 結果不変")
+# c が真側 (a + b) しか実行されない場合、a - b の Sub は Fixnum 特化されない
+# (= profile_fixnum_pc が立っていない)。else 側を一度でも通すと特化される。
+# ホット検出の閾値到達時点で c=true 側のみ実行されているので、Sub は generic のまま
+assert_includes(opt_section, "FixnumAdd ", "JIT-3c: 観測された Add は特化される")
+# Sub は観測されていないので generic のまま
+assert_includes(opt_section, "Sub ",       "JIT-3c: 観測されない Sub は generic のまま残る")
+assert_excludes(opt_section, "FixnumSub ", "JIT-3c: 観測されない Sub は FixnumSub にならない")
+
 puts ""
-puts "#{$pass} passed, #{$fail} failed (JIT-1/2/3a/3b1/3b2/3b3)"
+puts "#{$pass} passed, #{$fail} failed (JIT-1/2/3a/3b1/3b2/3b3/3c)"
 exit($fail == 0 ? 0 : 1)
