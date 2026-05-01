@@ -2752,6 +2752,10 @@ module Setsunaruby
 
     # 全 use を rename_target で書き換える。LOAD_LOCAL の hir_id を参照していた箇所が
     # その reaching def hir_id に置換される。
+    # 注: HirOp::GUARD_FIXNUM / FIXNUM_* は pass_type_specialize で emit されるが、
+    # それは pass_rename_vars (= apply_rename_targets) より後なのでここでは扱わない。
+    # specialize_binop が emit_guard_fixnum_at に渡す lhs/rhs は既に rename 済み。
+    # pass 順を変える場合は GUARD_FIXNUM / FIXNUM_* の use 書き換えもここで必要。
     def apply_rename_targets
       i = 0
       n = @hir_kind.length
