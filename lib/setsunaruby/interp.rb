@@ -420,22 +420,20 @@ module Setsunaruby
       while @lex_pos < @bytes.length && ident_cont?(@bytes[@lex_pos])
         @lex_pos += 1
       end
-      # Stage 3c.3: 識別子末尾の `?` / `!` を 1 byte だけ先に取り込む。
-      # 取り込んだ場合はキーワード判定を行わない (`true?` は KW_TRUE ではなく IDENT)。
-      has_suffix = 0
+      # Stage 3c.3: 識別子末尾の `?` / `!` を 1 byte 取り込む。取り込んだ識別子は常に
+      # IDENT (キーワード判定を行わない)。`true?` は KW_TRUE ではなく IDENT として lex。
       if @lex_pos < @bytes.length
         last = @bytes[@lex_pos]
         if last == Q_MARK_B || last == BANG_B
           @lex_pos += 1
-          has_suffix = 1
+          packed = (start << 16) | (@lex_pos - start)
+          return Token.new(TokenKind::IDENT, packed, "", @line)
         end
       end
       len = @lex_pos - start
-      if has_suffix == 0
-        kw = match_keyword(start, len)
-        if kw != :nop
-          return Token.new(kw, 0, "", @line)
-        end
+      kw = match_keyword(start, len)
+      if kw != :nop
+        return Token.new(kw, 0, "", @line)
       end
       # IDENT: 名前は @bytes 上の (start, len) で識別する。
       # 識別子の最大長を 2^16 と仮定し、(start << 16) | len を int_value に格納。
@@ -734,40 +732,13 @@ module Setsunaruby
       end
       skip_newlines
       if brace
-        body = parse_brace_block_body
+        body = parse_block_seq(BLOCK_SEQ_MODE_BRACE)
         expect(TokenKind::RBRACE)
       else
-        body = parse_block
+        body = parse_block_seq(BLOCK_SEQ_MODE_DO_END)
         expect(TokenKind::KW_END)
       end
       ASTNode.new(:block_arg, param_packed, false, :nop, body, nil, nil)
-    end
-
-    # 中括弧ブロック専用のボディパーサ。`}` を終端とする以外は parse_block と同形。
-    def parse_brace_block_body
-      skip_newlines
-      if @cur_token.kind == TokenKind::RBRACE
-        return ASTNode.new(:nil_lit, 0, false, :nop, nil, nil, nil)
-      end
-      first = parse_statement
-      consume_brace_block_terminator
-      skip_newlines
-      if @cur_token.kind == TokenKind::RBRACE
-        return first
-      end
-      rest = parse_brace_block_body
-      ASTNode.new(:seq, 0, false, :nop, first, nil, rest)
-    end
-
-    def consume_brace_block_terminator
-      k = @cur_token.kind
-      # NEWLINE / 改行不要のセミコロン代替として `}` 直前は何もない (式 1 個直後 `}`) も許可。
-      if k == TokenKind::NEWLINE || k == TokenKind::EOF || k == TokenKind::RBRACE
-        # OK (NEWLINE は呼び出し元の skip_newlines で消費)
-      else
-        raise "Parse error: line #{@cur_token.line}: 文の終端 (改行/`}`) が必要です"
-      end
-      nil
     end
 
     def parse_multiplicative_from(node)
@@ -982,41 +953,56 @@ module Setsunaruby
       skip_newlines
     end
 
+    # ブロック本体パース mode 定数。
+    # do/end は KW_END / KW_ELSE / KW_ELSIF / EOF で終端、中括弧は RBRACE で終端。
+    BLOCK_SEQ_MODE_DO_END = 0
+    BLOCK_SEQ_MODE_BRACE  = 1
+
     # 複数文を右結合の :seq チェーンに組み立てる。
-    # 終端: end / else / elsif / EOF。
-    # 文の区切りは NEWLINE またはブロック終端キーワード (else/elsif/end) を許す。
+    # 文の区切りは NEWLINE または終端キーワードを許す。
     # これにより `if true then 10 else 20 end` のような単一行も書ける。
     def parse_block
+      parse_block_seq(BLOCK_SEQ_MODE_DO_END)
+    end
+
+    def parse_block_seq(mode)
       skip_newlines
-      if at_block_end?
+      if at_block_seq_end?(mode)
         return ASTNode.new(:nil_lit, 0, false, :nop, nil, nil, nil)
       end
       first = parse_statement
-      consume_block_terminator
+      consume_block_seq_terminator(mode)
       skip_newlines
-      if at_block_end?
+      if at_block_seq_end?(mode)
         return first
       end
-      rest = parse_block
+      rest = parse_block_seq(mode)
       ASTNode.new(:seq, 0, false, :nop, first, nil, rest)
     end
 
-    def consume_block_terminator
+    def at_block_seq_end?(mode)
       k = @cur_token.kind
+      if mode == BLOCK_SEQ_MODE_BRACE
+        return k == TokenKind::RBRACE
+      end
+      k == TokenKind::KW_END || k == TokenKind::KW_ELSE ||
+        k == TokenKind::KW_ELSIF || k == TokenKind::EOF
+    end
+
+    def consume_block_seq_terminator(mode)
+      k = @cur_token.kind
+      if mode == BLOCK_SEQ_MODE_BRACE
+        if k == TokenKind::NEWLINE || k == TokenKind::EOF || k == TokenKind::RBRACE
+          return nil
+        end
+        raise "Parse error: line #{@cur_token.line}: 文の終端 (改行/`}`) が必要です"
+      end
       if k == TokenKind::NEWLINE || k == TokenKind::EOF ||
          k == TokenKind::KW_END  || k == TokenKind::KW_ELSE ||
          k == TokenKind::KW_ELSIF
-        # OK (NEWLINE は呼び出し元の skip_newlines で消費)
-      else
-        raise "Parse error: line #{@cur_token.line}: 文の終端 (改行/end/else/elsif) が必要です"
+        return nil
       end
-      nil
-    end
-
-    def at_block_end?
-      k = @cur_token.kind
-      k == TokenKind::KW_END || k == TokenKind::KW_ELSE ||
-        k == TokenKind::KW_ELSIF || k == TokenKind::EOF
+      raise "Parse error: line #{@cur_token.line}: 文の終端 (改行/end/else/elsif) が必要です"
     end
 
     # expression := IDENT '=' expression       (代入は右結合)
