@@ -104,6 +104,14 @@ module Setsunaruby
       @bb_df_starts  = []   # IntArray (各 BB の DF chunk の開始 offset)
       @bb_df_counts  = []   # IntArray (各 BB の DF サイズ)
       @bb_df_flat    = []   # IntArray (DF の BB id を flat に並べる)
+      # CFG 構築直後に build_preds_table が一度だけ書き込み、dominator/DF/将来の
+      # phi 挿入の各パスから読み出す。
+      @bb_preds_starts = []
+      @bb_preds_counts = []
+      @bb_preds_flat   = []
+      # dom_intersect が呼ぶたびに毎回 nbb 個の配列を確保すると spinel の型推論
+      # にも allocator にも厳しいので、scratch IntArray として共有する。
+      @dom_visited     = []
       # spinel AOT で ENV が解釈されない場合は常に false 相当 (HIR ダンプは CRuby のみ)。
       @dump_hir      = ENV["SETSUNARUBY_DUMP_HIR"] == "1"
       # VM のコールフレームスタック (並列 IntArray)。
@@ -151,6 +159,10 @@ module Setsunaruby
       @bb_df_starts  = []
       @bb_df_counts  = []
       @bb_df_flat    = []
+      @bb_preds_starts = []
+      @bb_preds_counts = []
+      @bb_preds_flat   = []
+      @dom_visited     = []
       @dump_hir      = ENV["SETSUNARUBY_DUMP_HIR"] == "1"
       @cfp_pcs   = []
       @cfp_bases = []
@@ -1413,6 +1425,10 @@ module Setsunaruby
       @bb_df_starts  = []
       @bb_df_counts  = []
       @bb_df_flat    = []
+      @bb_preds_starts = []
+      @bb_preds_counts = []
+      @bb_preds_flat   = []
+      @dom_visited     = []
 
       start_pc = @method_pcs[m_idx]
       end_pc   = @method_body_ends[m_idx]
@@ -1594,6 +1610,8 @@ module Setsunaruby
       end
 
       pass_build_cfg
+      build_preds_table
+      init_dom_scratch
       dump_hir(m_idx, "raw")
       optimize_hir
       dump_hir(m_idx, "optimized")
@@ -2089,6 +2107,39 @@ module Setsunaruby
     # JIT-3b2: dominator tree + dominance frontier
     # ============================================================
 
+    # CFG 構築直後に各 BB の predecessor を SoA で集計する。pass_compute_dominators
+    # と pass_compute_df が共通参照する (build_and_dump_hir で 1 度だけ呼ぶ)。
+    def build_preds_table
+      nbb = @bb_first_insn.length
+      b = 0
+      while b < nbb
+        @bb_preds_starts.push(@bb_preds_flat.length)
+        cnt = 0
+        p = 0
+        while p < nbb
+          if @bb_succ0[p] == b || @bb_succ1[p] == b
+            @bb_preds_flat.push(p)
+            cnt += 1
+          end
+          p += 1
+        end
+        @bb_preds_counts.push(cnt)
+        b += 1
+      end
+      nil
+    end
+
+    # dom_intersect が再利用するスクラッチ配列を nbb 個 0 で確保する。
+    def init_dom_scratch
+      nbb = @bb_first_insn.length
+      i = 0
+      while i < nbb
+        @dom_visited.push(0)
+        i += 1
+      end
+      nil
+    end
+
     # Cooper et al. の "A Simple, Fast Dominance Algorithm" の素朴反復版。
     # BB 数が小さいので O(N^3) 程度でも問題ない。reverse postorder ではなく
     # 単純に BB id 昇順で走査し、idom が変化しなくなるまで繰り返す。
@@ -2104,17 +2155,13 @@ module Setsunaruby
         return nil
       end
       @bb_idom[0] = 0
-      preds_starts = []
-      preds_counts = []
-      preds_flat   = []
-      build_preds_table(nbb, preds_starts, preds_counts, preds_flat)
       changed = 1
       while changed != 0
         changed = 0
         b = 1
         while b < nbb
           if bb_alive_count(b) > 0
-            new_idom = compute_new_idom(b, preds_starts, preds_counts, preds_flat)
+            new_idom = compute_new_idom(b)
             if new_idom != -1 && @bb_idom[b] != new_idom
               @bb_idom[b] = new_idom
               changed = 1
@@ -2126,32 +2173,13 @@ module Setsunaruby
       nil
     end
 
-    def build_preds_table(nbb, preds_starts, preds_counts, preds_flat)
-      b = 0
-      while b < nbb
-        preds_starts.push(preds_flat.length)
-        cnt = 0
-        p = 0
-        while p < nbb
-          if @bb_succ0[p] == b || @bb_succ1[p] == b
-            preds_flat.push(p)
-            cnt += 1
-          end
-          p += 1
-        end
-        preds_counts.push(cnt)
-        b += 1
-      end
-      nil
-    end
-
-    def compute_new_idom(b, preds_starts, preds_counts, preds_flat)
+    def compute_new_idom(b)
       result = -1
       pi = 0
-      pcount = preds_counts[b]
-      pstart = preds_starts[b]
+      pcount = @bb_preds_counts[b]
+      pstart = @bb_preds_starts[b]
       while pi < pcount
-        p = preds_flat[pstart + pi]
+        p = @bb_preds_flat[pstart + pi]
         if @bb_idom[p] != -1
           if result == -1
             result = p
@@ -2164,30 +2192,29 @@ module Setsunaruby
       result
     end
 
-    # b1, b2 の共通 dominator を求める。b1 のチェーンを visited に記録し、
+    # b1, b2 の共通 dominator を求める。b1 のチェーンを @dom_visited に記録し、
     # b2 のチェーンを遡って最初に visited な BB を返す。
-    # idom が -1 のチェーンに当たったら break (収束途中の状態)。
+    # idom が -1 のチェーンに当たったら早期 return (収束途中の状態、次の iter
+    # で再評価される)。
     def dom_intersect(b1, b2)
       nbb = @bb_first_insn.length
-      visited = []
       i = 0
       while i < nbb
-        visited.push(0)
+        @dom_visited[i] = 0
         i += 1
       end
       cur = b1
-      visited[cur] = 1
+      @dom_visited[cur] = 1
       parent = @bb_idom[cur]
       while parent != cur && parent != -1
         cur = parent
-        visited[cur] = 1
+        @dom_visited[cur] = 1
         parent = @bb_idom[cur]
       end
       cur = b2
-      while visited[cur] == 0
+      while @dom_visited[cur] == 0
         parent = @bb_idom[cur]
         if parent == cur || parent == -1
-          # 収束途中で共通祖先が確定しない (次の iter で再評価される)
           return cur
         end
         cur = parent
@@ -2196,16 +2223,13 @@ module Setsunaruby
     end
 
     # Cytron らの DF 計算。各合流点 b について、各 pred p から b の idom まで
-    # 遡る間の各 BB に b を DF として記録する。
+    # 遡る間の各 BB に b を DF として記録する。preds テーブルは build_preds_table
+    # が事前に @bb_preds_* に格納済み。
     def pass_compute_df
       nbb = @bb_first_insn.length
       if nbb == 0
         return nil
       end
-      preds_starts = []
-      preds_counts = []
-      preds_flat   = []
-      build_preds_table(nbb, preds_starts, preds_counts, preds_flat)
       # 合流点判定 + 各 BB が他 BB の DF に含まれるかをフラグ matrix で集計。
       is_df = []
       i = 0
@@ -2216,10 +2240,10 @@ module Setsunaruby
       end
       b = 0
       while b < nbb
-        if preds_counts[b] >= 2 && @bb_idom[b] != -1
+        if @bb_preds_counts[b] >= 2 && @bb_idom[b] != -1
           pi = 0
-          while pi < preds_counts[b]
-            p = preds_flat[preds_starts[b] + pi]
+          while pi < @bb_preds_counts[b]
+            p = @bb_preds_flat[@bb_preds_starts[b] + pi]
             # unreachable pred (clean_cfg で削除された BB) は idom=-1 のままで
             # 走査すると `is_df[dead_bb * nbb + b]` に誤って書き込まれて、JIT-3b3 で
             # phi 配置を狂わせる。pred ループ入口でガードする。
