@@ -603,9 +603,8 @@ module Setsunaruby
       end
     end
 
-    # `yield` / `yield expr` / `yield (expr)` / `yield(expr)` のいずれかを 1 つ読む。
-    # Stage 3c.2 では argc 0 or 1 のみサポート。多引数 yield は将来。
-    # node_left に引数式を 1 つ載せる (引数なしのときは nil)。
+    # `yield` / `yield expr` / `yield(expr)` のいずれかを 1 つ読む。多引数は raise。
+    # node_left = 引数式 or nil。
     def parse_yield
       @cur_token = next_token   # consume `yield`
       k = @cur_token.kind
@@ -1532,10 +1531,9 @@ module Setsunaruby
       nil
     end
 
-    # `do |param| body end` ブロックを caller 側の bytecode に inline で配置する。
-    # 通常実行ではブロック領域を skip-jump で飛び越す。method_def の skip-jump パターンと同形。
-    # ブロック param は caller scope の名前付き local として宣言 (Stage 3c.1 と同じ flat scope)。
-    # 戻り値: ブロック先頭の PC (CALL_WITH_BLOCK の operand に渡す)。
+    # `do |param| body end` ブロックを caller 側の bytecode に inline で配置する
+    # (compile_method_def の skip-jump パターンと同形)。戻り値はブロック先頭の PC で
+    # CALL_WITH_BLOCK の operand に渡す。
     def compile_inline_block(block_node)
       skip = emit_jump(Op::JUMP)
       block_pc = @bytecode.length
@@ -2336,34 +2334,49 @@ module Setsunaruby
         i -= 1
       end
 
-      @cfp_pcs.push(@pc)
-      @cfp_bases.push(@cur_base)
-      @cfp_block_pcs.push(block_pc)
-      @cfp_block_arities.push(block_arity)
+      push_call_frame(@pc, @cur_base, block_pc, block_arity)
       @cur_base = new_base
       @pc = @method_pcs[m_idx]
+      nil
+    end
+
+    # コールフレームの 4 並列 IntArray を 1 操作に集約する。フィールド追加時に
+    # exec_call_common と exec_return の 2 箇所を同期する手間 (= ドリフト由来のバグ) を防ぐ。
+    def push_call_frame(pc, base, block_pc, block_arity)
+      @cfp_pcs.push(pc)
+      @cfp_bases.push(base)
+      @cfp_block_pcs.push(block_pc)
+      @cfp_block_arities.push(block_arity)
+      nil
+    end
+
+    # 4 並列 IntArray を pop し @pc / @cur_base に復元。block 情報は破棄。
+    # 複数戻り値で渡すと spinel の poly 推論を誘発しがちなので ivar を直接書き換える。
+    def pop_call_frame
+      @cfp_block_arities.pop
+      @cfp_block_pcs.pop
+      @cur_base = @cfp_bases.pop
+      @pc       = @cfp_pcs.pop
       nil
     end
 
     # Stage 3c.2: yield。現在のフレームの block_pc に飛び、@cur_base を caller のものに切り替える。
     # @yield_pcs / @yield_bases に method 側の状態を退避し、BLOCK_RETURN で復元する。
     # 引数は YIELD 直前にスタック上に積まれており、ブロックのプロローグが消費する。
-    # argc とブロックの param 数が一致しない場合はランタイムで弾く (Stage 3c.2 制約: 0 or 1)。
     def exec_yield
       argc = decode_signed
-      if @cfp_block_pcs.length == 0 || @cfp_block_pcs[@cfp_block_pcs.length - 1] < 0
+      top  = @cfp_block_pcs.length - 1
+      if top < 0 || @cfp_block_pcs[top] < 0
         raise "LocalJumpError: no block given (yield)"
       end
-      expected_arity = @cfp_block_arities[@cfp_block_arities.length - 1]
+      expected_arity = @cfp_block_arities[top]
       if argc != expected_arity
         raise "ArgumentError: yield arity mismatch (block expects #{expected_arity}, got #{argc})"
       end
-      block_pc    = @cfp_block_pcs[@cfp_block_pcs.length - 1]
-      caller_base = @cfp_bases[@cfp_bases.length - 1]
       @yield_pcs.push(@pc)
       @yield_bases.push(@cur_base)
-      @cur_base = caller_base
-      @pc = block_pc
+      @cur_base = @cfp_bases[top]
+      @pc       = @cfp_block_pcs[top]
       nil
     end
 
@@ -2380,10 +2393,7 @@ module Setsunaruby
       while @locals.length > @cur_base
         @locals.pop
       end
-      @cur_base = @cfp_bases.pop
-      @pc = @cfp_pcs.pop
-      @cfp_block_pcs.pop   # Stage 3c.2: 同フレームの block_pc も対で破棄
-      @cfp_block_arities.pop
+      pop_call_frame
       @stack.push(v)
       nil
     end
@@ -2650,8 +2660,8 @@ module Setsunaruby
           hir_id = emit_hir(HirOp::CALL, callee_idx, args_start, arity)
           sstack.push(hir_id)
         elsif op == Op::CALL_WITH_BLOCK
-          # Stage 3c.2: CALL と同形 + block_pc / block_arity の追加 operand。
-          # HIR は CALL と同じ kind=CALL_WITH_BLOCK で扱い、LIR には lower しない。
+          # block_pc / block_arity は HIR では使わないが operand 数を合わせるためデコード。
+          # LIR には lower しない (PUTS と同じ generic 経路)。
           callee_idx    = decode_signed
           _block_pc     = decode_signed
           _block_arity  = decode_signed
