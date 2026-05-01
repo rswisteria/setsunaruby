@@ -7,9 +7,11 @@ module Setsunaruby
   # 0x110/0x120=二項演算、0x130/0x140=I/O・関数)。空番は将来の同系列追加用に予約。
   module HirOp
     LOAD_CONST    = 0x101   # op0 = HirConstTag, op1 = INT のとき raw 整数値
-    LOAD_LOCAL    = 0x102   # op0 = slot idx
-    STORE_LOCAL   = 0x103   # op0 = slot idx, op1 = value (hir_id)
+    LOAD_LOCAL    = 0x102   # op0 = slot idx (JIT-3b3 rename で deleted=1 化、@hir_rename_target で reaching def に redirect)
+    STORE_LOCAL   = 0x103   # op0 = slot idx, op1 = value (hir_id) (JIT-3b3 rename で deleted=1 化)
     POP           = 0x105   # 引数なし。jump target 解決用に bc アドレスを占有する
+    PHI           = 0x106   # op0 = slot, op1 = phi_args の start_idx, op2 = pred 数
+    LOAD_PARAM    = 0x107   # op0 = slot idx (メソッドパラメータの初期 reaching def)
     JUMP          = 0x108   # op0 = target hir_id
     JUMP_IF_FALSE = 0x109   # op0 = cond (hir_id), op1 = target hir_id
 

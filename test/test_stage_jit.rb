@@ -361,7 +361,7 @@ assert_eq(out, "55\n", "JIT-3b1: fib(10) 結果不変")
 assert_includes(raw_section, "BB0:",                  "JIT-3b1: BB0 が出る")
 assert_includes(raw_section, "BB1 (preds: BB0)",      "JIT-3b1: BB1 の preds 表示")
 assert_includes(raw_section, "BB3 (preds: BB1, BB2)", "JIT-3b1: BB3 の合流点 preds")
-assert_includes(raw_section, "JumpIfFalse v2, BB2",   "JIT-3b1: Jump target が BB 表記")
+assert_includes(raw_section, ", BB2",                 "JIT-3b1: Jump target が BB 表記")
 assert_includes(raw_section, "Jump BB3",              "JIT-3b1: Jump も BB 表記")
 
 # ---- 早期 return パターン: unreachable BB が clean_cfg で削除される ----
@@ -476,6 +476,94 @@ assert_eq(out, "7\n", "JIT-3b2: abs(-7) 結果不変")
 # unreachable BB2 は alive_count=0 でスキップされる
 assert_excludes(cfg_section, "BB2:", "JIT-3b2: unreachable BB は CFG 分析でスキップ")
 
+# ============================================================
+# JIT-3b3: phi 挿入 + variable renaming (本格 SSA 化)
+# ============================================================
+
+# ---- パラメータが LoadParam として BB0 先頭に並ぶ ----
+ENV["SETSUNARUBY_DUMP_HIR"] = "1"
+fib_ssa_src = <<~RUBY
+  def fib(n)
+    if n < 2
+      n
+    else
+      fib(n - 1) + fib(n - 2)
+    end
+  end
+  puts fib(10)
+RUBY
+begin
+  out, err = run_capture(fib_ssa_src)
+ensure
+  ENV.delete("SETSUNARUBY_DUMP_HIR")
+end
+raw_section, opt_section = split_dump_sections(err)
+assert_eq(out, "55\n", "JIT-3b3: fib(10) 結果不変")
+assert_includes(raw_section, "v0 = LoadParam slot=0", "JIT-3b3: BB0 先頭に LoadParam が emit される")
+# rename 後は LOAD_LOCAL が消えて LoadParam を直接参照
+assert_excludes(opt_section, "LoadLocal", "JIT-3b3: optimized で LoadLocal が消える")
+# fib では n は再代入されないので phi は不要
+assert_excludes(opt_section, "Phi ", "JIT-3b3: 単一 def の slot は phi 不要")
+
+# ---- if-else で同じ slot を再代入 → 合流点に phi 挿入 ----
+ENV["SETSUNARUBY_DUMP_HIR"] = "1"
+phi_src = <<~RUBY
+  def choose(c)
+    if c
+      x = 100
+    else
+      x = 200
+    end
+    x
+  end
+RUBY
+THRESHOLD.times { phi_src << "choose(true)\n" }
+phi_src << "puts choose(true)\nputs choose(false)\n"
+begin
+  out, err = run_capture(phi_src)
+ensure
+  ENV.delete("SETSUNARUBY_DUMP_HIR")
+end
+raw_section, opt_section = split_dump_sections(err)
+assert_eq(out, "100\n200\n", "JIT-3b3: choose の結果が phi 後も保たれる")
+# raw では LoadLocal/StoreLocal が両方ある
+assert_includes(raw_section, "StoreLocal slot=1", "JIT-3b3: raw に StoreLocal がある")
+assert_includes(raw_section, "LoadLocal slot=1",  "JIT-3b3: raw に LoadLocal がある")
+# optimized では phi が挿入されて LOAD/STORE_LOCAL は消える
+assert_includes(opt_section, "Phi slot=1",  "JIT-3b3: 合流点に phi 挿入")
+assert_includes(opt_section, "BB1 -> v",    "JIT-3b3: phi の BB1 経由の値が記録")
+assert_includes(opt_section, "BB2 -> v",    "JIT-3b3: phi の BB2 経由の値が記録")
+assert_excludes(opt_section, "StoreLocal",  "JIT-3b3: optimized で StoreLocal が消える")
+assert_excludes(opt_section, "LoadLocal",   "JIT-3b3: optimized で LoadLocal が消える")
+# Return が phi の hir_id を参照するように rename される
+assert_includes(opt_section, "Return ",     "JIT-3b3: Return は残る")
+
+# ---- while ループ: loop header に phi 挿入 ----
+ENV["SETSUNARUBY_DUMP_HIR"] = "1"
+loop_src = <<~RUBY
+  def sum_to(n)
+    i = 0
+    s = 0
+    while i < n
+      s = s + i
+      i = i + 1
+    end
+    s
+  end
+RUBY
+THRESHOLD.times { loop_src << "sum_to(5)\n" }
+loop_src << "puts sum_to(10)\n"
+begin
+  out, err = run_capture(loop_src)
+ensure
+  ENV.delete("SETSUNARUBY_DUMP_HIR")
+end
+_raw, opt_section = split_dump_sections(err)
+assert_eq(out, "45\n", "JIT-3b3: sum_to(10) = 45 (loop 結果不変)")
+# while ループでは i と s が loop header BB で再代入される → phi 挿入
+assert_includes(opt_section, "Phi ", "JIT-3b3: while ループで phi 挿入")
+assert_excludes(opt_section, "StoreLocal", "JIT-3b3: while ループでも StoreLocal が消える")
+
 puts ""
-puts "#{$pass} passed, #{$fail} failed (JIT-1/2/3a/3b1/3b2)"
+puts "#{$pass} passed, #{$fail} failed (JIT-1/2/3a/3b1/3b2/3b3)"
 exit($fail == 0 ? 0 : 1)

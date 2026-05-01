@@ -112,6 +112,16 @@ module Setsunaruby
       # dom_intersect が呼ぶたびに毎回 nbb 個の配列を確保すると spinel の型推論
       # にも allocator にも厳しいので、scratch IntArray として共有する。
       @dom_visited     = []
+      # dominator tree の child リスト (rename DFS で使う)
+      @bb_dom_children_starts = []
+      @bb_dom_children_counts = []
+      @bb_dom_children_flat   = []
+      # JIT-3b3: phi の引数 (= 各 pred 経由での値)。preds 順に並ぶ value hir_id。
+      @hir_phi_args  = []
+      # rename で hir_id をリダイレクトするマップ。LOAD_LOCAL を消すために、
+      # その hir_id を「reaching def の hir_id」に向ける。最後に apply_rename_targets で
+      # 全 use を置換する。
+      @hir_rename_target = []
       # spinel AOT で ENV が解釈されない場合は常に false 相当 (HIR ダンプは CRuby のみ)。
       @dump_hir      = ENV["SETSUNARUBY_DUMP_HIR"] == "1"
       # VM のコールフレームスタック (並列 IntArray)。
@@ -163,6 +173,11 @@ module Setsunaruby
       @bb_preds_counts = []
       @bb_preds_flat   = []
       @dom_visited     = []
+      @bb_dom_children_starts = []
+      @bb_dom_children_counts = []
+      @bb_dom_children_flat   = []
+      @hir_phi_args      = []
+      @hir_rename_target = []
       @dump_hir      = ENV["SETSUNARUBY_DUMP_HIR"] == "1"
       @cfp_pcs   = []
       @cfp_bases = []
@@ -1429,6 +1444,20 @@ module Setsunaruby
       @bb_preds_counts = []
       @bb_preds_flat   = []
       @dom_visited     = []
+      @bb_dom_children_starts = []
+      @bb_dom_children_counts = []
+      @bb_dom_children_flat   = []
+      @hir_phi_args      = []
+      @hir_rename_target = []
+
+      # JIT-3b3: BB0 先頭にメソッドパラメータの初期 reaching def (LoadParam) を arity 個 emit。
+      # rename DFS の時点で「未定義変数」エッジケースを避けるための前提セットアップ。
+      arity = @method_arities[m_idx]
+      ai = 0
+      while ai < arity
+        emit_hir(HirOp::LOAD_PARAM, ai, 0, 0)
+        ai += 1
+      end
 
       start_pc = @method_pcs[m_idx]
       end_pc   = @method_body_ends[m_idx]
@@ -1614,6 +1643,9 @@ module Setsunaruby
       init_dom_scratch
       dump_hir(m_idx, "raw")
       optimize_hir
+      pass_build_dom_children
+      pass_insert_phis(m_idx)
+      pass_rename_vars(m_idx)
       dump_hir(m_idx, "optimized")
       dump_cfg_analysis(m_idx)
       nil
@@ -1638,6 +1670,9 @@ module Setsunaruby
         if bb_alive_count(b) > 0
           pred_str = format_bb_preds(b)
           STDERR.puts "  BB#{b}#{pred_str}:"
+          # JIT-3b3: phi insn は BB の論理的先頭にある (実際は @hir_kind の末尾に
+          # append されているので、@hir_bb で BB を引いて先に表示する)。
+          dump_phis_for_bb(b)
           i = @bb_first_insn[b]
           last = @bb_last_insn[b]
           while i <= last
@@ -1652,7 +1687,20 @@ module Setsunaruby
       nil
     end
 
+    def dump_phis_for_bb(b)
+      i = 0
+      while i < @hir_kind.length
+        if @hir_kind[i] == HirOp::PHI && @hir_bb[i] == b && @hir_deleted[i] == 0
+          STDERR.puts "    v#{i} = #{format_hir_insn(i)}"
+        end
+        i += 1
+      end
+      nil
+    end
+
     # BB 内で生きている (deleted=0) insn の数。0 ならその BB は完全に消えている。
+    # PHI insn は @bb_first_insn..@bb_last_insn の範囲外 (= @hir_kind の末尾に
+    # append される) なので含まない。phi だけが残る BB は現行のパス順では発生しない。
     def bb_alive_count(b)
       count = 0
       i = @bb_first_insn[b]
@@ -1705,10 +1753,14 @@ module Setsunaruby
         end
       elsif kind == HirOp::LOAD_LOCAL
         result = "LoadLocal slot=#{op0}"
+      elsif kind == HirOp::LOAD_PARAM
+        result = "LoadParam slot=#{op0}"
       elsif kind == HirOp::STORE_LOCAL
         result = "StoreLocal slot=#{op0}, v#{op1}"
       elsif kind == HirOp::POP
         result = "Pop"
+      elsif kind == HirOp::PHI
+        result = format_phi_insn(i)
       elsif kind == HirOp::JUMP
         result = "Jump BB#{@hir_bb[op0]}"
       elsif kind == HirOp::JUMP_IF_FALSE
@@ -1929,8 +1981,19 @@ module Setsunaruby
         end
       elsif kind == HirOp::RETURN
         use_counts[@hir_op0[i]] += 1
+      elsif kind == HirOp::PHI
+        args_start = @hir_op1[i]
+        arity      = @hir_op2[i]
+        j = 0
+        while j < arity
+          v = @hir_phi_args[args_start + j]
+          if v >= 0
+            use_counts[v] += 1
+          end
+          j += 1
+        end
       end
-      # LOAD_CONST / LOAD_LOCAL / POP は op が即値またはなしなので加算不要。
+      # LOAD_CONST / LOAD_LOCAL / LOAD_PARAM / POP は op が即値またはなしなので加算不要。
       nil
     end
 
@@ -1957,6 +2020,8 @@ module Setsunaruby
         result = true   # ゼロ除算で raise しうる
       elsif kind == HirOp::MOD
         result = true
+      elsif kind == HirOp::LOAD_PARAM
+        result = true   # 直接 use がなくても reaching def の起点なので削除しない
       end
       result
     end
@@ -2319,6 +2384,314 @@ module Setsunaruby
         i += 1
       end
       result
+    end
+
+    def format_phi_insn(i)
+      slot = @hir_op0[i]
+      args_start = @hir_op1[i]
+      arity = @hir_op2[i]
+      bb = @hir_bb[i]
+      result = "Phi slot=" + slot.to_s + " ["
+      pred_start = @bb_preds_starts[bb]
+      ai = 0
+      while ai < arity
+        if ai > 0
+          result = result + ", "
+        end
+        pred_bb = @bb_preds_flat[pred_start + ai]
+        val = @hir_phi_args[args_start + ai]
+        result = result + "BB" + pred_bb.to_s + " -> v" + val.to_s
+        ai += 1
+      end
+      result = result + "]"
+      result
+    end
+
+    # ============================================================
+    # JIT-3b3: phi 挿入 + variable renaming (Cytron アルゴリズム)
+    # ============================================================
+
+    # 各 BB について dominator tree の子 BB を SoA で集める。rename DFS で使う。
+    def pass_build_dom_children
+      nbb = @bb_first_insn.length
+      b = 0
+      while b < nbb
+        @bb_dom_children_starts.push(@bb_dom_children_flat.length)
+        cnt = 0
+        c = 1   # BB0 は root なので親を持たない (idom[0] = 0 = 自分)
+        while c < nbb
+          if @bb_idom[c] == b && c != b
+            @bb_dom_children_flat.push(c)
+            cnt += 1
+          end
+          c += 1
+        end
+        @bb_dom_children_counts.push(cnt)
+        b += 1
+      end
+      nil
+    end
+
+    # 各ローカル変数 (slot) の def 集合に対して worklist で DF を辿り、合流点に phi 挿入。
+    # parameter は BB0 で定義されたとみなす (= LoadParam があるため has_def[0] = 1)。
+    def pass_insert_phis(m_idx)
+      num_slots = @method_local_counts[m_idx]
+      arity     = @method_arities[m_idx]
+      nbb = @bb_first_insn.length
+      if nbb == 0 || num_slots == 0
+        return nil
+      end
+      phi_at_bb = []
+      i = 0
+      total = nbb * num_slots
+      while i < total
+        phi_at_bb.push(-1)
+        i += 1
+      end
+      slot = 0
+      while slot < num_slots
+        has_def = []
+        i = 0
+        while i < nbb
+          has_def.push(0)
+          i += 1
+        end
+        # パラメータ (slot < arity) は BB0 先頭で LoadParam として定義済み。
+        # それ以外のローカル変数は STORE_LOCAL を通じてのみ定義され、BB0 に
+        # 自動的な def はない。
+        if slot < arity
+          has_def[0] = 1
+        end
+        i = 0
+        n = @hir_kind.length
+        while i < n
+          if @hir_deleted[i] == 0 && @hir_kind[i] == HirOp::STORE_LOCAL && @hir_op0[i] == slot
+            has_def[@hir_bb[i]] = 1
+          end
+          i += 1
+        end
+        worklist = []
+        i = 0
+        while i < nbb
+          if has_def[i] == 1
+            worklist.push(i)
+          end
+          i += 1
+        end
+        qhead = 0
+        while qhead < worklist.length
+          b = worklist[qhead]
+          qhead += 1
+          df_start = @bb_df_starts[b]
+          df_count = @bb_df_counts[b]
+          di = 0
+          while di < df_count
+            y = @bb_df_flat[df_start + di]
+            if phi_at_bb[y * num_slots + slot] < 0 && bb_alive_count(y) > 0
+              phi_arity = @bb_preds_counts[y]
+              args_start = @hir_phi_args.length
+              ai = 0
+              while ai < phi_arity
+                @hir_phi_args.push(-1)   # rename で確定する
+                ai += 1
+              end
+              phi_id = emit_phi_at(y, slot, args_start, phi_arity)
+              phi_at_bb[y * num_slots + slot] = phi_id
+              if has_def[y] == 0
+                has_def[y] = 1
+                worklist.push(y)
+              end
+            end
+            di += 1
+          end
+        end
+        slot += 1
+      end
+      nil
+    end
+
+    def emit_phi_at(bb, slot, args_start, arity)
+      @hir_kind.push(HirOp::PHI)
+      @hir_op0.push(slot)
+      @hir_op1.push(args_start)
+      @hir_op2.push(arity)
+      @hir_deleted.push(0)
+      @hir_bb.push(bb)
+      @hir_kind.length - 1
+    end
+
+    # dominator tree の DFS で reaching def stack を維持し、LOAD_LOCAL/STORE_LOCAL を
+    # SSA value に書き換える (Cytron rename)。LOAD_LOCAL は @hir_rename_target で
+    # reaching def hir_id にリダイレクトし、最後に apply_rename_targets で全 use を置換。
+    def pass_rename_vars(m_idx)
+      num_slots = @method_local_counts[m_idx]
+      nbb = @bb_first_insn.length
+      if nbb == 0 || num_slots == 0
+        return nil
+      end
+      n = @hir_kind.length
+      i = 0
+      while i < n
+        @hir_rename_target.push(i)
+        i += 1
+      end
+      reaching_top = []
+      i = 0
+      while i < num_slots
+        reaching_top.push(-1)
+        i += 1
+      end
+      saved_stack = []
+      rename_bb_visit(0, num_slots, reaching_top, saved_stack)
+      apply_rename_targets
+      nil
+    end
+
+    def rename_bb_visit(b, num_slots, reaching_top, saved_stack)
+      mark = saved_stack.length
+      # 1. この BB の phi (= def) を reaching_top に push
+      i = 0
+      n = @hir_kind.length
+      while i < n
+        if @hir_bb[i] == b && @hir_kind[i] == HirOp::PHI && @hir_deleted[i] == 0
+          slot = @hir_op0[i]
+          saved_stack.push(slot)
+          saved_stack.push(reaching_top[slot])
+          reaching_top[slot] = i
+        end
+        i += 1
+      end
+      # 2. 通常 insn を順に処理
+      i = @bb_first_insn[b]
+      last = @bb_last_insn[b]
+      while i <= last
+        if @hir_deleted[i] == 0
+          kind = @hir_kind[i]
+          if kind == HirOp::LOAD_PARAM
+            slot = @hir_op0[i]
+            saved_stack.push(slot)
+            saved_stack.push(reaching_top[slot])
+            reaching_top[slot] = i
+          elsif kind == HirOp::LOAD_LOCAL
+            slot = @hir_op0[i]
+            @hir_rename_target[i] = reaching_top[slot]
+            @hir_deleted[i] = 1
+          elsif kind == HirOp::STORE_LOCAL
+            slot = @hir_op0[i]
+            v = resolve_rename(@hir_op1[i])
+            saved_stack.push(slot)
+            saved_stack.push(reaching_top[slot])
+            reaching_top[slot] = v
+            @hir_deleted[i] = 1
+          end
+        end
+        i += 1
+      end
+      # 3. 後継の phi に args を埋める
+      s0 = @bb_succ0[b]
+      if s0 >= 0
+        fill_phi_args_for_succ(b, s0, reaching_top)
+      end
+      s1 = @bb_succ1[b]
+      if s1 >= 0
+        fill_phi_args_for_succ(b, s1, reaching_top)
+      end
+      # 4. dominator tree の子を再帰
+      ds = @bb_dom_children_starts[b]
+      dc = @bb_dom_children_counts[b]
+      di = 0
+      while di < dc
+        child = @bb_dom_children_flat[ds + di]
+        rename_bb_visit(child, num_slots, reaching_top, saved_stack)
+        di += 1
+      end
+      # 5. この BB で push した分を pop
+      while saved_stack.length > mark
+        prev_value = saved_stack.pop
+        slot = saved_stack.pop
+        reaching_top[slot] = prev_value
+      end
+      nil
+    end
+
+    def fill_phi_args_for_succ(from_bb, to_bb, reaching_top)
+      pred_start = @bb_preds_starts[to_bb]
+      pred_count = @bb_preds_counts[to_bb]
+      idx = -1
+      pi = 0
+      while pi < pred_count
+        if @bb_preds_flat[pred_start + pi] == from_bb
+          idx = pi
+        end
+        pi += 1
+      end
+      if idx < 0
+        return nil
+      end
+      i = 0
+      n = @hir_kind.length
+      while i < n
+        if @hir_bb[i] == to_bb && @hir_kind[i] == HirOp::PHI && @hir_deleted[i] == 0
+          slot = @hir_op0[i]
+          args_start = @hir_op1[i]
+          @hir_phi_args[args_start + idx] = reaching_top[slot]
+        end
+        i += 1
+      end
+      nil
+    end
+
+    # rename_target を辿って最終 def に解決 (path compression なしの素朴版)。
+    def resolve_rename(h)
+      if h < 0
+        return h
+      end
+      cur = h
+      while @hir_rename_target[cur] != cur
+        cur = @hir_rename_target[cur]
+      end
+      cur
+    end
+
+    # 全 use を rename_target で書き換える。LOAD_LOCAL の hir_id を参照していた箇所が
+    # その reaching def hir_id に置換される。
+    def apply_rename_targets
+      i = 0
+      n = @hir_kind.length
+      while i < n
+        kind = @hir_kind[i]
+        if kind == HirOp::JUMP_IF_FALSE
+          @hir_op0[i] = resolve_rename(@hir_op0[i])
+        elsif arith_kind?(kind) || compare_kind?(kind)
+          @hir_op0[i] = resolve_rename(@hir_op0[i])
+          @hir_op1[i] = resolve_rename(@hir_op1[i])
+        elsif kind == HirOp::PUTS
+          @hir_op0[i] = resolve_rename(@hir_op0[i])
+        elsif kind == HirOp::CALL
+          args_start = @hir_op1[i]
+          arity      = @hir_op2[i]
+          ai = 0
+          while ai < arity
+            @hir_call_args[args_start + ai] = resolve_rename(@hir_call_args[args_start + ai])
+            ai += 1
+          end
+        elsif kind == HirOp::RETURN
+          @hir_op0[i] = resolve_rename(@hir_op0[i])
+        elsif kind == HirOp::PHI
+          args_start = @hir_op1[i]
+          arity      = @hir_op2[i]
+          ai = 0
+          while ai < arity
+            v = @hir_phi_args[args_start + ai]
+            if v >= 0
+              @hir_phi_args[args_start + ai] = resolve_rename(v)
+            end
+            ai += 1
+          end
+        end
+        i += 1
+      end
+      nil
     end
   end
 end
