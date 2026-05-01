@@ -29,7 +29,11 @@ module Setsunaruby
 
     PUTS   = 0x130          # op0 = value (hir_id)
     CALL   = 0x140          # op0 = method_idx, op1 = args_start (in @hir_call_args), op2 = arity
-    RETURN = 0x141          # op0 = value (hir_id)
+    RETURN = 0x141
+
+    # Stage 3a: 文字列。LIR への lower はせず、HIR ダンプとプロファイル経路の整合のみ目的。
+    LOAD_STR = 0x180        # op0 = strlit_idx
+    STR_LSHIFT = 0x181      # op0 = lhs (hir_id), op1 = rhs (hir_id)
 
     # JIT-3c: 型特化命令。GUARD_FIXNUM は値が Fixnum でなければ side exit。
     # FIXNUM_* は Fixnum 入力前提で動作する特化命令。

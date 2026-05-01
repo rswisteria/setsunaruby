@@ -20,7 +20,10 @@ module Setsunaruby
     # ---- ASCII コード定数 (Lexer 用) ----
     NL    = 10
     TAB   =  9
+    CR_B  = 13       # '\r'
+    NUL_B = 0        # '\0'
     SP    = 32
+    DQUOTE_B  = 34   # '"'
     HASH  = 35
     LP    = 40
     RP    = 41
@@ -34,12 +37,20 @@ module Setsunaruby
     LT_BYTE = 60
     GT_BYTE = 62
     UND   = 95
+    BSLASH_B = 92    # '\\'
     D0    = 48
     D9    = 57
     A_LC  = 97
     Z_LC  = 122
     A_UC  = 65
     Z_UC  = 90
+    # 文字列エスケープの後続バイト (`\n` `\t` `\r` `\0` `\\` `\"`)。
+    ESC_N_B    = 110   # 'n'
+    ESC_T_B    = 116   # 't'
+    ESC_R_B    = 114   # 'r'
+    ESC_ZERO_B = 48    # '0' (= D0 と同値だが意図を分離)
+    # ヒープオブジェクト obj_id の下位 3 bit タグ。Stage 0 で予約した (idx<<3)|0b110。
+    HEAP_TAG = 6
 
     # キーワードバイト列。spinel の sp_String / const char* 不整合を避けるため
     # 文字列ではなくバイト配列で直接比較する。
@@ -145,6 +156,20 @@ module Setsunaruby
       @cfp_pcs   = []   # IntArray (戻り PC)
       @cfp_bases = []   # IntArray (戻り後の @cur_base)
       @cur_base  = 0    # 現在実行中の locals base
+      # Stage 3a: 文字列。
+      # @str_pool は IntArray (バイト配列) の追記専用アリーナ。
+      # リテラル (compile 時に escape 解決後の決定バイト列) と
+      # 実行時生成のヒープ String の両方が同じプールに格納される。
+      # `<<` の relocate-and-grow も @str_pool 末尾への append で表現するので、
+      # 「リテラル領域」と「ヒープ領域」を物理的に分離する必要はない。
+      @str_pool         = []   # IntArray (バイト)
+      @strlit_starts    = []   # IntArray (リテラル毎の @str_pool 開始 offset)
+      @strlit_lens      = []   # IntArray (リテラル毎の長さ)
+      # ヒープ String スロット表。obj_id = (idx << 3) | HEAP_TAG。
+      # スロットは @heap_str_starts/lens の同一 idx で並列。`<<` で書き換わる。
+      # GC はないので idx は単調増加 (削除なし)。
+      @heap_str_starts  = []
+      @heap_str_lens    = []
     end
 
     def run_file(path)
@@ -207,6 +232,12 @@ module Setsunaruby
       @cfp_pcs   = []
       @cfp_bases = []
       @cur_base  = 0
+      # Stage 3a: 文字列状態のリセット。
+      @str_pool         = []
+      @strlit_starts    = []
+      @strlit_lens      = []
+      @heap_str_starts  = []
+      @heap_str_lens    = []
 
       @cur_token = next_token
       while !at_end?
@@ -261,6 +292,8 @@ module Setsunaruby
           while @lex_pos < @bytes.length && @bytes[@lex_pos] != NL
             @lex_pos += 1
           end
+        elsif b == DQUOTE_B
+          return read_string
         elsif digit?(b)
           return read_number
         elsif ident_start?(b)
@@ -270,6 +303,57 @@ module Setsunaruby
         end
       end
       Token.new(TokenKind::EOF, 0, "", @line)
+    end
+
+    # 文字列リテラル `"..."` を読む。
+    # `\n \t \r \\ \" \0` のみ escape 対応。escape 解決後のバイト列を @str_pool に
+    # 直接追記し、@strlit_starts/@strlit_lens に新規エントリを追加する。
+    # Token の int_value にはそのリテラル idx を入れる。
+    def read_string
+      @lex_pos += 1   # consume opening "
+      pool_start = @str_pool.length
+      while @lex_pos < @bytes.length && @bytes[@lex_pos] != DQUOTE_B
+        b = @bytes[@lex_pos]
+        if b == BSLASH_B
+          if @lex_pos + 1 >= @bytes.length
+            raise "Lexer error: line #{@line}: 文字列の終端が見つかりません (escape の後)"
+          end
+          nb = @bytes[@lex_pos + 1]
+          decoded = nb
+          if nb == ESC_N_B
+            decoded = NL
+          elsif nb == ESC_T_B
+            decoded = TAB
+          elsif nb == ESC_R_B
+            decoded = CR_B
+          elsif nb == BSLASH_B
+            decoded = BSLASH_B
+          elsif nb == DQUOTE_B
+            decoded = DQUOTE_B
+          elsif nb == ESC_ZERO_B
+            decoded = NUL_B
+          else
+            raise "Lexer error: line #{@line}: 未対応の escape (バイト #{nb})"
+          end
+          @str_pool.push(decoded)
+          @lex_pos += 2
+        else
+          # 改行を含むそのままの byte (Ruby と異なり、生改行入り文字列リテラルも許容)。
+          if b == NL
+            @line += 1
+          end
+          @str_pool.push(b)
+          @lex_pos += 1
+        end
+      end
+      if @lex_pos >= @bytes.length
+        raise "Lexer error: line #{@line}: 文字列の終端 \" が見つかりません"
+      end
+      @lex_pos += 1   # consume closing "
+      lit_idx = @strlit_starts.length
+      @strlit_starts.push(pool_start)
+      @strlit_lens.push(@str_pool.length - pool_start)
+      Token.new(TokenKind::STR, lit_idx, "", @line)
     end
 
     def digit?(b)
@@ -393,6 +477,9 @@ module Setsunaruby
         if @lex_pos + 1 < @bytes.length && @bytes[@lex_pos + 1] == EQ
           @lex_pos += 2
           Token.new(TokenKind::LE, 0, "", @line)
+        elsif @lex_pos + 1 < @bytes.length && @bytes[@lex_pos + 1] == LT_BYTE
+          @lex_pos += 2
+          Token.new(TokenKind::LSHIFT, 0, "", @line)
         else
           @lex_pos += 1
           Token.new(TokenKind::LT, 0, "", @line)
@@ -473,6 +560,7 @@ module Setsunaruby
     def parse_expression_from(left, _line)
       left = parse_multiplicative_from(left)
       left = parse_additive_continue(left)
+      left = parse_shift_continue(left)
       left = parse_comparison_continue(left)
       left
     end
@@ -513,6 +601,17 @@ module Setsunaruby
         else
           break
         end
+      end
+      node
+    end
+
+    # `<<` は加減と比較の間。Ruby の優先順位 (`<<` は加減より低く比較より高い) と同じ。
+    # 左結合: `a << b << c` → `(a << b) << c`。
+    def parse_shift_continue(node)
+      while @cur_token.kind == TokenKind::LSHIFT
+        @cur_token = next_token
+        rhs = parse_additive
+        node = ASTNode.new(:bin_op, 0, false, :lshift, node, rhs, nil)
       end
       node
     end
@@ -735,6 +834,7 @@ module Setsunaruby
 
     def parse_comparison
       left = parse_additive
+      left = parse_shift_continue(left)
       parse_comparison_continue(left)
     end
 
@@ -763,6 +863,11 @@ module Setsunaruby
         v = @cur_token.int_value
         @cur_token = next_token
         ASTNode.new(:int_lit, v, false, :nop, nil, nil, nil)
+      elsif k == TokenKind::STR
+        # int_value はリテラル idx (lexer で @strlit_starts/@strlit_lens に登録済み)。
+        v = @cur_token.int_value
+        @cur_token = next_token
+        ASTNode.new(:str_lit, v, false, :nop, nil, nil, nil)
       elsif k == TokenKind::KW_TRUE
         @cur_token = next_token
         ASTNode.new(:bool_lit, 0, true, :nop, nil, nil, nil)
@@ -844,6 +949,10 @@ module Setsunaruby
       k = node.node_kind
       if k == :int_lit
         @bytecode.push(Op::PUSH_INT)
+        encode_signed(node.node_int_value)
+      elsif k == :str_lit
+        # node_int_value = strlit_idx。VM の PUSH_STR が毎回新しいヒープ String を確保する。
+        @bytecode.push(Op::PUSH_STR)
         encode_signed(node.node_int_value)
       elsif k == :bool_lit
         if node.node_bool_value
@@ -1101,6 +1210,8 @@ module Setsunaruby
         result = Op::LE
       elsif op == :ge
         result = Op::GE
+      elsif op == :lshift
+        result = Op::STR_LSHIFT
       else
         raise "Compiler bug: unknown binop #{op}"
       end
@@ -1202,6 +1313,9 @@ module Setsunaruby
         if op == Op::PUSH_INT
           n = decode_signed
           @stack.push(box_int(n))
+        elsif op == Op::PUSH_STR
+          lit_idx = decode_signed
+          @stack.push(heap_str_alloc_from_lit(lit_idx))
         elsif op == Op::PUSH_TRUE
           @stack.push(ObjectVal::TRUE_VAL)
         elsif op == Op::PUSH_FALSE
@@ -1245,6 +1359,8 @@ module Setsunaruby
           exec_compare(:le)
         elsif op == Op::GE
           exec_compare(:ge)
+        elsif op == Op::STR_LSHIFT
+          exec_str_lshift
         elsif op == Op::PUTS
           v = @stack.pop
           puts to_puts_string(v)
@@ -1264,6 +1380,26 @@ module Setsunaruby
 
     def fixnum?(v)
       (v & 1) == 1
+    end
+
+    # Stage 3a: ヒープオブジェクトの判定とタグ付け。下位 3 bit が HEAP_TAG (= 0b110)。
+    # Fixnum (LSB=1)、TRUE_VAL=4 (= 0b100)、FALSE_VAL=2 (= 0b010)、NIL_VAL=0 とは
+    # 排他的に区別できる。
+    def heap_obj?(v)
+      (v & 7) == HEAP_TAG
+    end
+
+    def heap_str?(v)
+      # 現状ヒープオブジェクトは String のみ。Stage 3b 以降では kind 配列を併用する。
+      heap_obj?(v)
+    end
+
+    def box_heap_str(idx)
+      (idx << 3) | HEAP_TAG
+    end
+
+    def unbox_heap_str(v)
+      v >> 3
     end
 
     def truthy?(v)
@@ -1295,9 +1431,108 @@ module Setsunaruby
         "false"
       elsif v == ObjectVal::NIL_VAL
         ""
+      elsif heap_str?(v)
+        heap_str_to_ruby(v)
       else
         "#<obj>"
       end
+    end
+
+    # ヒープ String の中身を Ruby String に再構築する (puts 出力経路)。
+    # @str_pool[start..start+len-1] のバイトを 1 つずつ chr して連結する。
+    # 既存の format_hex32 が `result = result + ...` で文字列連結している前提で
+    # spinel が String + String を扱えることに依存している。
+    def heap_str_to_ruby(obj_id)
+      idx = unbox_heap_str(obj_id)
+      s = @heap_str_starts[idx]
+      l = @heap_str_lens[idx]
+      result = ""
+      i = 0
+      while i < l
+        result = result + @str_pool[s + i].chr
+        i += 1
+      end
+      result
+    end
+
+    # @str_pool[src..src+len-1] を末尾に append する追記専用コピー。
+    # 自己連結 (lhs == rhs) でも安全: 読み取り元は更新前のまま、書き込みは末尾だけ。
+    def str_pool_copy(src, len)
+      i = 0
+      while i < len
+        @str_pool.push(@str_pool[src + i])
+        i += 1
+      end
+      nil
+    end
+
+    # リテラル idx から新しいヒープ String を確保する。実行のたびに新スロットを
+    # 確保することで、Ruby のリテラル独立性 (`a = "x"; b = "x"; a.equal?(b) == false`) を
+    # 自然に得る (== は値比較として別実装)。
+    def heap_str_alloc_from_lit(lit_idx)
+      new_start = @str_pool.length
+      src_len   = @strlit_lens[lit_idx]
+      str_pool_copy(@strlit_starts[lit_idx], src_len)
+      @heap_str_starts.push(new_start)
+      @heap_str_lens.push(src_len)
+      box_heap_str(@heap_str_starts.length - 1)
+    end
+
+    # `+`: 新しいヒープ String を確保し、lhs/rhs のバイトを順に append する。
+    def heap_str_concat(lhs_id, rhs_id)
+      lhs_idx = unbox_heap_str(lhs_id)
+      rhs_idx = unbox_heap_str(rhs_id)
+      ll = @heap_str_lens[lhs_idx]
+      rl = @heap_str_lens[rhs_idx]
+      new_start = @str_pool.length
+      str_pool_copy(@heap_str_starts[lhs_idx], ll)
+      str_pool_copy(@heap_str_starts[rhs_idx], rl)
+      @heap_str_starts.push(new_start)
+      @heap_str_lens.push(ll + rl)
+      box_heap_str(@heap_str_starts.length - 1)
+    end
+
+    # `<<`: lhs slot の start/len を「新しい末尾位置 + 連結後の長さ」に書き換える
+    # (relocate-and-grow)。同じ obj_id を共有する別変数からも更新が見える Ruby 互換の
+    # ミューテーション。元の領域は abandon (no-GC)。
+    # 自己 append (`s << s`) でも安全: ll/rl とソース start を先に確定してから append し、
+    # 最後にスロットを更新するため、読み取り中にソースが書き換わることはない。
+    def heap_str_append_bang(lhs_id, rhs_id)
+      lhs_idx = unbox_heap_str(lhs_id)
+      rhs_idx = unbox_heap_str(rhs_id)
+      ll = @heap_str_lens[lhs_idx]
+      rl = @heap_str_lens[rhs_idx]
+      new_start = @str_pool.length
+      str_pool_copy(@heap_str_starts[lhs_idx], ll)
+      str_pool_copy(@heap_str_starts[rhs_idx], rl)
+      @heap_str_starts[lhs_idx] = new_start
+      @heap_str_lens[lhs_idx]   = ll + rl
+      lhs_id
+    end
+
+    # bytes_eq は @bytes 上の比較、こちらは @str_pool 上の比較。同じ Integer 配列上の
+    # 範囲比較ロジックなので構造は同型だが、対象配列が違うので別関数に分けてある。
+    def pool_bytes_eq(a, b, len)
+      mismatch = 0
+      i = 0
+      while i < len && mismatch == 0
+        if @str_pool[a + i] != @str_pool[b + i]
+          mismatch = 1
+        end
+        i += 1
+      end
+      mismatch == 0
+    end
+
+    def heap_str_eq(lhs_id, rhs_id)
+      lhs_idx = unbox_heap_str(lhs_id)
+      rhs_idx = unbox_heap_str(rhs_id)
+      ll = @heap_str_lens[lhs_idx]
+      result = false
+      if ll == @heap_str_lens[rhs_idx]
+        result = pool_bytes_eq(@heap_str_starts[lhs_idx], @heap_str_starts[rhs_idx], ll)
+      end
+      result
     end
 
     # 可変長 SLEB128 デコード (bytecode から @pc 起点で)
@@ -1336,6 +1571,12 @@ module Setsunaruby
     def exec_arith(op)
       rhs = @stack.pop
       lhs = @stack.pop
+      # Stage 3a: ADD のみ String 連結に多相化。両辺がヒープ String なら新規確保で連結。
+      # 片方が String、片方が Fixnum などの混在は TypeError。
+      if op == :add && heap_str?(lhs) && heap_str?(rhs)
+        @stack.push(heap_str_concat(lhs, rhs))
+        return nil
+      end
       if !fixnum?(lhs) || !fixnum?(rhs)
         raise "TypeError: arithmetic requires Integer operands"
       end
@@ -1369,12 +1610,28 @@ module Setsunaruby
 
     def exec_eq
       # JIT-3c: EQ は型違いも許容するが、両辺 Fixnum なら特化対象として観測。
+      # Stage 3a: 両辺がヒープ String ならバイト列の値比較。それ以外は obj_id 同値比較
+      # (Fixnum/bool/nil のいずれも tagged immediate なので一致が同値と等価)。
       rhs = @stack.pop
       lhs = @stack.pop
       if fixnum?(lhs) && fixnum?(rhs)
         @profile_fixnum_pc[@pc - 1] = 1
+        @stack.push(box_bool(lhs == rhs))
+      elsif heap_str?(lhs) && heap_str?(rhs)
+        @stack.push(box_bool(heap_str_eq(lhs, rhs)))
+      else
+        @stack.push(box_bool(lhs == rhs))
       end
-      @stack.push(box_bool(lhs == rhs))
+      nil
+    end
+
+    def exec_str_lshift
+      rhs = @stack.pop
+      lhs = @stack.pop
+      if !heap_str?(lhs) || !heap_str?(rhs)
+        raise "TypeError: << は文字列のみ対応 (Stage 3a)"
+      end
+      @stack.push(heap_str_append_bang(lhs, rhs))
       nil
     end
 
@@ -1541,6 +1798,11 @@ module Setsunaruby
           n = decode_signed
           hir_id = emit_hir(HirOp::LOAD_CONST, HirConstTag::INT, n, 0)
           sstack.push(hir_id)
+        elsif op == Op::PUSH_STR
+          # Stage 3a: ロード対象は strlit_idx そのもの。LIR には lower しない (PUTS と同様)。
+          lit_idx = decode_signed
+          hir_id = emit_hir(HirOp::LOAD_STR, lit_idx, 0, 0)
+          sstack.push(hir_id)
         elsif op == Op::PUSH_TRUE
           hir_id = emit_hir(HirOp::LOAD_CONST, HirConstTag::TRUE, 0, 0)
           sstack.push(hir_id)
@@ -1630,6 +1892,11 @@ module Setsunaruby
           rhs = sstack.pop
           lhs = sstack.pop
           hir_id = emit_hir(HirOp::GE, lhs, rhs, 0)
+          sstack.push(hir_id)
+        elsif op == Op::STR_LSHIFT
+          rhs = sstack.pop
+          lhs = sstack.pop
+          hir_id = emit_hir(HirOp::STR_LSHIFT, lhs, rhs, 0)
           sstack.push(hir_id)
         elsif op == Op::PUTS
           v = sstack.pop
@@ -1857,6 +2124,10 @@ module Setsunaruby
         result = "Ge v#{op0}, v#{op1}"
       elsif kind == HirOp::PUTS
         result = "Puts v#{op0}"
+      elsif kind == HirOp::LOAD_STR
+        result = "LoadStr lit=#{op0}"
+      elsif kind == HirOp::STR_LSHIFT
+        result = "StrLShift v#{op0}, v#{op1}"
       elsif kind == HirOp::CALL
         result = format_call_insn(op0, op1, op2)
       elsif kind == HirOp::RETURN
@@ -2075,6 +2346,9 @@ module Setsunaruby
       elsif binop_kind?(kind)
         use_counts[@hir_op0[i]] += 1
         use_counts[@hir_op1[i]] += 1
+      elsif kind == HirOp::STR_LSHIFT
+        use_counts[@hir_op0[i]] += 1
+        use_counts[@hir_op1[i]] += 1
       elsif kind == HirOp::GUARD_FIXNUM
         use_counts[@hir_op0[i]] += 1
       elsif kind == HirOp::PUTS
@@ -2138,6 +2412,8 @@ module Setsunaruby
         result = true   # ゼロ除算で raise しうる
       elsif kind == HirOp::FIXNUM_MOD
         result = true
+      elsif kind == HirOp::STR_LSHIFT
+        result = true   # ヒープ String を in-place ミューテーションするため除去禁止
       end
       result
     end
@@ -2789,6 +3065,9 @@ module Setsunaruby
         if kind == HirOp::JUMP_IF_FALSE
           @hir_op0[i] = resolve_rename(@hir_op0[i])
         elsif arith_kind?(kind) || compare_kind?(kind)
+          @hir_op0[i] = resolve_rename(@hir_op0[i])
+          @hir_op1[i] = resolve_rename(@hir_op1[i])
+        elsif kind == HirOp::STR_LSHIFT
           @hir_op0[i] = resolve_rename(@hir_op0[i])
           @hir_op1[i] = resolve_rename(@hir_op1[i])
         elsif kind == HirOp::PUTS

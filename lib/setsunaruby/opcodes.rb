@@ -28,6 +28,12 @@ module Setsunaruby
     CALL   = 0x40   # operand: SLEB128 method_idx
     RETURN = 0x41
 
+    # Stage 3a: 文字列。
+    # PUSH_STR は実行時に毎回新しいヒープ String を確保する (Ruby のリテラル独立性)。
+    # STR_LSHIFT は <<: lhs を relocate-and-grow で in-place 拡張し、lhs を push し直す。
+    PUSH_STR   = 0x42   # operand: SLEB128 strlit_idx
+    STR_LSHIFT = 0x43
+
     HALT = 0xFF
   end
 end
