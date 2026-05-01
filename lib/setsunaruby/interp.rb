@@ -1,6 +1,7 @@
 require_relative 'token'
 require_relative 'ast'
 require_relative 'opcodes'
+require_relative 'hir_opcodes'
 require_relative 'object'
 
 module Setsunaruby
@@ -83,7 +84,16 @@ module Setsunaruby
       @method_pcs          = []   # IntArray (本体の開始 PC)
       @method_arities      = []   # IntArray (パラメータ数)
       @method_local_counts = []   # IntArray (パラメータ含むローカル変数の総数)
+      @method_body_ends    = []   # IntArray (JIT-2: メソッド本体終了 PC、HIR 構築の範囲決定用)
       @jit_call_counts     = []   # IntArray (JIT-1: メソッド呼び出し回数)
+      # JIT-2: HIR (lite SSA) を SoA で保持。build_and_dump_hir が再構築する。
+      @hir_kind      = []   # IntArray (HirOp 定数)
+      @hir_op0       = []   # IntArray (kind ごとの 1 番目のオペランド)
+      @hir_op1       = []   # IntArray
+      @hir_op2       = []   # IntArray
+      @hir_call_args = []   # IntArray (CALL の引数 hir_id を flat に並べる)
+      # spinel AOT で ENV が解釈されない場合は常に false 相当 (HIR ダンプは CRuby のみ)。
+      @dump_hir      = ENV["SETSUNARUBY_DUMP_HIR"] == "1"
       # VM のコールフレームスタック (並列 IntArray)。
       # locals の縮小は @cur_base で行うので length 自体は記録しない。
       @cfp_pcs   = []   # IntArray (戻り PC)
@@ -112,7 +122,14 @@ module Setsunaruby
       @method_pcs          = []
       @method_arities      = []
       @method_local_counts = []
+      @method_body_ends    = []
       @jit_call_counts     = []
+      @hir_kind      = []
+      @hir_op0       = []
+      @hir_op1       = []
+      @hir_op2       = []
+      @hir_call_args = []
+      @dump_hir      = ENV["SETSUNARUBY_DUMP_HIR"] == "1"
       @cfp_pcs   = []
       @cfp_bases = []
       @cur_base  = 0
@@ -852,6 +869,8 @@ module Setsunaruby
 
       # メソッドのローカル変数総数 (パラメータ + body 内宣言) を確定。
       @method_local_counts[m_idx] = @local_starts.length - @scope_base
+      # JIT-2: HIR 構築の範囲を確定 (RETURN push 後の長さ)。
+      @method_body_ends[m_idx] = @bytecode.length
 
       # スコープから抜ける。method 内で使ったローカル名は捨てる。
       while @local_starts.length > @scope_base
@@ -951,12 +970,14 @@ module Setsunaruby
         @method_pcs.push(method_pc)
         @method_arities.push(arity)
         @method_local_counts.push(0)
+        @method_body_ends.push(-1)
         @jit_call_counts.push(0)
         i = @method_name_starts.length - 1
       else
         @method_pcs[i] = method_pc
         @method_arities[i] = arity
         @method_local_counts[i] = 0
+        @method_body_ends[i] = -1
         @jit_call_counts[i] = 0
       end
       i
@@ -1279,6 +1300,9 @@ module Setsunaruby
         @jit_call_counts[m_idx] = cnt
         if cnt == JIT_HOT_THRESHOLD
           STDERR.puts "ZJIT: hot method detected (idx=#{m_idx})"
+          if @dump_hir
+            build_and_dump_hir(m_idx)
+          end
         end
       end
       argc = @method_arities[m_idx]
@@ -1340,6 +1364,294 @@ module Setsunaruby
       end
       @stack.push(box_bool(r))
       nil
+    end
+
+    # ============================================================
+    # JIT-2: HIR 構築 + ダンプ
+    # ============================================================
+
+    # ホット検出時にメソッド本体の bytecode を lite SSA HIR に変換し、
+    # SETSUNARUBY_DUMP_HIR=1 のとき STDERR に表示する。
+    # phi は挿入せず、合流点は STORE_LOCAL/LOAD_LOCAL で表現する半 SSA。
+    # `@pc` を一時的に decode_signed のために借用する (VM 実行中の値は
+    # `saved_pc` に退避)。
+    def build_and_dump_hir(m_idx)
+      @hir_kind = []
+      @hir_op0  = []
+      @hir_op1  = []
+      @hir_op2  = []
+      @hir_call_args = []
+
+      start_pc = @method_pcs[m_idx]
+      end_pc   = @method_body_ends[m_idx]
+
+      # bytecode address → hir_id の写像 (-1 = 未マップ)。
+      # patch_jump の target が `@bytecode.length` (= end_pc 相当) になるケースに
+      # 備えて end_pc 自身も含む長さで確保する。POP も emit_hir するので、
+      # メソッド本体内のすべての jump target は必ずいずれかの hir_id にマップされる。
+      bc_to_hir = []
+      i = 0
+      while i <= end_pc
+        bc_to_hir.push(-1)
+        i += 1
+      end
+
+      # 仮想スタック (各要素は SSA value 番号 = hir_id)。
+      sstack = []
+      # 後で target を patch する jump 命令の (hir_id, target_bc) を別配列で記録。
+      pending_jump_ids     = []
+      pending_jump_targets = []
+
+      # decode_signed が @pc を進めるため一時的に借用する。VM 実行中の値は
+      # build_and_dump_hir 終了時に復元する (exec_call の続行に影響させない)。
+      saved_pc = @pc
+      @pc = start_pc
+      while @pc < end_pc
+        bc_pc = @pc
+        op = @bytecode[@pc]
+        @pc += 1
+        hir_id = -1
+        if op == Op::PUSH_INT
+          n = decode_signed
+          hir_id = emit_hir(HirOp::LOAD_CONST, HirConstTag::INT, n, 0)
+          sstack.push(hir_id)
+        elsif op == Op::PUSH_TRUE
+          hir_id = emit_hir(HirOp::LOAD_CONST, HirConstTag::TRUE, 0, 0)
+          sstack.push(hir_id)
+        elsif op == Op::PUSH_FALSE
+          hir_id = emit_hir(HirOp::LOAD_CONST, HirConstTag::FALSE, 0, 0)
+          sstack.push(hir_id)
+        elsif op == Op::PUSH_NIL
+          hir_id = emit_hir(HirOp::LOAD_CONST, HirConstTag::NIL, 0, 0)
+          sstack.push(hir_id)
+        elsif op == Op::POP
+          sstack.pop
+          # jump target が POP のアドレスを指すケース (中間 if + 早期 return 等)
+          # に備えて HIR insn を出して bc_to_hir に登録する。
+          hir_id = emit_hir(HirOp::POP, 0, 0, 0)
+        elsif op == Op::STORE_LOCAL
+          slot = decode_signed
+          # peek (bytecode の挙動: 値は残す)。空 sstack から `nil` が混入すると
+          # @hir_op1 の IntArray 推論が壊れる (spinel ルール 3) ためフェイルファスト。
+          if sstack.length == 0
+            raise "JIT-2 bug: STORE_LOCAL with empty sstack at pc=#{bc_pc}"
+          end
+          v = sstack[sstack.length - 1]
+          hir_id = emit_hir(HirOp::STORE_LOCAL, slot, v, 0)
+        elsif op == Op::LOAD_LOCAL
+          slot = decode_signed
+          hir_id = emit_hir(HirOp::LOAD_LOCAL, slot, 0, 0)
+          sstack.push(hir_id)
+        elsif op == Op::JUMP
+          rel = decode_signed_3
+          target_bc = @pc + rel
+          hir_id = emit_hir(HirOp::JUMP, -1, 0, 0)
+          pending_jump_ids.push(hir_id)
+          pending_jump_targets.push(target_bc)
+        elsif op == Op::JUMP_IF_FALSE
+          rel = decode_signed_3
+          target_bc = @pc + rel
+          cond = sstack.pop
+          hir_id = emit_hir(HirOp::JUMP_IF_FALSE, cond, -1, 0)
+          pending_jump_ids.push(hir_id)
+          pending_jump_targets.push(target_bc)
+        elsif op == Op::ADD
+          rhs = sstack.pop
+          lhs = sstack.pop
+          hir_id = emit_hir(HirOp::ADD, lhs, rhs, 0)
+          sstack.push(hir_id)
+        elsif op == Op::SUB
+          rhs = sstack.pop
+          lhs = sstack.pop
+          hir_id = emit_hir(HirOp::SUB, lhs, rhs, 0)
+          sstack.push(hir_id)
+        elsif op == Op::MUL
+          rhs = sstack.pop
+          lhs = sstack.pop
+          hir_id = emit_hir(HirOp::MUL, lhs, rhs, 0)
+          sstack.push(hir_id)
+        elsif op == Op::DIV
+          rhs = sstack.pop
+          lhs = sstack.pop
+          hir_id = emit_hir(HirOp::DIV, lhs, rhs, 0)
+          sstack.push(hir_id)
+        elsif op == Op::MOD
+          rhs = sstack.pop
+          lhs = sstack.pop
+          hir_id = emit_hir(HirOp::MOD, lhs, rhs, 0)
+          sstack.push(hir_id)
+        elsif op == Op::EQ
+          rhs = sstack.pop
+          lhs = sstack.pop
+          hir_id = emit_hir(HirOp::EQ, lhs, rhs, 0)
+          sstack.push(hir_id)
+        elsif op == Op::LT
+          rhs = sstack.pop
+          lhs = sstack.pop
+          hir_id = emit_hir(HirOp::LT, lhs, rhs, 0)
+          sstack.push(hir_id)
+        elsif op == Op::GT
+          rhs = sstack.pop
+          lhs = sstack.pop
+          hir_id = emit_hir(HirOp::GT, lhs, rhs, 0)
+          sstack.push(hir_id)
+        elsif op == Op::LE
+          rhs = sstack.pop
+          lhs = sstack.pop
+          hir_id = emit_hir(HirOp::LE, lhs, rhs, 0)
+          sstack.push(hir_id)
+        elsif op == Op::GE
+          rhs = sstack.pop
+          lhs = sstack.pop
+          hir_id = emit_hir(HirOp::GE, lhs, rhs, 0)
+          sstack.push(hir_id)
+        elsif op == Op::PUTS
+          v = sstack.pop
+          hir_id = emit_hir(HirOp::PUTS, v, 0, 0)
+          # bytecode の PUTS は nil を push するのでそれに合わせる。
+          nil_id = emit_hir(HirOp::LOAD_CONST, HirConstTag::NIL, 0, 0)
+          sstack.push(nil_id)
+        elsif op == Op::CALL
+          callee_idx = decode_signed
+          arity = @method_arities[callee_idx]
+          # underflow から `nil` が @hir_call_args (IntArray) に混入するのを防ぐ。
+          if sstack.length < arity
+            raise "JIT-2 bug: CALL underflow (need #{arity}, have #{sstack.length}) at pc=#{bc_pc}"
+          end
+          args_start = @hir_call_args.length
+          ai = sstack.length - arity
+          ae = sstack.length
+          while ai < ae
+            @hir_call_args.push(sstack[ai])
+            ai += 1
+          end
+          ai = 0
+          while ai < arity
+            sstack.pop
+            ai += 1
+          end
+          hir_id = emit_hir(HirOp::CALL, callee_idx, args_start, arity)
+          sstack.push(hir_id)
+        elsif op == Op::RETURN
+          v = sstack.pop
+          hir_id = emit_hir(HirOp::RETURN, v, 0, 0)
+        else
+          raise "JIT-2 bug: unknown opcode #{op} at pc=#{bc_pc}"
+        end
+        if hir_id >= 0
+          bc_to_hir[bc_pc] = hir_id
+        end
+      end
+      @pc = saved_pc
+
+      # JUMP / JUMP_IF_FALSE の target を hir_id に解決する。
+      pi = 0
+      while pi < pending_jump_ids.length
+        jhid = pending_jump_ids[pi]
+        target_bc = pending_jump_targets[pi]
+        target_hid = bc_to_hir[target_bc]
+        if target_hid < 0
+          raise "JIT-2 bug: jump target bc=#{target_bc} has no HIR mapping (m_idx=#{m_idx})"
+        end
+        if @hir_kind[jhid] == HirOp::JUMP
+          @hir_op0[jhid] = target_hid
+        else
+          @hir_op1[jhid] = target_hid
+        end
+        pi += 1
+      end
+
+      dump_hir(m_idx)
+      nil
+    end
+
+    def emit_hir(kind, op0, op1, op2)
+      @hir_kind.push(kind)
+      @hir_op0.push(op0)
+      @hir_op1.push(op1)
+      @hir_op2.push(op2)
+      @hir_kind.length - 1
+    end
+
+    def dump_hir(m_idx)
+      STDERR.puts "ZJIT HIR for method idx=#{m_idx}:"
+      i = 0
+      while i < @hir_kind.length
+        STDERR.puts "  v#{i} = #{format_hir_insn(i)}"
+        i += 1
+      end
+      nil
+    end
+
+    def format_hir_insn(i)
+      kind = @hir_kind[i]
+      op0  = @hir_op0[i]
+      op1  = @hir_op1[i]
+      op2  = @hir_op2[i]
+      result = "?"
+      if kind == HirOp::LOAD_CONST
+        if op0 == HirConstTag::NIL
+          result = "LoadConst nil"
+        elsif op0 == HirConstTag::TRUE
+          result = "LoadConst true"
+        elsif op0 == HirConstTag::FALSE
+          result = "LoadConst false"
+        elsif op0 == HirConstTag::INT
+          result = "LoadConst #{op1}"
+        end
+      elsif kind == HirOp::LOAD_LOCAL
+        result = "LoadLocal slot=#{op0}"
+      elsif kind == HirOp::STORE_LOCAL
+        result = "StoreLocal slot=#{op0}, v#{op1}"
+      elsif kind == HirOp::POP
+        result = "Pop"
+      elsif kind == HirOp::JUMP
+        result = "Jump v#{op0}"
+      elsif kind == HirOp::JUMP_IF_FALSE
+        result = "JumpIfFalse v#{op0}, v#{op1}"
+      elsif kind == HirOp::ADD
+        result = "Add v#{op0}, v#{op1}"
+      elsif kind == HirOp::SUB
+        result = "Sub v#{op0}, v#{op1}"
+      elsif kind == HirOp::MUL
+        result = "Mul v#{op0}, v#{op1}"
+      elsif kind == HirOp::DIV
+        result = "Div v#{op0}, v#{op1}"
+      elsif kind == HirOp::MOD
+        result = "Mod v#{op0}, v#{op1}"
+      elsif kind == HirOp::EQ
+        result = "Eq v#{op0}, v#{op1}"
+      elsif kind == HirOp::LT
+        result = "Lt v#{op0}, v#{op1}"
+      elsif kind == HirOp::GT
+        result = "Gt v#{op0}, v#{op1}"
+      elsif kind == HirOp::LE
+        result = "Le v#{op0}, v#{op1}"
+      elsif kind == HirOp::GE
+        result = "Ge v#{op0}, v#{op1}"
+      elsif kind == HirOp::PUTS
+        result = "Puts v#{op0}"
+      elsif kind == HirOp::CALL
+        result = format_call_insn(op0, op1, op2)
+      elsif kind == HirOp::RETURN
+        result = "Return v#{op0}"
+      end
+      result
+    end
+
+    def format_call_insn(callee_idx, args_start, arity)
+      result = "Call m#{callee_idx}("
+      ci = 0
+      while ci < arity
+        if ci > 0
+          result = result + ", "
+        end
+        arg_hid = @hir_call_args[args_start + ci]
+        result = result + "v#{arg_hid}"
+        ci += 1
+      end
+      result = result + ")"
+      result
     end
   end
 end
