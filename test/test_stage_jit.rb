@@ -394,6 +394,88 @@ assert_excludes(opt_section, "BB2:",  "JIT-3b1: optimized で unreachable BB が
 # 合流先の preds リストも更新されている (BB2 が消えるので merge BB の preds は BB3 のみ)
 assert_includes(opt_section, "(preds: BB3)", "JIT-3b1: clean 後 merge BB の preds が更新")
 
+# ============================================================
+# JIT-3b2: dominator tree + dominance frontier
+# ============================================================
+
+def split_cfg_section(err)
+  marker = "ZJIT CFG analysis"
+  idx = err.index(marker) || err.length
+  err[idx..-1].to_s
+end
+
+# ---- fib の dominator + DF ----
+ENV["SETSUNARUBY_DUMP_HIR"] = "1"
+fib_dom_src = <<~RUBY
+  def fib(n)
+    if n < 2
+      n
+    else
+      fib(n - 1) + fib(n - 2)
+    end
+  end
+  puts fib(10)
+RUBY
+begin
+  out, err = run_capture(fib_dom_src)
+ensure
+  ENV.delete("SETSUNARUBY_DUMP_HIR")
+end
+cfg_section = split_cfg_section(err)
+assert_eq(out, "55\n", "JIT-3b2: fib(10) 結果不変")
+assert_includes(cfg_section, "ZJIT CFG analysis for method idx=0:", "JIT-3b2: 分析ヘッダ")
+# fib は entry → (then|else) → merge の標準 diamond CFG
+assert_includes(cfg_section, "BB0: idom=BB0, DF={}",     "JIT-3b2: entry の idom は自分、DF 空")
+assert_includes(cfg_section, "BB1: idom=BB0, DF={BB3}",  "JIT-3b2: then 節の DF は merge")
+assert_includes(cfg_section, "BB2: idom=BB0, DF={BB3}",  "JIT-3b2: else 節の DF は merge")
+assert_includes(cfg_section, "BB3: idom=BB0, DF={}",     "JIT-3b2: merge BB の idom は entry")
+
+# ---- 単純メソッド (1 BB のみ): idom=自分、DF 空 ----
+ENV["SETSUNARUBY_DUMP_HIR"] = "1"
+simple_src = <<~RUBY
+  def f(n)
+    n + 1
+  end
+RUBY
+THRESHOLD.times { simple_src << "f(2)\n" }
+simple_src << "puts 0\n"
+begin
+  out, err = run_capture(simple_src)
+ensure
+  ENV.delete("SETSUNARUBY_DUMP_HIR")
+end
+cfg_section = split_cfg_section(err)
+assert_eq(out, "0\n",                            "JIT-3b2: 単純メソッド 結果不変")
+assert_includes(cfg_section, "BB0: idom=BB0, DF={}", "JIT-3b2: 単一 BB は idom=自分 DF 空")
+# 1 BB しかないので BB1 以降は出ない
+assert_excludes(cfg_section, "BB1:",                 "JIT-3b2: 1 BB のみ、BB1 以降は出ない")
+
+# ---- 早期 return + 中間 if (unreachable BB は分析からスキップ) ----
+ENV["SETSUNARUBY_DUMP_HIR"] = "1"
+abs_dom_src = <<~RUBY
+  def abs(n)
+    if n < 0
+      return -n
+    end
+    n
+  end
+  i = 0
+  while i < 100
+    abs(-7)
+    i = i + 1
+  end
+  puts abs(-7)
+RUBY
+begin
+  out, err = run_capture(abs_dom_src)
+ensure
+  ENV.delete("SETSUNARUBY_DUMP_HIR")
+end
+cfg_section = split_cfg_section(err)
+assert_eq(out, "7\n", "JIT-3b2: abs(-7) 結果不変")
+# unreachable BB2 は alive_count=0 でスキップされる
+assert_excludes(cfg_section, "BB2:", "JIT-3b2: unreachable BB は CFG 分析でスキップ")
+
 puts ""
-puts "#{$pass} passed, #{$fail} failed (JIT-1/2/3a/3b1)"
+puts "#{$pass} passed, #{$fail} failed (JIT-1/2/3a/3b1/3b2)"
 exit($fail == 0 ? 0 : 1)
