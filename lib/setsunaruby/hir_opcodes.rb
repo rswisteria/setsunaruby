@@ -30,6 +30,21 @@ module Setsunaruby
     PUTS   = 0x130          # op0 = value (hir_id)
     CALL   = 0x140          # op0 = method_idx, op1 = args_start (in @hir_call_args), op2 = arity
     RETURN = 0x141          # op0 = value (hir_id)
+
+    # JIT-3c: 型特化命令。GUARD_FIXNUM は値が Fixnum でなければ side exit。
+    # FIXNUM_* は Fixnum 入力前提で動作する特化命令。
+    GUARD_FIXNUM = 0x150    # op0 = guarded value (hir_id)
+    FIXNUM_ADD = 0x160      # op0 = lhs (hir_id, GuardFixnum 経由), op1 = rhs (同)
+    FIXNUM_SUB = 0x161
+    FIXNUM_MUL = 0x162
+    FIXNUM_DIV = 0x163
+    FIXNUM_MOD = 0x164
+
+    FIXNUM_EQ = 0x170
+    FIXNUM_LT = 0x171
+    FIXNUM_GT = 0x172
+    FIXNUM_LE = 0x173
+    FIXNUM_GE = 0x174
   end
 
   # LOAD_CONST のタグ。op1 に意味のある値が入るのは INT のみ。
