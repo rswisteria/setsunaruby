@@ -7,7 +7,7 @@ Ruby 文法を持つ、スタックマシン型プログラミング言語の処
 「刹那」(10⁻¹⁸) から命名。mruby / nanoruby / picoruby に続く、
 さらに小さな Ruby 系列という位置付け。
 
-## 現状: Stage 0 / 0.5 / 1 / 2 / 3a / JIT-1 / JIT-2 / JIT-3a / JIT-3b1 / JIT-3b2 / JIT-3b3 / JIT-3c / JIT-4 (案 A) 完了
+## 現状: Stage 0 / 0.5 / 1 / 2 / 3a / 3b / JIT-1 / JIT-2 / JIT-3a / JIT-3b1 / JIT-3b2 / JIT-3b3 / JIT-3c / JIT-4 (案 A) 完了
 
 スタックマシン上で **再帰 `fib(20)` / アッカーマン / tarai が CRuby + spinel AOT 両方で動作**。
 
@@ -34,6 +34,11 @@ Ruby 文法を持つ、スタックマシン型プログラミング言語の処
 - **文字列の連結 `+`** (新オブジェクトを返す immutable concat)
 - **文字列の追加 `<<`** (relocate-and-grow による in-place 拡張、共有参照に反映)
 - **文字列の比較 `==`** (バイト列の値比較、異型は常に false)
+- **配列リテラル `[a, b, c]`** (空 `[]` も可、末尾カンマ許容)
+- **インデックスアクセス `a[i]` / `a[i] = v`** (範囲外読み込みは nil、書き込みは Stage 3b スコープ外でエラー)
+- **配列の `<<`** (string と多相、要素 push)
+- **配列の `.length`** (Stage 3b 限定の dot method、一般 dispatch は Stage 3d)
+- **`puts` の配列展開** (要素ごとに別行、ネスト配列は再帰展開)
 
 ## クイックスタート
 
@@ -53,7 +58,7 @@ make test-aot
 make test-all
 ```
 
-(テスト件数は `make test-cruby` 出力で確認できる。Stage 3a 追加で +36 件。)
+(テスト件数は `make test-cruby` 出力で確認できる。Stage 3a +38 件、3b +39 件。)
 
 ## ベンチマーク
 
@@ -123,12 +128,23 @@ CRuby の `VALUE` を踏襲したタグ付き即値方式。
 | CALL | 0x40 | SLEB128 method_idx | メソッド呼び出し (引数 argc 個 pop、結果 push) |
 | RETURN | 0x41 | – | コールフレーム破棄して呼び出し元へ |
 | PUSH_STR | 0x42 | SLEB128 strlit_idx | リテラル表からヒープ String を新規確保して push |
-| STR_LSHIFT | 0x43 | – | `<<`: lhs を relocate-and-grow で in-place 拡張、lhs を push |
+| LSHIFT | 0x43 | – | `<<`: 両辺 String なら append、Array << any なら push (多相 dispatch) |
+| ARRAY_NEW | 0x44 | SLEB128 size | スタック上の size 個を pop してヒープ Array を確保 |
+| ARRAY_GET | 0x45 | – | pop idx, pop arr, push arr[idx] (範囲外は nil) |
+| ARRAY_SET | 0x46 | – | pop val, pop idx, pop arr, arr[idx]=val, push val |
+| ARRAY_LEN | 0x47 | – | pop arr, push fixnum(len) |
 | HALT | 0xFF | – | 終了 |
 
 `+` (ADD) と `==` (EQ) は VM で多相化されており、両辺がヒープ String の場合は文字列
 連結 / 値比較として動作する。それ以外の組み合わせは Stage 0 の既存挙動 (整数 / 同値) を
-踏襲する。
+踏襲する。`<<` (LSHIFT) も同様に String/Array で多相 dispatch する。
+
+ヒープオブジェクトは並列 IntArray の SoA で管理する:
+- `@heap_kind[idx]` — 1=String, 2=Array
+- `@heap_starts[idx]` / `@heap_lens[idx]` — kind に応じて `@str_pool` / `@heap_arr_pool` への offset / 長さ
+
+新しいヒープ型 (Stage 3d のクラスインスタンス等) を追加する際は `HEAP_KIND_*` 定数を
+増やし、専用の pool ivar を追加する。
 
 ジャンプオフセットは patch up の都合で **固定 3 バイト SLEB128** (±1M バイト範囲)。
 他の整数オペランド (整数リテラル、ローカル変数 idx) は通常の可変長 SLEB128。
@@ -157,6 +173,10 @@ spinel の型推論で混同されるのを防いでいる。
 - `:param_cons` → `node_int_value` (param 名 packed)、`node_operand` (次の `:param_cons` or nil)
 - `:arg_cons` → `node_left` (引数式)、`node_operand` (次の `:arg_cons` or nil)
 - `:str_lit` → `node_int_value` (`@strlit_starts/lens` への idx。escape 解決後のバイトは `@str_pool` に格納済み)
+- `:array_lit` → `node_left` (`:arg_cons` チェーン)。要素数は count_arg_chain で算出
+- `:index_get` → `node_left` (receiver)、`node_right` (index 式)
+- `:index_set` → `node_left` (receiver)、`node_right` (index 式)、`node_operand` (value 式)
+- `:method_call_on` → `node_int_value` (method 名 packed)、`node_left` (receiver)、`node_operand` (`:arg_cons` チェーン)
 
 ローカル変数名は **`@bytes` 上のバイト範囲 (start, len) で識別**。
 Symbol/sp_sym を経由すると spinel の Token フィールド型推論が崩壊するため、
@@ -180,7 +200,8 @@ Symbol/sp_sym を経由すると spinel の Token フィールド型推論が崩
 | JIT-4 (案 A) | HIR → LIR lowering + arm64 エンコーダ + ダンプ (実機実行なし) | ✅ 完了 (アセンブリ + 機械語 hex を STDERR に出力) |
 | JIT-4 (案 C) | mmap + W^X + 関数ポインタ呼び出しでの実機実行 | 未着手 (spinel 拡張が前提) |
 | 3a | 文字列リテラル・連結 (`+` `<<`) ・比較 (`==`) ・puts | ✅ 完了 |
-| 3b〜3e | 配列・ブロック・クラス・例外 | 未着手 |
+| 3b | 配列リテラル・index アクセス・`<<` 多相・`.length` | ✅ 完了 |
+| 3c〜3e | ブロック・クラス・例外 | 未着手 |
 | ∞ | 自己ホスト (setsunaruby を setsunaruby で動かす) | 究極目標 |
 
 ## ディレクトリ構成
@@ -203,14 +224,16 @@ Symbol/sp_sym を経由すると spinel の Token フィールド型推論が崩
 │   ├── arith.rb
 │   ├── fizzbuzz.rb           # Stage 1: ローカル変数 + 制御構造のショーケース
 │   ├── fib.rb                # Stage 2: 再帰のショーケース
-│   └── string.rb             # Stage 3a: 文字列リテラル/+ /<< /== のショーケース
+│   ├── string.rb             # Stage 3a: 文字列リテラル/+ /<< /== のショーケース
+│   └── array.rb              # Stage 3b: 配列/index/.length のショーケース
 ├── test/
 │   ├── test_stage0.rb        # CRuby Stage 0 テスト (38件)
 │   ├── test_stage1.rb        # CRuby Stage 1 テスト (28件)
 │   ├── test_stage2.rb        # CRuby Stage 2 テスト (26件)
-│   ├── test_stage3a.rb       # CRuby Stage 3a テスト (36件)
+│   ├── test_stage3a.rb       # CRuby Stage 3a テスト (38件)
+│   ├── test_stage3b.rb       # CRuby Stage 3b テスト (39件)
 │   ├── test_stage_jit.rb     # CRuby JIT-1/2/3a/3b1/3b2/3b3/3c/4 テスト (108件)
-│   └── test_aot.rb           # AOT テスト (Stage 0/1/2/3a + JIT)
+│   └── test_aot.rb           # AOT テスト (Stage 0/1/2/3a/3b + JIT)
 ├── setsunaruby               # spinel ビルド成果物 (gitignore)
 └── Makefile
 ```

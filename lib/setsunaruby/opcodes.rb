@@ -30,9 +30,18 @@ module Setsunaruby
 
     # Stage 3a: 文字列。
     # PUSH_STR は実行時に毎回新しいヒープ String を確保する (Ruby のリテラル独立性)。
-    # STR_LSHIFT は <<: lhs を relocate-and-grow で in-place 拡張し、lhs を push し直す。
+    # LSHIFT は <<: 両辺 String なら relocate-and-grow で in-place 拡張、Array なら push (Stage 3b)。
+    # 多相 dispatch は VM 側で receiver の heap kind に応じて行う。
     PUSH_STR   = 0x42   # operand: SLEB128 strlit_idx
-    STR_LSHIFT = 0x43
+    LSHIFT     = 0x43
+
+    # Stage 3b: 配列。
+    # ARRAY_NEW は size 個のスタック上要素を pop して新しい heap Array を確保する。
+    # ARRAY_GET / ARRAY_SET は a[i] / a[i]=v、ARRAY_LEN は a.length。
+    ARRAY_NEW = 0x44    # operand: SLEB128 size
+    ARRAY_GET = 0x45
+    ARRAY_SET = 0x46
+    ARRAY_LEN = 0x47
 
     HALT = 0xFF
   end

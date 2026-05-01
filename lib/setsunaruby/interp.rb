@@ -31,7 +31,10 @@ module Setsunaruby
     PLUS_BYTE  = 43
     COMMA_BYTE = 44
     MINUS_BYTE = 45
+    DOT_BYTE   = 46  # '.' (Stage 3b)
     SLASH_BYTE = 47
+    LBRACK_B   = 91  # '[' (Stage 3b)
+    RBRACK_B   = 93  # ']' (Stage 3b)
     PCT   = 37
     EQ    = 61
     LT_BYTE = 60
@@ -51,6 +54,9 @@ module Setsunaruby
     ESC_ZERO_B = 48    # '0' (= D0 と同値だが意図を分離)
     # ヒープオブジェクト obj_id の下位 3 bit タグ。Stage 0 で予約した (idx<<3)|0b110。
     HEAP_TAG = 6
+    # ヒープオブジェクトの kind (= @heap_kind の値)。Stage 3b 以降は要素を増やしていく。
+    HEAP_KIND_STRING = 1
+    HEAP_KIND_ARRAY  = 2
 
     # キーワードバイト列。spinel の sp_String / const char* 不整合を避けるため
     # 文字列ではなくバイト配列で直接比較する。
@@ -66,6 +72,9 @@ module Setsunaruby
     KW_THEN_BYTES   = [116, 104, 101, 110].freeze             # "then"
     KW_DEF_BYTES    = [100, 101, 102].freeze                  # "def"
     KW_RETURN_BYTES = [114, 101, 116, 117, 114, 110].freeze   # "return"
+    # Stage 3b: ドット method 名 (現状 length のみサポート)。将来 method_name_is_*? を
+    # 増やすときも同じ場所に追加する。
+    KW_LENGTH_BYTES = [108, 101, 110, 103, 116, 104].freeze   # "length"
 
     def initialize
       @src       = ""
@@ -156,20 +165,21 @@ module Setsunaruby
       @cfp_pcs   = []   # IntArray (戻り PC)
       @cfp_bases = []   # IntArray (戻り後の @cur_base)
       @cur_base  = 0    # 現在実行中の locals base
-      # Stage 3a: 文字列。
-      # @str_pool は IntArray (バイト配列) の追記専用アリーナ。
-      # リテラル (compile 時に escape 解決後の決定バイト列) と
-      # 実行時生成のヒープ String の両方が同じプールに格納される。
-      # `<<` の relocate-and-grow も @str_pool 末尾への append で表現するので、
-      # 「リテラル領域」と「ヒープ領域」を物理的に分離する必要はない。
-      @str_pool         = []   # IntArray (バイト)
-      @strlit_starts    = []   # IntArray (リテラル毎の @str_pool 開始 offset)
-      @strlit_lens      = []   # IntArray (リテラル毎の長さ)
-      # ヒープ String スロット表。obj_id = (idx << 3) | HEAP_TAG。
-      # スロットは @heap_str_starts/lens の同一 idx で並列。`<<` で書き換わる。
+      # Stage 3a/3b: ヒープオブジェクト。obj_id = (idx << 3) | HEAP_TAG。
+      # @heap_kind が 1=String, 2=Array を区別する (HEAP_KIND_STRING / HEAP_KIND_ARRAY)。
+      # @heap_starts/lens の解釈は kind に依存:
+      #   - String: @str_pool への byte offset / length
+      #   - Array:  @heap_arr_pool への element offset / length
       # GC はないので idx は単調増加 (削除なし)。
-      @heap_str_starts  = []
-      @heap_str_lens    = []
+      @heap_kind   = []
+      @heap_starts = []
+      @heap_lens   = []
+      # Stage 3a: 文字列バイトプール (リテラルと実行時生成の共有アリーナ)。
+      @str_pool      = []
+      @strlit_starts = []
+      @strlit_lens   = []
+      # Stage 3b: 配列要素プール (要素は obj_id = tagged value)。
+      @heap_arr_pool = []
     end
 
     def run_file(path)
@@ -232,12 +242,14 @@ module Setsunaruby
       @cfp_pcs   = []
       @cfp_bases = []
       @cur_base  = 0
-      # Stage 3a: 文字列状態のリセット。
-      @str_pool         = []
-      @strlit_starts    = []
-      @strlit_lens      = []
-      @heap_str_starts  = []
-      @heap_str_lens    = []
+      # Stage 3a/3b: ヒープ状態のリセット。
+      @heap_kind     = []
+      @heap_starts   = []
+      @heap_lens     = []
+      @str_pool      = []
+      @strlit_starts = []
+      @strlit_lens   = []
+      @heap_arr_pool = []
 
       @cur_token = next_token
       while !at_end?
@@ -465,6 +477,15 @@ module Setsunaruby
       elsif b == COMMA_BYTE
         @lex_pos += 1
         Token.new(TokenKind::COMMA, 0, "", @line)
+      elsif b == LBRACK_B
+        @lex_pos += 1
+        Token.new(TokenKind::LBRACK, 0, "", @line)
+      elsif b == RBRACK_B
+        @lex_pos += 1
+        Token.new(TokenKind::RBRACK, 0, "", @line)
+      elsif b == DOT_BYTE
+        @lex_pos += 1
+        Token.new(TokenKind::DOT, 0, "", @line)
       elsif b == EQ
         if @lex_pos + 1 < @bytes.length && @bytes[@lex_pos + 1] == EQ
           @lex_pos += 2
@@ -557,12 +578,50 @@ module Setsunaruby
     end
 
     # 既に primary を 1 つ読み終えた状態から、続く演算子を取り込んで式を完成させる。
+    # 最初に postfix (`[i]` / `.name`) を消費してから二項演算チェーンに入る。
     def parse_expression_from(left, _line)
+      left = parse_postfix_from(left)
       left = parse_multiplicative_from(left)
       left = parse_additive_continue(left)
       left = parse_shift_continue(left)
       left = parse_comparison_continue(left)
       left
+    end
+
+    # `[idx]` (read) / `[idx] = expr` (write) / `.name` / `.name(args)` の postfix チェーン。
+    # 左結合で繰り返し畳み込む。
+    # `[idx] =` の右辺は parse_expression を呼ぶので、`a[i] = b[j] = v` のような
+    # 右結合代入も自然に通る。
+    def parse_postfix_from(node)
+      while @cur_token.kind == TokenKind::LBRACK || @cur_token.kind == TokenKind::DOT
+        if @cur_token.kind == TokenKind::LBRACK
+          @cur_token = next_token
+          idx = parse_expression
+          expect(TokenKind::RBRACK)
+          if @cur_token.kind == TokenKind::EQ
+            @cur_token = next_token
+            val = parse_expression
+            node = ASTNode.new(:index_set, 0, false, :nop, node, idx, val)
+          else
+            node = ASTNode.new(:index_get, 0, false, :nop, node, idx, nil)
+          end
+        else
+          @cur_token = next_token   # consume `.`
+          if @cur_token.kind != TokenKind::IDENT
+            raise "Parse error: line #{@cur_token.line}: . の後にメソッド名が必要です"
+          end
+          name_packed = @cur_token.int_value
+          @cur_token = next_token
+          args = nil
+          if @cur_token.kind == TokenKind::LPAREN
+            @cur_token = next_token
+            args = parse_arg_list
+            expect(TokenKind::RPAREN)
+          end
+          node = ASTNode.new(:method_call_on, name_packed, false, :nop, node, nil, args)
+        end
+      end
+      node
     end
 
     def parse_multiplicative_from(node)
@@ -734,6 +793,22 @@ module Setsunaruby
       ASTNode.new(:arg_cons, 0, false, :nop, arg, nil, rest)
     end
 
+    # 配列リテラル `[a, b, c]` の要素リスト。終端は RBRACK。
+    # parse_arg_list と同じ :arg_cons チェーン形式 (compile_expr で要素数を数えて
+    # ARRAY_NEW operand にする)。
+    def parse_array_elements
+      if @cur_token.kind == TokenKind::RBRACK
+        return nil
+      end
+      elem = parse_expression
+      rest = nil
+      if @cur_token.kind == TokenKind::COMMA
+        @cur_token = next_token
+        rest = parse_array_elements
+      end
+      ASTNode.new(:arg_cons, 0, false, :nop, elem, nil, rest)
+    end
+
     # return [expression]
     def parse_return
       @cur_token = next_token  # consume `return`
@@ -853,7 +928,10 @@ module Setsunaruby
         @cur_token = next_token
         ASTNode.new(:unary_minus, 0, false, :nop, nil, nil, parse_unary)
       else
-        parse_primary
+        # 非 IDENT primary (リテラル / 括弧式 / 配列リテラル / method_call) からの postfix
+        # を消費する。IDENT 経路は parse_expression が parse_expression_from を経由して
+        # 同じ parse_postfix_from を呼ぶため、ここでの呼び出しと二重実行にはならない。
+        parse_postfix_from(parse_primary)
       end
     end
 
@@ -893,6 +971,12 @@ module Setsunaruby
         expr = parse_expression
         expect(TokenKind::RPAREN)
         expr
+      elsif k == TokenKind::LBRACK
+        # 配列リテラル `[a, b, c]`。要素は :arg_cons チェーン (parse_arg_list と同じ形式)。
+        @cur_token = next_token
+        elems = parse_array_elements
+        expect(TokenKind::RBRACK)
+        ASTNode.new(:array_lit, 0, false, :nop, elems, nil, nil)
       elsif k == TokenKind::KW_IF
         parse_if
       elsif k == TokenKind::KW_WHILE
@@ -1007,10 +1091,64 @@ module Setsunaruby
         @bytecode.push(Op::PUTS)
       elsif k == :method_call
         compile_method_call(node)
+      elsif k == :array_lit
+        compile_array_lit(node)
+      elsif k == :index_get
+        compile_expr(node.node_left)
+        compile_expr(node.node_right)
+        @bytecode.push(Op::ARRAY_GET)
+      elsif k == :index_set
+        compile_expr(node.node_left)
+        compile_expr(node.node_right)
+        compile_expr(node.node_operand)
+        @bytecode.push(Op::ARRAY_SET)
+      elsif k == :method_call_on
+        compile_method_call_on(node)
       else
         raise "Compiler bug: unknown expression kind #{k}"
       end
       nil
+    end
+
+    # `[a, b, c]` を ARRAY_NEW にコンパイル: 各要素を順に push してから ARRAY_NEW size。
+    def compile_array_lit(node)
+      size = count_arg_chain(node.node_left)
+      cur = node.node_left
+      while cur != nil
+        compile_expr(cur.node_left)
+        cur = cur.node_operand
+      end
+      @bytecode.push(Op::ARRAY_NEW)
+      encode_signed(size)
+      nil
+    end
+
+    # `obj.method(args)` の dispatch。Stage 3b では `length` (引数 0) のみ対応。
+    # 一般 method dispatch (vtable / hash) は Stage 3d で導入する想定。
+    def compile_method_call_on(node)
+      name_packed = node.node_int_value
+      argc        = count_arg_chain(node.node_operand)
+      compile_expr(node.node_left)   # receiver
+      cur = node.node_operand
+      while cur != nil
+        compile_expr(cur.node_left)
+        cur = cur.node_operand
+      end
+      if argc == 0 && method_name_is_length?(name_packed)
+        @bytecode.push(Op::ARRAY_LEN)
+      else
+        # Stage 3b スコープ外。配列以外の receiver や length 以外の名前はここで弾く。
+        raise "Compile error: line #{@cur_token.line}: Stage 3b ではドット method は .length のみ対応"
+      end
+      nil
+    end
+
+    # ローカル変数表と同様の packed (start<<16)|len 比較で "length" 判定。
+    # KW_LENGTH_BYTES の定義はクラス先頭の KW_*_BYTES ブロックにある。
+    def method_name_is_length?(packed)
+      pkg_start = packed >> 16
+      pkg_len   = packed & 0xffff
+      match_bytes(pkg_start, pkg_len, KW_LENGTH_BYTES)
     end
 
     def compile_if(node)
@@ -1211,7 +1349,7 @@ module Setsunaruby
       elsif op == :ge
         result = Op::GE
       elsif op == :lshift
-        result = Op::STR_LSHIFT
+        result = Op::LSHIFT
       else
         raise "Compiler bug: unknown binop #{op}"
       end
@@ -1359,11 +1497,24 @@ module Setsunaruby
           exec_compare(:le)
         elsif op == Op::GE
           exec_compare(:ge)
-        elsif op == Op::STR_LSHIFT
-          exec_str_lshift
+        elsif op == Op::LSHIFT
+          exec_lshift
+        elsif op == Op::ARRAY_NEW
+          exec_array_new
+        elsif op == Op::ARRAY_GET
+          exec_array_get
+        elsif op == Op::ARRAY_SET
+          exec_array_set
+        elsif op == Op::ARRAY_LEN
+          exec_array_len
         elsif op == Op::PUTS
           v = @stack.pop
-          puts to_puts_string(v)
+          # Ruby の puts は配列の各要素を別行で出力 (空配列なら何も出力しない)。
+          if heap_array?(v)
+            puts_array(v)
+          else
+            puts to_puts_string(v)
+          end
           @stack.push(ObjectVal::NIL_VAL)   # Stage 1: puts は nil を返す
         elsif op == Op::CALL
           exec_call
@@ -1382,23 +1533,28 @@ module Setsunaruby
       (v & 1) == 1
     end
 
-    # Stage 3a: ヒープオブジェクトの判定とタグ付け。下位 3 bit が HEAP_TAG (= 0b110)。
+    # Stage 3a/3b: ヒープオブジェクトの判定とタグ付け。下位 3 bit が HEAP_TAG (= 0b110)。
     # Fixnum (LSB=1)、TRUE_VAL=4 (= 0b100)、FALSE_VAL=2 (= 0b010)、NIL_VAL=0 とは
     # 排他的に区別できる。
+    # kind 別判定 (heap_str? / heap_array?) は obj_id の tag だけでなく @heap_kind も
+    # 確認することで多型ヒープを安全にディスパッチする。
     def heap_obj?(v)
       (v & 7) == HEAP_TAG
     end
 
     def heap_str?(v)
-      # 現状ヒープオブジェクトは String のみ。Stage 3b 以降では kind 配列を併用する。
-      heap_obj?(v)
+      heap_obj?(v) && @heap_kind[v >> 3] == HEAP_KIND_STRING
     end
 
-    def box_heap_str(idx)
+    def heap_array?(v)
+      heap_obj?(v) && @heap_kind[v >> 3] == HEAP_KIND_ARRAY
+    end
+
+    def box_heap(idx)
       (idx << 3) | HEAP_TAG
     end
 
-    def unbox_heap_str(v)
+    def unbox_heap(v)
       v >> 3
     end
 
@@ -1438,14 +1594,46 @@ module Setsunaruby
       end
     end
 
+    # `puts [1, 2, 3]` → 各要素を別行で出力 (Ruby と同じ)。空配列は何も出力しない。
+    # ネスト配列は再帰的に展開。循環参照 (`a << a` 後の `puts a`) で無限再帰しないよう、
+    # 深さ上限 (PUTS_ARRAY_MAX_DEPTH) を超えたら明示エラー。Ruby の `[...]` 切替は
+    # 循環検出 (visited set) が必要で Stage 3b の SoA IntArray 制約と合わないため、
+    # 簡易な深さ制限で代替する。
+    PUTS_ARRAY_MAX_DEPTH = 100
+
+    def puts_array(arr_id)
+      puts_array_at_depth(arr_id, 0)
+      nil
+    end
+
+    def puts_array_at_depth(arr_id, depth)
+      if depth >= PUTS_ARRAY_MAX_DEPTH
+        raise "RuntimeError: puts: 配列がネストしすぎ (循環参照の疑い、深さ #{PUTS_ARRAY_MAX_DEPTH})"
+      end
+      arr_idx = unbox_heap(arr_id)
+      start = @heap_starts[arr_idx]
+      len   = @heap_lens[arr_idx]
+      i = 0
+      while i < len
+        e = @heap_arr_pool[start + i]
+        if heap_array?(e)
+          puts_array_at_depth(e, depth + 1)
+        else
+          puts to_puts_string(e)
+        end
+        i += 1
+      end
+      nil
+    end
+
     # ヒープ String の中身を Ruby String に再構築する (puts 出力経路)。
     # @str_pool[start..start+len-1] のバイトを 1 つずつ chr して連結する。
     # 既存の format_hex32 が `result = result + ...` で文字列連結している前提で
     # spinel が String + String を扱えることに依存している。
     def heap_str_to_ruby(obj_id)
-      idx = unbox_heap_str(obj_id)
-      s = @heap_str_starts[idx]
-      l = @heap_str_lens[idx]
+      idx = unbox_heap(obj_id)
+      s = @heap_starts[idx]
+      l = @heap_lens[idx]
       result = ""
       i = 0
       while i < l
@@ -1473,23 +1661,25 @@ module Setsunaruby
       new_start = @str_pool.length
       src_len   = @strlit_lens[lit_idx]
       str_pool_copy(@strlit_starts[lit_idx], src_len)
-      @heap_str_starts.push(new_start)
-      @heap_str_lens.push(src_len)
-      box_heap_str(@heap_str_starts.length - 1)
+      @heap_kind.push(HEAP_KIND_STRING)
+      @heap_starts.push(new_start)
+      @heap_lens.push(src_len)
+      box_heap(@heap_kind.length - 1)
     end
 
     # `+`: 新しいヒープ String を確保し、lhs/rhs のバイトを順に append する。
     def heap_str_concat(lhs_id, rhs_id)
-      lhs_idx = unbox_heap_str(lhs_id)
-      rhs_idx = unbox_heap_str(rhs_id)
-      ll = @heap_str_lens[lhs_idx]
-      rl = @heap_str_lens[rhs_idx]
+      lhs_idx = unbox_heap(lhs_id)
+      rhs_idx = unbox_heap(rhs_id)
+      ll = @heap_lens[lhs_idx]
+      rl = @heap_lens[rhs_idx]
       new_start = @str_pool.length
-      str_pool_copy(@heap_str_starts[lhs_idx], ll)
-      str_pool_copy(@heap_str_starts[rhs_idx], rl)
-      @heap_str_starts.push(new_start)
-      @heap_str_lens.push(ll + rl)
-      box_heap_str(@heap_str_starts.length - 1)
+      str_pool_copy(@heap_starts[lhs_idx], ll)
+      str_pool_copy(@heap_starts[rhs_idx], rl)
+      @heap_kind.push(HEAP_KIND_STRING)
+      @heap_starts.push(new_start)
+      @heap_lens.push(ll + rl)
+      box_heap(@heap_kind.length - 1)
     end
 
     # `<<`: lhs slot の start/len を「新しい末尾位置 + 連結後の長さ」に書き換える
@@ -1498,15 +1688,15 @@ module Setsunaruby
     # 自己 append (`s << s`) でも安全: ll/rl とソース start を先に確定してから append し、
     # 最後にスロットを更新するため、読み取り中にソースが書き換わることはない。
     def heap_str_append_bang(lhs_id, rhs_id)
-      lhs_idx = unbox_heap_str(lhs_id)
-      rhs_idx = unbox_heap_str(rhs_id)
-      ll = @heap_str_lens[lhs_idx]
-      rl = @heap_str_lens[rhs_idx]
+      lhs_idx = unbox_heap(lhs_id)
+      rhs_idx = unbox_heap(rhs_id)
+      ll = @heap_lens[lhs_idx]
+      rl = @heap_lens[rhs_idx]
       new_start = @str_pool.length
-      str_pool_copy(@heap_str_starts[lhs_idx], ll)
-      str_pool_copy(@heap_str_starts[rhs_idx], rl)
-      @heap_str_starts[lhs_idx] = new_start
-      @heap_str_lens[lhs_idx]   = ll + rl
+      str_pool_copy(@heap_starts[lhs_idx], ll)
+      str_pool_copy(@heap_starts[rhs_idx], rl)
+      @heap_starts[lhs_idx] = new_start
+      @heap_lens[lhs_idx]   = ll + rl
       lhs_id
     end
 
@@ -1525,14 +1715,95 @@ module Setsunaruby
     end
 
     def heap_str_eq(lhs_id, rhs_id)
-      lhs_idx = unbox_heap_str(lhs_id)
-      rhs_idx = unbox_heap_str(rhs_id)
-      ll = @heap_str_lens[lhs_idx]
+      lhs_idx = unbox_heap(lhs_id)
+      rhs_idx = unbox_heap(rhs_id)
+      ll = @heap_lens[lhs_idx]
       result = false
-      if ll == @heap_str_lens[rhs_idx]
-        result = pool_bytes_eq(@heap_str_starts[lhs_idx], @heap_str_starts[rhs_idx], ll)
+      if ll == @heap_lens[rhs_idx]
+        result = pool_bytes_eq(@heap_starts[lhs_idx], @heap_starts[rhs_idx], ll)
       end
       result
+    end
+
+    # ============================================================
+    # Stage 3b: 配列ヘルパ
+    # ============================================================
+    # 配列の要素は @heap_arr_pool に flat に並べる (IntArray of obj_id)。
+    # @heap_starts[idx] = pool 開始 element offset、@heap_lens[idx] = 要素数。
+    # `<<` は文字列と同じ relocate-and-grow (lhs を pool 末尾に再配置 + 新要素 push)。
+    # `[i] = v` はその場で `@heap_arr_pool[start + i] = v`。
+
+    def heap_array_alloc(size)
+      # スタックからの pop はトップから逆順なので一旦ローカル IntArray に逆順で退避し、
+      # その後 @heap_arr_pool に正順で push する。NIL_VAL 一時埋めの中間 pass を省ける。
+      reversed = []
+      i = 0
+      while i < size
+        reversed.push(@stack.pop)
+        i += 1
+      end
+      new_start = @heap_arr_pool.length
+      i = size - 1
+      while i >= 0
+        @heap_arr_pool.push(reversed[i])
+        i -= 1
+      end
+      @heap_kind.push(HEAP_KIND_ARRAY)
+      @heap_starts.push(new_start)
+      @heap_lens.push(size)
+      box_heap(@heap_kind.length - 1)
+    end
+
+    # `a[i]` (read)。範囲外 (idx >= len) は Ruby と同じく nil。
+    # 負 index は Stage 3b スコープ外として明示エラー。
+    def heap_array_get(arr_id, idx)
+      arr_idx = unbox_heap(arr_id)
+      len = @heap_lens[arr_idx]
+      if idx < 0
+        raise "IndexError: 負 index は Stage 3b スコープ外"
+      end
+      if idx >= len
+        ObjectVal::NIL_VAL
+      else
+        @heap_arr_pool[@heap_starts[arr_idx] + idx]
+      end
+    end
+
+    # `a[i] = v` (write)。範囲外への代入は Ruby は nil 埋めで拡張するが、
+    # Stage 3b では明示エラーで簡素化。値は呼び出し元が代入式の値として push する。
+    def heap_array_set(arr_id, idx, val)
+      arr_idx = unbox_heap(arr_id)
+      len = @heap_lens[arr_idx]
+      if idx < 0
+        raise "IndexError: 負 index は Stage 3b スコープ外"
+      end
+      if idx >= len
+        raise "IndexError: 範囲外への代入は Stage 3b スコープ外 (idx=#{idx}, len=#{len})"
+      end
+      @heap_arr_pool[@heap_starts[arr_idx] + idx] = val
+      nil
+    end
+
+    # `a << v` (push)。@heap_arr_pool 末尾に「現在の要素 + 新要素」を再配置し、
+    # lhs スロットの start/len を更新。共有参照に変更が反映される Ruby 互換セマンティクス。
+    def heap_array_push_bang(arr_id, val)
+      arr_idx = unbox_heap(arr_id)
+      ll = @heap_lens[arr_idx]
+      old_start = @heap_starts[arr_idx]
+      new_start = @heap_arr_pool.length
+      i = 0
+      while i < ll
+        @heap_arr_pool.push(@heap_arr_pool[old_start + i])
+        i += 1
+      end
+      @heap_arr_pool.push(val)
+      @heap_starts[arr_idx] = new_start
+      @heap_lens[arr_idx]   = ll + 1
+      arr_id
+    end
+
+    def heap_array_len(arr_id)
+      @heap_lens[unbox_heap(arr_id)]
     end
 
     # 可変長 SLEB128 デコード (bytecode から @pc 起点で)
@@ -1625,13 +1896,60 @@ module Setsunaruby
       nil
     end
 
-    def exec_str_lshift
+    # Stage 3a: String × String、Stage 3b: Array × any へ多相化。
+    def exec_lshift
       rhs = @stack.pop
       lhs = @stack.pop
-      if !heap_str?(lhs) || !heap_str?(rhs)
-        raise "TypeError: << は文字列のみ対応 (Stage 3a)"
+      if heap_str?(lhs) && heap_str?(rhs)
+        @stack.push(heap_str_append_bang(lhs, rhs))
+      elsif heap_array?(lhs)
+        @stack.push(heap_array_push_bang(lhs, rhs))
+      else
+        raise "TypeError: << は (String << String) または (Array << any) のみ"
       end
-      @stack.push(heap_str_append_bang(lhs, rhs))
+      nil
+    end
+
+    def exec_array_new
+      size = decode_signed
+      @stack.push(heap_array_alloc(size))
+      nil
+    end
+
+    def exec_array_get
+      idx_val = @stack.pop
+      arr     = @stack.pop
+      if !fixnum?(idx_val)
+        raise "TypeError: [] の index は Integer 必須"
+      end
+      if !heap_array?(arr)
+        raise "TypeError: [] の receiver は Array 必須 (Stage 3b)"
+      end
+      @stack.push(heap_array_get(arr, unbox_int(idx_val)))
+      nil
+    end
+
+    def exec_array_set
+      val     = @stack.pop
+      idx_val = @stack.pop
+      arr     = @stack.pop
+      if !fixnum?(idx_val)
+        raise "TypeError: []= の index は Integer 必須"
+      end
+      if !heap_array?(arr)
+        raise "TypeError: []= の receiver は Array 必須 (Stage 3b)"
+      end
+      heap_array_set(arr, unbox_int(idx_val), val)
+      @stack.push(val)
+      nil
+    end
+
+    def exec_array_len
+      arr = @stack.pop
+      if !heap_array?(arr)
+        raise "TypeError: .length の receiver は Array 必須 (Stage 3b)"
+      end
+      @stack.push(box_int(heap_array_len(arr)))
       nil
     end
 
@@ -1893,10 +2211,49 @@ module Setsunaruby
           lhs = sstack.pop
           hir_id = emit_hir(HirOp::GE, lhs, rhs, 0)
           sstack.push(hir_id)
-        elsif op == Op::STR_LSHIFT
+        elsif op == Op::LSHIFT
           rhs = sstack.pop
           lhs = sstack.pop
-          hir_id = emit_hir(HirOp::STR_LSHIFT, lhs, rhs, 0)
+          hir_id = emit_hir(HirOp::LSHIFT, lhs, rhs, 0)
+          sstack.push(hir_id)
+        elsif op == Op::ARRAY_NEW
+          # スタック上の size 個を 1 つの ArrayNew にまとめる。要素 hir_id は CALL と
+          # 同じく @hir_call_args に flat に並べる (専用配列を増やさない)。
+          size = decode_signed
+          if sstack.length < size
+            raise "JIT-2 bug: ARRAY_NEW underflow (need #{size}, have #{sstack.length}) at pc=#{bc_pc}"
+          end
+          args_start = @hir_call_args.length
+          ai = sstack.length - size
+          ae = sstack.length
+          while ai < ae
+            @hir_call_args.push(sstack[ai])
+            ai += 1
+          end
+          ai = 0
+          while ai < size
+            sstack.pop
+            ai += 1
+          end
+          # op0 = size (display 用)、op1 = args_start (@hir_call_args 上の起点)、op2 = 0
+          # CALL は op0=callee_idx, op1=args_start, op2=arity と分けるが、ARRAY_NEW は
+          # arity 相当の値が size と同じなので op0 だけで賄い op2 は予約として 0。
+          hir_id = emit_hir(HirOp::ARRAY_NEW, size, args_start, 0)
+          sstack.push(hir_id)
+        elsif op == Op::ARRAY_GET
+          idx = sstack.pop
+          arr = sstack.pop
+          hir_id = emit_hir(HirOp::ARRAY_GET, arr, idx, 0)
+          sstack.push(hir_id)
+        elsif op == Op::ARRAY_SET
+          val = sstack.pop
+          idx = sstack.pop
+          arr = sstack.pop
+          hir_id = emit_hir(HirOp::ARRAY_SET, arr, idx, val)
+          sstack.push(hir_id)   # bytecode の ARRAY_SET は val を push するのに合わせる
+        elsif op == Op::ARRAY_LEN
+          arr = sstack.pop
+          hir_id = emit_hir(HirOp::ARRAY_LEN, arr, 0, 0)
           sstack.push(hir_id)
         elsif op == Op::PUTS
           v = sstack.pop
@@ -2126,8 +2483,16 @@ module Setsunaruby
         result = "Puts v#{op0}"
       elsif kind == HirOp::LOAD_STR
         result = "LoadStr lit=#{op0}"
-      elsif kind == HirOp::STR_LSHIFT
-        result = "StrLShift v#{op0}, v#{op1}"
+      elsif kind == HirOp::LSHIFT
+        result = "LShift v#{op0}, v#{op1}"
+      elsif kind == HirOp::ARRAY_NEW
+        result = "ArrayNew size=#{op0}"
+      elsif kind == HirOp::ARRAY_GET
+        result = "ArrayGet v#{op0}, v#{op1}"
+      elsif kind == HirOp::ARRAY_SET
+        result = "ArraySet v#{op0}, v#{op1}, v#{op2}"
+      elsif kind == HirOp::ARRAY_LEN
+        result = "ArrayLen v#{op0}"
       elsif kind == HirOp::CALL
         result = format_call_insn(op0, op1, op2)
       elsif kind == HirOp::RETURN
@@ -2222,9 +2587,14 @@ module Setsunaruby
     end
 
     # 二項算術/比較 (op0 = lhs, op1 = rhs の use パターン) の統合述語。
-    # accumulate_uses が将来の特化命令追加でも壊れないようまとめる。
+    # accumulate_uses / apply_rename_targets が将来の特化命令追加でも壊れないようまとめる。
+    # LSHIFT も op0/op1 が値の二項演算なので含める (kind 番号は離れているが意味的に同じ)。
+    # 注: pass_fold_constants の対象は arith_kind? || compare_kind? のみで、LSHIFT は
+    # 文字列/配列のヒープ操作なので畳み込み対象ではない。
     def binop_kind?(kind)
-      arith_kind?(kind) || compare_kind?(kind) || fixnum_arith_kind?(kind) || fixnum_compare_kind?(kind)
+      arith_kind?(kind) || compare_kind?(kind) ||
+        fixnum_arith_kind?(kind) || fixnum_compare_kind?(kind) ||
+        kind == HirOp::LSHIFT
     end
 
     def try_fold_binop(i, kind)
@@ -2344,11 +2714,27 @@ module Setsunaruby
         use_counts[@hir_op0[i]] += 1
         use_counts[@hir_op1[i]] += 1
       elsif binop_kind?(kind)
+        # arith / compare / fixnum_* / LSHIFT を全部包む
         use_counts[@hir_op0[i]] += 1
         use_counts[@hir_op1[i]] += 1
-      elsif kind == HirOp::STR_LSHIFT
+      elsif kind == HirOp::ARRAY_NEW
+        # 要素 hir_id を @hir_call_args 上に flat 格納 (op0=size, op1=args_start)
+        size       = @hir_op0[i]
+        args_start = @hir_op1[i]
+        j = 0
+        while j < size
+          use_counts[@hir_call_args[args_start + j]] += 1
+          j += 1
+        end
+      elsif kind == HirOp::ARRAY_GET || kind == HirOp::ARRAY_LEN
+        use_counts[@hir_op0[i]] += 1
+        if kind == HirOp::ARRAY_GET
+          use_counts[@hir_op1[i]] += 1
+        end
+      elsif kind == HirOp::ARRAY_SET
         use_counts[@hir_op0[i]] += 1
         use_counts[@hir_op1[i]] += 1
+        use_counts[@hir_op2[i]] += 1
       elsif kind == HirOp::GUARD_FIXNUM
         use_counts[@hir_op0[i]] += 1
       elsif kind == HirOp::PUTS
@@ -2412,8 +2798,16 @@ module Setsunaruby
         result = true   # ゼロ除算で raise しうる
       elsif kind == HirOp::FIXNUM_MOD
         result = true
-      elsif kind == HirOp::STR_LSHIFT
-        result = true   # ヒープ String を in-place ミューテーションするため除去禁止
+      elsif kind == HirOp::LSHIFT
+        result = true   # ヒープ String/Array を in-place ミューテーションするため除去禁止
+      elsif kind == HirOp::ARRAY_SET
+        result = true   # in-place 書き込み
+      elsif kind == HirOp::ARRAY_GET
+        result = true   # 範囲外 / 型違いで raise しうる
+      elsif kind == HirOp::ARRAY_LEN
+        result = true   # 型違いで raise しうる
+      elsif kind == HirOp::ARRAY_NEW
+        result = true   # 観察可能なヒープ確保 (slot idx が外部状態に効く)
       end
       result
     end
@@ -3064,12 +3458,28 @@ module Setsunaruby
         kind = @hir_kind[i]
         if kind == HirOp::JUMP_IF_FALSE
           @hir_op0[i] = resolve_rename(@hir_op0[i])
-        elsif arith_kind?(kind) || compare_kind?(kind)
+        elsif binop_kind?(kind)
+          # arith / compare / fixnum_* / LSHIFT を統合 (op0 = lhs, op1 = rhs)
           @hir_op0[i] = resolve_rename(@hir_op0[i])
           @hir_op1[i] = resolve_rename(@hir_op1[i])
-        elsif kind == HirOp::STR_LSHIFT
+        elsif kind == HirOp::ARRAY_NEW
+          # @hir_call_args 上をリダイレクト (op0=size, op1=args_start)
+          size       = @hir_op0[i]
+          args_start = @hir_op1[i]
+          ai = 0
+          while ai < size
+            @hir_call_args[args_start + ai] = resolve_rename(@hir_call_args[args_start + ai])
+            ai += 1
+          end
+        elsif kind == HirOp::ARRAY_GET
           @hir_op0[i] = resolve_rename(@hir_op0[i])
           @hir_op1[i] = resolve_rename(@hir_op1[i])
+        elsif kind == HirOp::ARRAY_SET
+          @hir_op0[i] = resolve_rename(@hir_op0[i])
+          @hir_op1[i] = resolve_rename(@hir_op1[i])
+          @hir_op2[i] = resolve_rename(@hir_op2[i])
+        elsif kind == HirOp::ARRAY_LEN
+          @hir_op0[i] = resolve_rename(@hir_op0[i])
         elsif kind == HirOp::PUTS
           @hir_op0[i] = resolve_rename(@hir_op0[i])
         elsif kind == HirOp::CALL
