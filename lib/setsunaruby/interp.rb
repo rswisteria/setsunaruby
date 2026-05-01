@@ -11,6 +11,10 @@ module Setsunaruby
   # ローカル変数名 (Symbol) を @local_names IntArray (sp_sym 配列) に
   # 蓄積する。VM 実行時は @locals IntArray (obj_id) を slot 番号でアクセス。
   class Interp
+    # JIT-1 (ZJIT 風プロファイル収集): メソッドごとの呼び出し回数が
+    # JIT_HOT_THRESHOLD ちょうどに達した時点で 1 度だけホット検出ログを出す。
+    JIT_HOT_THRESHOLD = 100
+
     # ---- ASCII コード定数 (Lexer 用) ----
     NL    = 10
     TAB   =  9
@@ -79,6 +83,7 @@ module Setsunaruby
       @method_pcs          = []   # IntArray (本体の開始 PC)
       @method_arities      = []   # IntArray (パラメータ数)
       @method_local_counts = []   # IntArray (パラメータ含むローカル変数の総数)
+      @jit_call_counts     = []   # IntArray (JIT-1: メソッド呼び出し回数)
       # VM のコールフレームスタック (並列 IntArray)。
       # locals の縮小は @cur_base で行うので length 自体は記録しない。
       @cfp_pcs   = []   # IntArray (戻り PC)
@@ -107,6 +112,7 @@ module Setsunaruby
       @method_pcs          = []
       @method_arities      = []
       @method_local_counts = []
+      @jit_call_counts     = []
       @cfp_pcs   = []
       @cfp_bases = []
       @cur_base  = 0
@@ -945,11 +951,13 @@ module Setsunaruby
         @method_pcs.push(method_pc)
         @method_arities.push(arity)
         @method_local_counts.push(0)
+        @jit_call_counts.push(0)
         i = @method_name_starts.length - 1
       else
         @method_pcs[i] = method_pc
         @method_arities[i] = arity
         @method_local_counts[i] = 0
+        @jit_call_counts[i] = 0
       end
       i
     end
@@ -1262,6 +1270,17 @@ module Setsunaruby
 
     def exec_call
       m_idx = decode_signed
+      # 閾値到達後はカウントを止めて以降の配列 write を省く。
+      # 名前ではなく idx で出すのは @bytes 復元の文字列処理が spinel で
+      # 安全に動くか未検証なため (CLAUDE.md ルール 11)。
+      cnt = @jit_call_counts[m_idx]
+      if cnt < JIT_HOT_THRESHOLD
+        cnt += 1
+        @jit_call_counts[m_idx] = cnt
+        if cnt == JIT_HOT_THRESHOLD
+          STDERR.puts "ZJIT: hot method detected (idx=#{m_idx})"
+        end
+      end
       argc = @method_arities[m_idx]
       local_count = @method_local_counts[m_idx]
 
