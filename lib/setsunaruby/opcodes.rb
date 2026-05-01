@@ -52,6 +52,9 @@ module Setsunaruby
     YIELD           = 0x49   # operand: SLEB128 argc
     BLOCK_RETURN    = 0x4A
 
+    # Stage 3c.3: 現フレームにブロックが紐付いているかを true/false で push する組み込み。
+    BLOCK_GIVEN_P   = 0x4B
+
     HALT = 0xFF
   end
 end

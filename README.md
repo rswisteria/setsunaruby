@@ -7,7 +7,7 @@ Ruby 文法を持つ、スタックマシン型プログラミング言語の処
 「刹那」(10⁻¹⁸) から命名。mruby / nanoruby / picoruby に続く、
 さらに小さな Ruby 系列という位置付け。
 
-## 現状: Stage 0 / 0.5 / 1 / 2 / 3a / 3b / 3c.1 / 3c.2 / JIT-1 / JIT-2 / JIT-3a / JIT-3b1 / JIT-3b2 / JIT-3b3 / JIT-3c / JIT-4 (案 A) 完了
+## 現状: Stage 0 / 0.5 / 1 / 2 / 3a / 3b / 3c.1 / 3c.2 / 3c.3 / JIT-1 / JIT-2 / JIT-3a / JIT-3b1 / JIT-3b2 / JIT-3b3 / JIT-3c / JIT-4 (案 A) 完了
 
 スタックマシン上で **再帰 `fib(20)` / アッカーマン / tarai が CRuby + spinel AOT 両方で動作**。
 
@@ -42,6 +42,10 @@ Ruby 文法を持つ、スタックマシン型プログラミング言語の処
 - **`do |x| body end` ブロック** (`Array#each` と `Integer#times` のコンパイラ展開 + ユーザ定義の一般 yield)
 - **ブロック内から外部変数の読み書き** (flat scope ベースの closure 的振る舞い)
 - **`yield` / ユーザ定義のブロック取り method** (`def f(...) ... yield x ... end` + `f(...) do |x| ... end`)
+- **`{ |x| body }` 中括弧ブロック** (do/end と等価)
+- **`block_given?`** (現フレームにブロックが紐付いているかを true/false で返す組み込み)
+- **`Array#map`** (block の戻り値を集約した新配列を返す compile-time special form)
+- **識別子末尾の `?` / `!`** (lexer 拡張、Ruby 同様の述語/破壊的命名規則)
 
 ## クイックスタート
 
@@ -61,7 +65,7 @@ make test-aot
 make test-all
 ```
 
-(テスト件数は `make test-cruby` 出力で確認できる。Stage 3a +38 件、3b +42 件、3c.1 +24 件、3c.2 +13 件。)
+(テスト件数は `make test-cruby` 出力で確認できる。Stage 3a +38 件、3b +42 件、3c.1 +24 件、3c.2 +15 件、3c.3 +24 件。)
 
 ## ベンチマーク
 
@@ -139,6 +143,7 @@ CRuby の `VALUE` を踏襲したタグ付き即値方式。
 | CALL_WITH_BLOCK | 0x48 | SLEB128 method_idx + SLEB128 block_pc + SLEB128 block_arity | CALL と同じ + block_pc / block_arity を新フレームに紐付け |
 | YIELD | 0x49 | SLEB128 argc | フレームの block_pc に飛び @cur_base を caller's に切替、BLOCK_RETURN で復帰 |
 | BLOCK_RETURN | 0x4A | – | block 終端、yield の続きへ復帰 |
+| BLOCK_GIVEN_P | 0x4B | – | 現フレームにブロックがあれば true、なければ false を push |
 | HALT | 0xFF | – | 終了 |
 
 `+` (ADD) と `==` (EQ) は VM で多相化されており、両辺がヒープ String の場合は文字列
@@ -212,7 +217,7 @@ Symbol/sp_sym を経由すると spinel の Token フィールド型推論が崩
 | 3b | 配列リテラル・index アクセス・`<<` 多相・`.length` | ✅ 完了 |
 | 3c.1 | `do \| \|` ブロック (`each` / `times` 特殊展開) | ✅ 完了 |
 | 3c.2 | 一般 `yield` / ユーザ定義のブロック取り method | ✅ 完了 |
-| 3c.3〜 | `block_given?` / `Array#map` / `{ \| \| }` 中括弧構文 | 未着手 |
+| 3c.3 | `block_given?` / `Array#map` / `{ \| \| }` 中括弧構文 / 識別子末尾 `?`/`!` | ✅ 完了 |
 | 3d〜3e | クラス・例外 | 未着手 |
 | ∞ | 自己ホスト (setsunaruby を setsunaruby で動かす) | 究極目標 |
 
@@ -239,7 +244,8 @@ Symbol/sp_sym を経由すると spinel の Token フィールド型推論が崩
 │   ├── string.rb             # Stage 3a: 文字列リテラル/+ /<< /== のショーケース
 │   ├── array.rb              # Stage 3b: 配列/index/.length のショーケース
 │   ├── each.rb               # Stage 3c.1: each / times ブロックのショーケース
-│   └── yield.rb              # Stage 3c.2: 一般 yield / 自前 each / 自前 map のショーケース
+│   ├── yield.rb              # Stage 3c.2: 一般 yield / 自前 each / 自前 map のショーケース
+│   └── map.rb                # Stage 3c.3: map / 中括弧 / block_given? のショーケース
 ├── test/
 │   ├── test_stage0.rb        # CRuby Stage 0 テスト (38件)
 │   ├── test_stage1.rb        # CRuby Stage 1 テスト (28件)
@@ -247,7 +253,8 @@ Symbol/sp_sym を経由すると spinel の Token フィールド型推論が崩
 │   ├── test_stage3a.rb       # CRuby Stage 3a テスト (38件)
 │   ├── test_stage3b.rb       # CRuby Stage 3b テスト (42件)
 │   ├── test_stage3c1.rb      # CRuby Stage 3c.1 テスト (24件)
-│   ├── test_stage3c2.rb      # CRuby Stage 3c.2 テスト (13件)
+│   ├── test_stage3c2.rb      # CRuby Stage 3c.2 テスト (15件)
+│   ├── test_stage3c3.rb      # CRuby Stage 3c.3 テスト (24件)
 │   ├── test_stage_jit.rb     # CRuby JIT-1/2/3a/3b1/3b2/3b3/3c/4 テスト (108件)
 │   └── test_aot.rb           # AOT テスト (Stage 0/1/2/3a/3b/3c + JIT)
 ├── setsunaruby               # spinel ビルド成果物 (gitignore)

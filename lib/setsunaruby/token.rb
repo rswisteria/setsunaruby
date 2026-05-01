@@ -33,6 +33,8 @@ module Setsunaruby
     RPAREN   = :rparen
     LBRACK   = :lbrack     # `[` (Stage 3b 配列リテラル/index アクセス)
     RBRACK   = :rbrack     # `]`
+    LBRACE   = :lbrace     # `{` (Stage 3c.3 中括弧ブロック)
+    RBRACE   = :rbrace     # `}`
     DOT      = :dot        # `.` (Stage 3b: 配列の length のみ。一般 method dispatch は Stage 3d)
     PIPE     = :pipe       # `|` (Stage 3c.1 ブロックパラメータ区切り)
     COMMA    = :comma

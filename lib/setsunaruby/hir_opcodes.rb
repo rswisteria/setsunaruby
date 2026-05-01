@@ -46,6 +46,9 @@ module Setsunaruby
     YIELD           = 0x191   # op0 = argc, op1 = args_start
     BLOCK_RETURN    = 0x192   # op0 = value (hir_id)
 
+    # Stage 3c.3: block_given? built-in。引数なしで bool を push。
+    BLOCK_GIVEN_P   = 0x193
+
     # JIT-3c: 型特化命令。GUARD_FIXNUM は値が Fixnum でなければ side exit。
     # FIXNUM_* は Fixnum 入力前提で動作する特化命令。
     GUARD_FIXNUM = 0x150    # op0 = guarded value (hir_id)
