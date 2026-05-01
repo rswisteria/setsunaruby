@@ -2022,6 +2022,8 @@ module Setsunaruby
         result = true
       elsif kind == HirOp::LOAD_PARAM
         result = true   # 直接 use がなくても reaching def の起点なので削除しない
+      elsif kind == HirOp::PHI
+        result = true   # 現行のパス順では DCE は phi 挿入前だが、将来順序が変わっても誤削除されないよう保護
       end
       result
     end
@@ -2510,6 +2512,9 @@ module Setsunaruby
       nil
     end
 
+    # 注: @hir_rename_target はここで push しない。pass_rename_vars 冒頭で
+    # @hir_kind.length 個まとめて push される設計のため。pass_insert_phis →
+    # pass_rename_vars の順序が前提。順序を変える場合はここで push も必要。
     def emit_phi_at(bb, slot, args_start, arity)
       @hir_kind.push(HirOp::PHI)
       @hir_op0.push(slot)
@@ -2617,9 +2622,11 @@ module Setsunaruby
     def fill_phi_args_for_succ(from_bb, to_bb, reaching_top)
       pred_start = @bb_preds_starts[to_bb]
       pred_count = @bb_preds_counts[to_bb]
+      # build_preds_table は同一 from_bb を 1 度しか push しないが、最初の
+      # 一致で打ち切ると将来 CFG 構築が変わって複数 push になっても安全。
       idx = -1
       pi = 0
-      while pi < pred_count
+      while pi < pred_count && idx < 0
         if @bb_preds_flat[pred_start + pi] == from_bb
           idx = pi
         end
