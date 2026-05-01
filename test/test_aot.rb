@@ -210,6 +210,14 @@ assert_output(File.read(File.expand_path('../examples/array.rb', __dir__)),
               "3\n5\n10\n50\n10\n20\n999\n40\n50\n3\n2\n3\n5\n1\ntwo\ntrue\n\n9\n",
               "examples/array.rb")
 
+# ---- Stage 3c.1: ブロック (each / times) ----
+assert_output("3.times do |i|\n  puts i\nend\n", "0\n1\n2\n",       "BLK: times")
+assert_output("[10, 20].each do |x|\n  puts x\nend\n", "10\n20\n",  "BLK: each")
+assert_output("s = 0\n5.times do |i|\n  s = s + i\nend\nputs s\n", "10\n", "BLK: 集計 (closure read)")
+assert_output(File.read(File.expand_path('../examples/each.rb', __dir__)),
+              "0\n1\n2\n10\n20\n30\n15\n1\n4\n9\n16\n25\n100\n",
+              "examples/each.rb")
+
 # ---- エラー系 ----
 assert_fails(%(puts "a" + 1\n),  "STR: + 型エラー")
 assert_fails(%(puts 1 << 1\n),   "STR: << は (string|array) のみ (Fixnum 不可)")
