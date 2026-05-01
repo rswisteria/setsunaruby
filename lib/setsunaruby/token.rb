@@ -29,6 +29,9 @@ module Setsunaruby
     LSHIFT   = :lshift     # `<<` (Stage 3a で文字列追加)
     LPAREN   = :lparen
     RPAREN   = :rparen
+    LBRACK   = :lbrack     # `[` (Stage 3b 配列リテラル/index アクセス)
+    RBRACK   = :rbrack     # `]`
+    DOT      = :dot        # `.` (Stage 3b: 配列の length のみ。一般 method dispatch は Stage 3d)
     COMMA    = :comma
     NEWLINE  = :newline
     EOF      = :eof

@@ -198,9 +198,23 @@ assert_output(File.read(File.expand_path('../examples/string.rb', __dir__)),
               "hello, setsunaruby\ntab\there\nline1\nline2\nStage 3a\n*****\nok\n",
               "examples/string.rb")
 
+# ---- Stage 3b: 配列 ----
+assert_output("a = [1, 2, 3]\nputs a.length\n",       "3\n",          "ARR: literal + length")
+assert_output("a = []\nputs a.length\n",              "0\n",          "ARR: empty length")
+assert_output("a = [10, 20, 30]\nputs a[1]\n",        "20\n",         "ARR: index get")
+assert_output("a = [1, 2, 3]\na[1] = 99\nputs a\n",   "1\n99\n3\n",   "ARR: index set + puts")
+assert_output("a = []\na << 1\na << 2\nputs a\n",     "1\n2\n",       "ARR: << push")
+assert_output("a = [1, 2]\nputs a\n",                 "1\n2\n",       "ARR: puts requires elements per line")
+assert_output("a = [[1, 2], [3, 4]]\nputs a[0][1]\n", "2\n",          "ARR: nested index")
+assert_output(File.read(File.expand_path('../examples/array.rb', __dir__)),
+              "3\n5\n10\n50\n10\n20\n999\n40\n50\n3\n2\n3\n5\n1\ntwo\ntrue\n\n9\n",
+              "examples/array.rb")
+
 # ---- エラー系 ----
 assert_fails(%(puts "a" + 1\n),  "STR: + 型エラー")
-assert_fails(%(puts 1 << 1\n),   "STR: << は文字列のみ (Fixnum 不可)")
+assert_fails(%(puts 1 << 1\n),   "STR: << は (string|array) のみ (Fixnum 不可)")
+assert_fails("a = [1, 2]\nputs a[-1]\n",  "ARR: 負 index は Stage 3b スコープ外")
+assert_fails("puts 1.length\n",            "ARR: Fixnum.length は不可")
 assert_fails("puts 1 / 0\n",     "ゼロ除算")
 assert_fails("puts true + 1\n",  "型エラー")
 assert_fails("puts (1 + 2\n",    "閉じ括弧不足")
