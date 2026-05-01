@@ -2,6 +2,7 @@ require_relative 'token'
 require_relative 'ast'
 require_relative 'opcodes'
 require_relative 'hir_opcodes'
+require_relative 'lir_opcodes'
 require_relative 'object'
 
 module Setsunaruby
@@ -128,6 +129,15 @@ module Setsunaruby
       # (-1 = bytecode 由来でない: LoadParam / Phi / GuardFixnum 等)。
       @profile_fixnum_pc = []
       @hir_bc_pc         = []
+      # JIT-4 (案 A): LIR (Low-level IR) を SoA で保持。pass_lower_to_lir が構築し、
+      # pass_encode_arm64 が @lir_machine_code に 32bit 機械語を生成する。
+      # 実機実行はせず、ダンプのみ。
+      @lir_kind         = []
+      @lir_op0          = []
+      @lir_op1          = []
+      @lir_op2          = []
+      @lir_bb           = []
+      @lir_machine_code = []
       # spinel AOT で ENV が解釈されない場合は常に false 相当 (HIR ダンプは CRuby のみ)。
       @dump_hir      = ENV["SETSUNARUBY_DUMP_HIR"] == "1"
       # VM のコールフレームスタック (並列 IntArray)。
@@ -185,6 +195,12 @@ module Setsunaruby
       @hir_phi_args      = []
       @hir_rename_target = []
       @hir_bc_pc         = []
+      @lir_kind          = []
+      @lir_op0           = []
+      @lir_op1           = []
+      @lir_op2           = []
+      @lir_bb            = []
+      @lir_machine_code  = []
       # @profile_fixnum_pc は bytecode コンパイル完了後に length 分一括確保するため、
       # 冒頭リセットには含めない (= run_string 後半で `[] + push` 経由で初期化)。
       @dump_hir      = ENV["SETSUNARUBY_DUMP_HIR"] == "1"
@@ -1476,6 +1492,12 @@ module Setsunaruby
       @hir_phi_args      = []
       @hir_rename_target = []
       @hir_bc_pc         = []
+      @lir_kind          = []
+      @lir_op0           = []
+      @lir_op1           = []
+      @lir_op2           = []
+      @lir_bb            = []
+      @lir_machine_code  = []
 
       # JIT-3b3: BB0 先頭にメソッドパラメータの初期 reaching def (LoadParam) を arity 個 emit。
       # rename DFS の時点で「未定義変数」エッジケースを避けるための前提セットアップ。
@@ -1678,6 +1700,9 @@ module Setsunaruby
       pass_type_specialize
       dump_hir(m_idx, "optimized")
       dump_cfg_analysis(m_idx)
+      pass_lower_to_lir
+      pass_encode_arm64
+      dump_lir(m_idx)
       nil
     end
 
@@ -2866,6 +2891,414 @@ module Setsunaruby
         result = HirOp::FIXNUM_LE
       elsif kind == HirOp::GE
         result = HirOp::FIXNUM_GE
+      end
+      result
+    end
+
+    # ============================================================
+    # JIT-4 (案 A): HIR → LIR lowering + arm64 エンコーダ + ダンプ
+    # ============================================================
+    # 実機実行はしない。SSA HIR を低レベル中間表現に下げ、各 LIR insn を
+    # 32bit arm64 機械語にエンコードして「アセンブリ + hex」をダンプするのみ。
+    # レジスタ割り当ては素朴 (hir_id → x9..x28 の循環)、衝突は無視。
+    # critical edge split は行わないため while loop 等で phi のコピーは
+    # 厳密には正しくないが、構造は読み取れる教育用の最小実装。
+
+    def hir_to_reg(hir_id)
+      9 + (hir_id % 20)
+    end
+
+    def emit_lir(kind, op0, op1, op2, bb)
+      @lir_kind.push(kind)
+      @lir_op0.push(op0)
+      @lir_op1.push(op1)
+      @lir_op2.push(op2)
+      @lir_bb.push(bb)
+      @lir_kind.length - 1
+    end
+
+    def pass_lower_to_lir
+      b = 0
+      while b < @bb_first_insn.length
+        if bb_alive_count(b) > 0
+          lower_bb(b)
+        end
+        b += 1
+      end
+      nil
+    end
+
+    def lower_bb(b)
+      i = @bb_first_insn[b]
+      last = @bb_last_insn[b]
+      while i <= last
+        if @hir_deleted[i] == 0
+          kind = @hir_kind[i]
+          # jump / return の前に phi コピーを挿入する。
+          if kind == HirOp::JUMP || kind == HirOp::JUMP_IF_FALSE || kind == HirOp::RETURN
+            emit_phi_copies_for_bb(b)
+          end
+          lower_insn(i, b)
+        end
+        i += 1
+      end
+      # JIT-3c の GuardFixnum (BB 末尾範囲外) を、通常 insn の lower 後に処理。
+      lower_guards_for_bb(b)
+      nil
+    end
+
+    def lower_guards_for_bb(b)
+      i = 0
+      while i < @hir_kind.length
+        if @hir_kind[i] == HirOp::GUARD_FIXNUM && @hir_bb[i] == b && @hir_deleted[i] == 0
+          # GuardFixnum: x{op0} の bit 0 (Fixnum タグ) が 1 でなければ side exit。
+          # TBZ x{op0}, #0, side_exit_label。side_exit のラベル解決は将来 JIT-4d。
+          # 現段階では target_lir_id = -1 (未解決) としてダンプのみ。
+          src = hir_to_reg(@hir_op0[i])
+          emit_lir(LirOp::TBZ, src, 0, -1, b)
+        end
+        i += 1
+      end
+      nil
+    end
+
+    def emit_phi_copies_for_bb(from_bb)
+      s0 = @bb_succ0[from_bb]
+      if s0 >= 0
+        emit_phi_copies_for_succ(from_bb, s0)
+      end
+      s1 = @bb_succ1[from_bb]
+      if s1 >= 0
+        emit_phi_copies_for_succ(from_bb, s1)
+      end
+      nil
+    end
+
+    def emit_phi_copies_for_succ(from_bb, to_bb)
+      pred_count = @bb_preds_counts[to_bb]
+      pred_start = @bb_preds_starts[to_bb]
+      idx = -1
+      pi = 0
+      while pi < pred_count && idx < 0
+        if @bb_preds_flat[pred_start + pi] == from_bb
+          idx = pi
+        end
+        pi += 1
+      end
+      if idx < 0
+        return nil
+      end
+      i = 0
+      while i < @hir_kind.length
+        if @hir_kind[i] == HirOp::PHI && @hir_bb[i] == to_bb && @hir_deleted[i] == 0
+          args_start = @hir_op1[i]
+          src_hir = @hir_phi_args[args_start + idx]
+          if src_hir >= 0
+            emit_lir(LirOp::MOV_REG, hir_to_reg(i), hir_to_reg(src_hir), 0, from_bb)
+          end
+        end
+        i += 1
+      end
+      nil
+    end
+
+    def lower_insn(i, bb)
+      kind = @hir_kind[i]
+      if kind == HirOp::LOAD_CONST
+        lower_load_const(i, bb)
+      elsif kind == HirOp::LOAD_PARAM
+        # arm64 calling convention で第 N 引数は xN に来る (slot 0..7)。
+        emit_lir(LirOp::MOV_REG, hir_to_reg(i), @hir_op0[i], 0, bb)
+      elsif kind == HirOp::FIXNUM_ADD
+        emit_lir(LirOp::ADD, hir_to_reg(i), hir_to_reg(@hir_op0[i]), hir_to_reg(@hir_op1[i]), bb)
+      elsif kind == HirOp::FIXNUM_SUB
+        emit_lir(LirOp::SUB, hir_to_reg(i), hir_to_reg(@hir_op0[i]), hir_to_reg(@hir_op1[i]), bb)
+      elsif kind == HirOp::FIXNUM_MUL
+        emit_lir(LirOp::MUL, hir_to_reg(i), hir_to_reg(@hir_op0[i]), hir_to_reg(@hir_op1[i]), bb)
+      elsif kind == HirOp::FIXNUM_DIV
+        emit_lir(LirOp::SDIV, hir_to_reg(i), hir_to_reg(@hir_op0[i]), hir_to_reg(@hir_op1[i]), bb)
+      elsif kind == HirOp::FIXNUM_MOD
+        # arm64 には MOD 命令がない。本格実装では `SDIV + MSUB` の 2 命令で表現するが、
+        # 案 A の最小スコープでは SDIV のみ emit (= ダンプ上で「商」が見える) して、
+        # 実機実行時の MSUB は将来の JIT-4d で対応する。
+        emit_lir(LirOp::SDIV, hir_to_reg(i), hir_to_reg(@hir_op0[i]), hir_to_reg(@hir_op1[i]), bb)
+      elsif compare_kind?(kind) || fixnum_compare_kind?(kind)
+        # 比較は CMP のみ emit。JumpIfFalse 側で B.cond を出す前提。
+        emit_lir(LirOp::CMP, hir_to_reg(@hir_op0[i]), hir_to_reg(@hir_op1[i]), 0, bb)
+      elsif kind == HirOp::JUMP
+        emit_lir(LirOp::B, @bb_succ0[bb], 0, 0, bb)
+      elsif kind == HirOp::JUMP_IF_FALSE
+        # 直前の比較 HIR insn の kind から「偽分岐」相当の B.cond を選ぶ。
+        # 例: FIXNUM_LT (a < b) が偽 (= a >= b) なら BB2 へ → B_GE。
+        cond_hid = @hir_op0[i]
+        cond_kind = @hir_kind[cond_hid]
+        b_cond = lir_b_cond_for_false(cond_kind)
+        emit_lir(b_cond, @bb_succ0[bb], 0, 0, bb)
+      elsif kind == HirOp::CALL
+        # 引数を x0..x{arity-1} に並べる MOV を emit してから BL。
+        callee = @hir_op0[i]
+        args_start = @hir_op1[i]
+        arity = @hir_op2[i]
+        ai = 0
+        while ai < arity
+          arg_hir = @hir_call_args[args_start + ai]
+          emit_lir(LirOp::MOV_REG, ai, hir_to_reg(arg_hir), 0, bb)
+          ai += 1
+        end
+        emit_lir(LirOp::BL, callee, 0, 0, bb)
+        # 戻り値 x0 を hir_to_reg(i) に。
+        emit_lir(LirOp::MOV_REG, hir_to_reg(i), 0, 0, bb)
+      elsif kind == HirOp::RETURN
+        # 戻り値を x0 に置いて RET。
+        emit_lir(LirOp::MOV_REG, 0, hir_to_reg(@hir_op0[i]), 0, bb)
+        emit_lir(LirOp::RET, 0, 0, 0, bb)
+      end
+      # PHI / PUTS / 観測なしの generic ADD 等は lower しない (= LIR には現れない)。
+      nil
+    end
+
+    # 比較 HIR の偽分岐に対応する LirOp::B_* を返す (= JUMP_IF_FALSE で使う)。
+    # LT 偽 = >= → B_GE、GT 偽 = <= → B_LE、LE 偽 = > → B_GT、GE 偽 = < → B_LT、
+    # EQ 偽 = != → B_NE。それ以外 (bool 値直接) は B_EQ で fallback。
+    def lir_b_cond_for_false(cond_kind)
+      result = LirOp::B_EQ
+      if cond_kind == HirOp::LT || cond_kind == HirOp::FIXNUM_LT
+        result = LirOp::B_GE
+      elsif cond_kind == HirOp::GT || cond_kind == HirOp::FIXNUM_GT
+        result = LirOp::B_LE
+      elsif cond_kind == HirOp::LE || cond_kind == HirOp::FIXNUM_LE
+        result = LirOp::B_GT
+      elsif cond_kind == HirOp::GE || cond_kind == HirOp::FIXNUM_GE
+        result = LirOp::B_LT
+      elsif cond_kind == HirOp::EQ || cond_kind == HirOp::FIXNUM_EQ
+        result = LirOp::B_NE
+      end
+      result
+    end
+
+    def lower_load_const(i, bb)
+      tag = @hir_op0[i]
+      if tag == HirConstTag::INT
+        # box 形式 (n << 1 | 1) で MOVZ。MOVZ は 16bit zero-extend なので、
+        # 負数の boxed 値や 16bit を超える整数は上位 bit が落ちて誤った値になる。
+        # 完全対応には MOVN または MOVZ + MOVK チェーンが必要だが、案 A (実機実行
+        # なし、ダンプのみ) では下位 16bit のみ表示する素朴版。
+        v = (@hir_op1[i] << 1) | 1
+        emit_lir(LirOp::MOV_IMM, hir_to_reg(i), v & 0xFFFF, 0, bb)
+      elsif tag == HirConstTag::TRUE
+        emit_lir(LirOp::MOV_IMM, hir_to_reg(i), ObjectVal::TRUE_VAL, 0, bb)
+      elsif tag == HirConstTag::FALSE
+        emit_lir(LirOp::MOV_IMM, hir_to_reg(i), ObjectVal::FALSE_VAL, 0, bb)
+      elsif tag == HirConstTag::NIL
+        emit_lir(LirOp::MOV_IMM, hir_to_reg(i), ObjectVal::NIL_VAL, 0, bb)
+      end
+      nil
+    end
+
+    def pass_encode_arm64
+      i = 0
+      while i < @lir_kind.length
+        @lir_machine_code.push(encode_arm64_insn(i))
+        i += 1
+      end
+      nil
+    end
+
+    def encode_arm64_insn(lir_id)
+      kind = @lir_kind[lir_id]
+      # 未知 kind のフォールバック値。0 は arm64 で UDF #0 (= 不正命令) なので、
+      # ダンプで「0xdead0000」が出れば「LirOp 追加忘れ」と気付ける目印。
+      result = 0xDEAD0000
+      if kind == LirOp::MOV_IMM
+        result = encode_movz(@lir_op0[lir_id], @lir_op1[lir_id])
+      elsif kind == LirOp::MOV_REG
+        result = encode_orr_xzr(@lir_op0[lir_id], @lir_op1[lir_id])
+      elsif kind == LirOp::ADD
+        result = encode_add_reg(@lir_op0[lir_id], @lir_op1[lir_id], @lir_op2[lir_id])
+      elsif kind == LirOp::SUB
+        result = encode_sub_reg(@lir_op0[lir_id], @lir_op1[lir_id], @lir_op2[lir_id])
+      elsif kind == LirOp::MUL
+        result = encode_mul_reg(@lir_op0[lir_id], @lir_op1[lir_id], @lir_op2[lir_id])
+      elsif kind == LirOp::SDIV
+        result = encode_sdiv_reg(@lir_op0[lir_id], @lir_op1[lir_id], @lir_op2[lir_id])
+      elsif kind == LirOp::CMP
+        result = encode_cmp_reg(@lir_op0[lir_id], @lir_op1[lir_id])
+      elsif kind == LirOp::B
+        # target は BB id。実機の offset 解決は JIT-4d で。今はラベル番号を生埋め。
+        result = encode_b(@lir_op0[lir_id])
+      elsif kind == LirOp::B_NE
+        result = encode_b_cond(Arm64Cond::NE, @lir_op0[lir_id])
+      elsif kind == LirOp::B_EQ
+        result = encode_b_cond(Arm64Cond::EQ, @lir_op0[lir_id])
+      elsif kind == LirOp::B_LT
+        result = encode_b_cond(Arm64Cond::LT, @lir_op0[lir_id])
+      elsif kind == LirOp::B_GT
+        result = encode_b_cond(Arm64Cond::GT, @lir_op0[lir_id])
+      elsif kind == LirOp::B_LE
+        result = encode_b_cond(Arm64Cond::LE, @lir_op0[lir_id])
+      elsif kind == LirOp::B_GE
+        result = encode_b_cond(Arm64Cond::GE, @lir_op0[lir_id])
+      elsif kind == LirOp::BL
+        result = encode_bl(@lir_op0[lir_id])
+      elsif kind == LirOp::RET
+        result = encode_ret
+      elsif kind == LirOp::TBZ
+        # TBZ Rt, #imm6, label (= bit が 0 なら branch)。
+        result = encode_tbz(@lir_op0[lir_id], @lir_op1[lir_id], @lir_op2[lir_id])
+      end
+      result
+    end
+
+    # MOVZ Xd, #imm16 : 1101 0010 100 imm16 Rd
+    def encode_movz(rd, imm16)
+      0xD2800000 | ((imm16 & 0xFFFF) << 5) | (rd & 0x1F)
+    end
+
+    # MOV (register) = ORR Xd, XZR, Xm : 1010 1010 000 Rm 000000 11111 Rd
+    def encode_orr_xzr(rd, rm)
+      0xAA0003E0 | ((rm & 0x1F) << 16) | (rd & 0x1F)
+    end
+
+    # ADD Xd, Xn, Xm : 1000 1011 000 Rm 000000 Rn Rd
+    def encode_add_reg(rd, rn, rm)
+      0x8B000000 | ((rm & 0x1F) << 16) | ((rn & 0x1F) << 5) | (rd & 0x1F)
+    end
+
+    # SUB Xd, Xn, Xm : 1100 1011 000 Rm 000000 Rn Rd
+    def encode_sub_reg(rd, rn, rm)
+      0xCB000000 | ((rm & 0x1F) << 16) | ((rn & 0x1F) << 5) | (rd & 0x1F)
+    end
+
+    # MUL Xd, Xn, Xm = MADD Xd, Xn, Xm, XZR : 1001 1011 000 Rm 0 11111 Rn Rd
+    def encode_mul_reg(rd, rn, rm)
+      0x9B007C00 | ((rm & 0x1F) << 16) | ((rn & 0x1F) << 5) | (rd & 0x1F)
+    end
+
+    # SDIV Xd, Xn, Xm : 1001 1010 110 Rm 000011 Rn Rd
+    def encode_sdiv_reg(rd, rn, rm)
+      0x9AC00C00 | ((rm & 0x1F) << 16) | ((rn & 0x1F) << 5) | (rd & 0x1F)
+    end
+
+    # CMP Xn, Xm = SUBS XZR, Xn, Xm : 1110 1011 000 Rm 000000 Rn 11111
+    def encode_cmp_reg(rn, rm)
+      0xEB00001F | ((rm & 0x1F) << 16) | ((rn & 0x1F) << 5)
+    end
+
+    # B label : 0001 0100 imm26 (offset26 は 4byte 単位、現段階では label 番号生埋め)
+    def encode_b(target)
+      0x14000000 | (target & 0x3FFFFFF)
+    end
+
+    # B.cond label : 0101 0100 imm19 0 cond
+    def encode_b_cond(cond, target)
+      0x54000000 | ((target & 0x7FFFF) << 5) | (cond & 0xF)
+    end
+
+    # BL imm26 : 1001 0100 imm26
+    def encode_bl(target)
+      0x94000000 | (target & 0x3FFFFFF)
+    end
+
+    # RET Xn (default Xn=30) : 1101 0110 0101 1111 0000 00 Rn 00000
+    def encode_ret
+      0xD65F0000 | (30 << 5)
+    end
+
+    # TBZ Rt, #b40, label : b5(31) 011011 op(24=0=TBZ) b40(23:19) imm14(18:5) Rt(4:0)。
+    # b5 はビット番号の bit5 (0..31 のテストなら 0、32..63 なら 1)。setsunaruby は
+    # Fixnum タグ (bit 0) のチェックにしか使わないので b5=0 → ベース 0x36000000。
+    # target=-1 (未解決) のときは imm14 が 0x3FFF に汚染されないよう 0 にクランプ。
+    def encode_tbz(rt, bit, target)
+      safe_target = target
+      if safe_target < 0
+        safe_target = 0
+      end
+      0x36000000 | ((bit & 0x1F) << 19) | ((safe_target & 0x3FFF) << 5) | (rt & 0x1F)
+    end
+
+    def dump_lir(m_idx)
+      STDERR.puts "ZJIT LIR for method idx=#{m_idx}:"
+      i = 0
+      cur_bb = -1
+      while i < @lir_kind.length
+        bb = @lir_bb[i]
+        if bb != cur_bb
+          STDERR.puts "  BB#{bb}:"
+          cur_bb = bb
+        end
+        asm = format_lir_asm(i)
+        hex = format_hex32(@lir_machine_code[i])
+        STDERR.puts "    #{asm}    ; #{hex}"
+        i += 1
+      end
+      nil
+    end
+
+    def format_hex32(v)
+      result = "0x"
+      i = 7
+      while i >= 0
+        nibble = (v >> (i * 4)) & 0xF
+        if nibble < 10
+          result = result + nibble.to_s
+        elsif nibble == 10
+          result = result + "a"
+        elsif nibble == 11
+          result = result + "b"
+        elsif nibble == 12
+          result = result + "c"
+        elsif nibble == 13
+          result = result + "d"
+        elsif nibble == 14
+          result = result + "e"
+        elsif nibble == 15
+          result = result + "f"
+        end
+        i -= 1
+      end
+      result
+    end
+
+    def format_lir_asm(i)
+      kind = @lir_kind[i]
+      op0  = @lir_op0[i]
+      op1  = @lir_op1[i]
+      op2  = @lir_op2[i]
+      result = "?"
+      if kind == LirOp::MOV_IMM
+        result = "mov x" + op0.to_s + ", #" + op1.to_s
+      elsif kind == LirOp::MOV_REG
+        result = "mov x" + op0.to_s + ", x" + op1.to_s
+      elsif kind == LirOp::ADD
+        result = "add x" + op0.to_s + ", x" + op1.to_s + ", x" + op2.to_s
+      elsif kind == LirOp::SUB
+        result = "sub x" + op0.to_s + ", x" + op1.to_s + ", x" + op2.to_s
+      elsif kind == LirOp::MUL
+        result = "mul x" + op0.to_s + ", x" + op1.to_s + ", x" + op2.to_s
+      elsif kind == LirOp::SDIV
+        result = "sdiv x" + op0.to_s + ", x" + op1.to_s + ", x" + op2.to_s
+      elsif kind == LirOp::CMP
+        result = "cmp x" + op0.to_s + ", x" + op1.to_s
+      elsif kind == LirOp::B
+        result = "b BB" + op0.to_s
+      elsif kind == LirOp::B_EQ
+        result = "b.eq BB" + op0.to_s
+      elsif kind == LirOp::B_NE
+        result = "b.ne BB" + op0.to_s
+      elsif kind == LirOp::B_LT
+        result = "b.lt BB" + op0.to_s
+      elsif kind == LirOp::B_GT
+        result = "b.gt BB" + op0.to_s
+      elsif kind == LirOp::B_LE
+        result = "b.le BB" + op0.to_s
+      elsif kind == LirOp::B_GE
+        result = "b.ge BB" + op0.to_s
+      elsif kind == LirOp::BL
+        result = "bl m" + op0.to_s
+      elsif kind == LirOp::RET
+        result = "ret"
+      elsif kind == LirOp::TBZ
+        result = "tbz x" + op0.to_s + ", #" + op1.to_s + ", side_exit"
       end
       result
     end

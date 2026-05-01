@@ -635,6 +635,53 @@ assert_includes(opt_section, "FixnumAdd ", "JIT-3c: 観測された Add は特�
 assert_includes(opt_section, "Sub ",       "JIT-3c: 観測されない Sub は generic のまま残る")
 assert_excludes(opt_section, "FixnumSub ", "JIT-3c: 観測されない Sub は FixnumSub にならない")
 
+# ============================================================
+# JIT-4 (案 A): HIR → LIR lowering + arm64 エンコーダ + ダンプ
+# ============================================================
+
+def split_lir_section(err)
+  marker = "ZJIT LIR for method"
+  idx = err.index(marker) || err.length
+  err[idx..-1].to_s
+end
+
+# ---- fib で LIR ダンプが出る ----
+ENV["SETSUNARUBY_DUMP_HIR"] = "1"
+fib_lir_src = <<~RUBY
+  def fib(n)
+    if n < 2
+      n
+    else
+      fib(n - 1) + fib(n - 2)
+    end
+  end
+  puts fib(10)
+RUBY
+begin
+  out, err = run_capture(fib_lir_src)
+ensure
+  ENV.delete("SETSUNARUBY_DUMP_HIR")
+end
+lir = split_lir_section(err)
+assert_eq(out, "55\n", "JIT-4: fib(10) 結果不変")
+assert_includes(lir, "ZJIT LIR for method idx=0:", "JIT-4: LIR ヘッダ")
+# arm64 主要命令が出る
+assert_includes(lir, "mov x",      "JIT-4: mov 命令")
+assert_includes(lir, "sub x",      "JIT-4: sub 命令")
+assert_includes(lir, "add x",      "JIT-4: add 命令")
+assert_includes(lir, "cmp x",      "JIT-4: cmp 命令")
+assert_includes(lir, "b.ge BB",    "JIT-4: FixnumLt の偽分岐は B_GE")
+assert_includes(lir, "b BB",       "JIT-4: 無条件 jump")
+assert_includes(lir, "bl m0",      "JIT-4: 再帰呼び出し")
+assert_includes(lir, "ret",        "JIT-4: return")
+assert_includes(lir, "tbz x",      "JIT-4: GuardFixnum (TBZ)")
+# 機械語 hex が併記される
+assert_includes(lir, "    ; 0x",   "JIT-4: 機械語 hex 表示")
+# RET の機械語は固定 0xd65f03c0
+assert_includes(lir, "0xd65f03c0", "JIT-4: ret の正しい機械語")
+# ADD register 命令の上位 8 ビットは 0x8b
+assert_includes(lir, "    ; 0x8b", "JIT-4: add reg の 0x8b プレフィクス")
+
 puts ""
-puts "#{$pass} passed, #{$fail} failed (JIT-1/2/3a/3b1/3b2/3b3/3c)"
+puts "#{$pass} passed, #{$fail} failed (JIT-1/2/3a/3b1/3b2/3b3/3c/4)"
 exit($fail == 0 ? 0 : 1)

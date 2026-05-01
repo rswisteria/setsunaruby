@@ -7,7 +7,7 @@ Ruby 文法を持つ、スタックマシン型プログラミング言語の処
 「刹那」(10⁻¹⁸) から命名。mruby / nanoruby / picoruby に続く、
 さらに小さな Ruby 系列という位置付け。
 
-## 現状: Stage 0 / 0.5 / 1 / 2 / JIT-1 / JIT-2 / JIT-3a / JIT-3b1 / JIT-3b2 / JIT-3b3 / JIT-3c 完了
+## 現状: Stage 0 / 0.5 / 1 / 2 / JIT-1 / JIT-2 / JIT-3a / JIT-3b1 / JIT-3b2 / JIT-3b3 / JIT-3c / JIT-4 (案 A) 完了
 
 スタックマシン上で **再帰 `fib(20)` / アッカーマン / tarai が CRuby + spinel AOT 両方で動作**。
 
@@ -43,7 +43,7 @@ make build       # ./setsunaruby を生成
 # AOT 実行
 ./setsunaruby examples/hello.rb
 
-# テスト (CRuby Stage 0:38 + Stage 1:28 + Stage 2:26 + JIT-1/2/3a/3b1/3b2/3b3/3c:94 / AOT:47)
+# テスト (CRuby Stage 0:38 + Stage 1:28 + Stage 2:26 + JIT-1/2/3a/3b1/3b2/3b3/3c/4:108 / AOT:47)
 make test-cruby
 make test-aot
 make test-all
@@ -164,7 +164,8 @@ Symbol/sp_sym を経由すると spinel の Token フィールド型推論が崩
 | JIT-3b2 | dominator tree + dominance frontier + CFG 分析ダンプ | ✅ 完了 (Cooper iterative + Cytron DF) |
 | JIT-3b3 | phi 挿入 + variable renaming (本格 SSA 化) | ✅ 完了 (Cytron + LoadParam) |
 | JIT-3c | プロファイル収集 + type_specialize + GuardFixnum | ✅ 完了 (Fixnum 特化命令) |
-| JIT-4 | LIR + arm64 codegen + ディスパッチ切替 + side exit | 未着手 |
+| JIT-4 (案 A) | HIR → LIR lowering + arm64 エンコーダ + ダンプ (実機実行なし) | ✅ 完了 (アセンブリ + 機械語 hex を STDERR に出力) |
+| JIT-4 (案 C) | mmap + W^X + 関数ポインタ呼び出しでの実機実行 | 未着手 (spinel 拡張が前提) |
 | 3+ | 文字列・配列・ブロック・クラス・例外 | 未着手 |
 | ∞ | 自己ホスト (setsunaruby を setsunaruby で動かす) | 究極目標 |
 
@@ -180,6 +181,7 @@ Symbol/sp_sym を経由すると spinel の Token フィールド型推論が崩
 │       ├── ast.rb            # ASTNode クラス (トップレベル)
 │       ├── opcodes.rb        # Op:: オペコード定数
 │       ├── hir_opcodes.rb    # HirOp:: HIR 命令種別 + HirConstTag (JIT-2)
+│       ├── lir_opcodes.rb    # LirOp:: LIR 命令種別 + Arm64Cond (JIT-4)
 │       ├── object.rb         # ObjectVal::NIL_VAL/TRUE_VAL/FALSE_VAL
 │       └── interp.rb         # Lexer/Parser/Compiler/VM 統合クラス
 ├── examples/
@@ -191,7 +193,7 @@ Symbol/sp_sym を経由すると spinel の Token フィールド型推論が崩
 │   ├── test_stage0.rb        # CRuby Stage 0 テスト (38件)
 │   ├── test_stage1.rb        # CRuby Stage 1 テスト (28件)
 │   ├── test_stage2.rb        # CRuby Stage 2 テスト (26件)
-│   ├── test_stage_jit.rb     # CRuby JIT-1/2/3a/3b1/3b2/3b3/3c テスト (94件)
+│   ├── test_stage_jit.rb     # CRuby JIT-1/2/3a/3b1/3b2/3b3/3c/4 テスト (108件)
 │   └── test_aot.rb           # AOT テスト (47件)
 ├── setsunaruby               # spinel ビルド成果物 (gitignore)
 └── Makefile
