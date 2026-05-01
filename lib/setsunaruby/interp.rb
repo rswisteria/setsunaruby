@@ -35,7 +35,11 @@ module Setsunaruby
     SLASH_BYTE = 47
     LBRACK_B   = 91  # '[' (Stage 3b)
     RBRACK_B   = 93  # ']' (Stage 3b)
+    LBRACE_B   = 123 # '{' (Stage 3c.3 中括弧ブロック)
+    RBRACE_B   = 125 # '}'
     PIPE_B     = 124 # '|' (Stage 3c.1 ブロックパラメータ)
+    Q_MARK_B   = 63  # '?' (Stage 3c.3 識別子末尾)
+    BANG_B     = 33  # '!' (Stage 3c.3 識別子末尾)
     PCT   = 37
     EQ    = 61
     LT_BYTE = 60
@@ -75,11 +79,14 @@ module Setsunaruby
     KW_RETURN_BYTES = [114, 101, 116, 117, 114, 110].freeze   # "return"
     KW_DO_BYTES     = [100, 111].freeze                       # "do" (Stage 3c.1)
     KW_YIELD_BYTES  = [121, 105, 101, 108, 100].freeze        # "yield" (Stage 3c.2)
-    # Stage 3b/3c: ドット method 名 (現状 length / each / times をサポート)。
+    # Stage 3b/3c: ドット method 名 (現状 length / each / times / map をサポート)。
     # 将来 method_name_is_*? を増やすときも同じ場所に追加する。
     KW_LENGTH_BYTES = [108, 101, 110, 103, 116, 104].freeze   # "length"
     KW_EACH_BYTES   = [101, 97, 99, 104].freeze               # "each"
     KW_TIMES_BYTES  = [116, 105, 109, 101, 115].freeze        # "times"
+    KW_MAP_BYTES    = [109, 97, 112].freeze                   # "map" (Stage 3c.3)
+    # Stage 3c.3: block_given? は識別子として lex され、compile 時に名前判定する。
+    KW_BLOCK_GIVEN_BYTES = [98, 108, 111, 99, 107, 95, 103, 105, 118, 101, 110, 63].freeze   # "block_given?"
 
     def initialize
       @src       = ""
@@ -413,10 +420,22 @@ module Setsunaruby
       while @lex_pos < @bytes.length && ident_cont?(@bytes[@lex_pos])
         @lex_pos += 1
       end
+      # Stage 3c.3: 識別子末尾の `?` / `!` を 1 byte だけ先に取り込む。
+      # 取り込んだ場合はキーワード判定を行わない (`true?` は KW_TRUE ではなく IDENT)。
+      has_suffix = 0
+      if @lex_pos < @bytes.length
+        last = @bytes[@lex_pos]
+        if last == Q_MARK_B || last == BANG_B
+          @lex_pos += 1
+          has_suffix = 1
+        end
+      end
       len = @lex_pos - start
-      kw = match_keyword(start, len)
-      if kw != :nop
-        return Token.new(kw, 0, "", @line)
+      if has_suffix == 0
+        kw = match_keyword(start, len)
+        if kw != :nop
+          return Token.new(kw, 0, "", @line)
+        end
       end
       # IDENT: 名前は @bytes 上の (start, len) で識別する。
       # 識別子の最大長を 2^16 と仮定し、(start << 16) | len を int_value に格納。
@@ -506,6 +525,12 @@ module Setsunaruby
       elsif b == RBRACK_B
         @lex_pos += 1
         Token.new(TokenKind::RBRACK, 0, "", @line)
+      elsif b == LBRACE_B
+        @lex_pos += 1
+        Token.new(TokenKind::LBRACE, 0, "", @line)
+      elsif b == RBRACE_B
+        @lex_pos += 1
+        Token.new(TokenKind::RBRACE, 0, "", @line)
       elsif b == DOT_BYTE
         @lex_pos += 1
         Token.new(TokenKind::DOT, 0, "", @line)
@@ -672,10 +697,10 @@ module Setsunaruby
             args = parse_arg_list
             expect(TokenKind::RPAREN)
           end
-          # Stage 3c.1: 引数並びの直後に `do |param| body end` があればブロックを取り込む。
-          # node_right に :block_arg を載せる (compile_method_call_on で each/times に展開)。
+          # Stage 3c.1/3c.3: 引数並びの直後に `do ... end` または `{ ... }` があればブロックを取り込む。
+          # node_right に :block_arg を載せる (compile_method_call_on で each/times/map に展開)。
           block = nil
-          if @cur_token.kind == TokenKind::KW_DO
+          if @cur_token.kind == TokenKind::KW_DO || @cur_token.kind == TokenKind::LBRACE
             block = parse_block_arg
           end
           node = ASTNode.new(:method_call_on, name_packed, false, :nop, node, block, args)
@@ -684,15 +709,16 @@ module Setsunaruby
       node
     end
 
-    # `do |param| body end` を 1 つ読む。`do body end` (param なし) も許容。
-    # 多パラメータ `|x, y|` は Stage 3c.1 では非対応。
-    # node_int_value: param 名 packed (param なしの場合は 0、len=0 の packed)
-    # node_left:      ブロック本体 (parse_block 結果)
-    # 注: 内部の parse_block は KW_DO を終端として認識しないが、ネストした
-    # `each`/`times` の `do` は parse_postfix_from が DOT 直後のチェックで先取り
-    # するため通常パスでは衝突しない。
+    # `do |param| body end` または `{ |param| body }` を 1 つ読む (param なし可)。
+    # 多パラメータ `|x, y|` は未対応。
+    # node_int_value: param 名 packed (省略時 0)、node_left: ブロック本体
     def parse_block_arg
-      expect(TokenKind::KW_DO)
+      brace = @cur_token.kind == TokenKind::LBRACE
+      if brace
+        expect(TokenKind::LBRACE)
+      else
+        expect(TokenKind::KW_DO)
+      end
       param_packed = 0
       if @cur_token.kind == TokenKind::PIPE
         @cur_token = next_token
@@ -702,14 +728,46 @@ module Setsunaruby
         param_packed = @cur_token.int_value
         @cur_token = next_token
         if @cur_token.kind == TokenKind::COMMA
-          raise "Parse error: line #{@cur_token.line}: 多パラメータブロックは Stage 3c.1 スコープ外"
+          raise "Parse error: line #{@cur_token.line}: 多パラメータブロックはスコープ外"
         end
         expect(TokenKind::PIPE)
       end
       skip_newlines
-      body = parse_block
-      expect(TokenKind::KW_END)
+      if brace
+        body = parse_brace_block_body
+        expect(TokenKind::RBRACE)
+      else
+        body = parse_block
+        expect(TokenKind::KW_END)
+      end
       ASTNode.new(:block_arg, param_packed, false, :nop, body, nil, nil)
+    end
+
+    # 中括弧ブロック専用のボディパーサ。`}` を終端とする以外は parse_block と同形。
+    def parse_brace_block_body
+      skip_newlines
+      if @cur_token.kind == TokenKind::RBRACE
+        return ASTNode.new(:nil_lit, 0, false, :nop, nil, nil, nil)
+      end
+      first = parse_statement
+      consume_brace_block_terminator
+      skip_newlines
+      if @cur_token.kind == TokenKind::RBRACE
+        return first
+      end
+      rest = parse_brace_block_body
+      ASTNode.new(:seq, 0, false, :nop, first, nil, rest)
+    end
+
+    def consume_brace_block_terminator
+      k = @cur_token.kind
+      # NEWLINE / 改行不要のセミコロン代替として `}` 直前は何もない (式 1 個直後 `}`) も許可。
+      if k == TokenKind::NEWLINE || k == TokenKind::EOF || k == TokenKind::RBRACE
+        # OK (NEWLINE は呼び出し元の skip_newlines で消費)
+      else
+        raise "Parse error: line #{@cur_token.line}: 文の終端 (改行/`}`) が必要です"
+      end
+      nil
     end
 
     def parse_multiplicative_from(node)
@@ -981,20 +1039,20 @@ module Setsunaruby
           # :assign は名前 packed を node_int_value に格納
           return ASTNode.new(:assign, packed, false, :nop, value, nil, nil)
         elsif @cur_token.kind == TokenKind::LPAREN
-          # メソッド呼び出し: ident '(' args ')' [do |p| body end]
+          # メソッド呼び出し: ident '(' args ')' [do|{ ... end|}]
           @cur_token = next_token
           args = parse_arg_list
           expect(TokenKind::RPAREN)
-          # Stage 3c.2: 引数並びの直後に do ... end があればブロックとして取り込む。
+          # Stage 3c.2/3c.3: 引数並びの直後に do ... end / { ... } があればブロックを取り込む。
           # method_call の node_right にブロックを attach (method_call_on と同じ規約)。
           block = nil
-          if @cur_token.kind == TokenKind::KW_DO
+          if @cur_token.kind == TokenKind::KW_DO || @cur_token.kind == TokenKind::LBRACE
             block = parse_block_arg
           end
           left_node = ASTNode.new(:method_call, packed, false, :nop, args, block, nil)
           return parse_expression_from(left_node, line)
-        elsif @cur_token.kind == TokenKind::KW_DO
-          # Stage 3c.2: `f do ... end` 括弧省略形は 0-arg method_call + block として扱う。
+        elsif @cur_token.kind == TokenKind::KW_DO || @cur_token.kind == TokenKind::LBRACE
+          # `f do ... end` / `f { ... }` 括弧省略形 → 0-arg method_call + block。
           block = parse_block_arg
           left_node = ASTNode.new(:method_call, packed, false, :nop, nil, block, nil)
           return parse_expression_from(left_node, line)
@@ -1162,6 +1220,9 @@ module Setsunaruby
         if idx >= 0
           @bytecode.push(Op::LOAD_LOCAL)
           encode_signed(idx)
+        elsif method_name_is_block_given?(pkt)
+          # Stage 3c.3: block_given? は組み込み 0-arg method として opcode 直接 emit。
+          @bytecode.push(Op::BLOCK_GIVEN_P)
         else
           # Ruby と同様、ローカルとして未定義なら 0 引数メソッド呼び出しに解決する。
           m_idx = find_method(pkt)
@@ -1250,17 +1311,19 @@ module Setsunaruby
       block       = node.node_right
       argc        = count_arg_chain(node.node_operand)
 
-      # Stage 3c.1: ブロック付き呼び出しは特殊形式 (each / times) 限定でインライン展開。
+      # Stage 3c.1/3c.3: ブロック付き呼び出しは特殊形式 (each / times / map) 限定でインライン展開。
       if block != nil
         if argc != 0
-          raise "Compile error: line #{@cur_token.line}: Stage 3c.1 ではブロック付きメソッドの引数は 0 個のみ"
+          raise "Compile error: line #{@cur_token.line}: ブロック付きメソッドの引数は 0 個のみ"
         end
         if method_name_is_each?(name_packed)
           compile_each_block(node.node_left, block)
         elsif method_name_is_times?(name_packed)
           compile_times_block(node.node_left, block)
+        elsif method_name_is_map?(name_packed)
+          compile_map_block(node.node_left, block)
         else
-          raise "Compile error: line #{@cur_token.line}: Stage 3c.1 ではブロック付きは .each / .times のみ"
+          raise "Compile error: line #{@cur_token.line}: ブロック付きは .each / .times / .map のみ"
         end
         return nil
       end
@@ -1396,6 +1459,61 @@ module Setsunaruby
       nil
     end
 
+    # `arr.map do |x| body end` → while ループ + 出力配列構築に展開する。
+    # 形は compile_each_block と同じだが、毎反復で body の戻り値を出力配列に push し、
+    # 最後に出力配列を結果として残す (Ruby Array#map と一致)。
+    def compile_map_block(recv_node, block_node)
+      recv_slot = declare_anonymous_local
+      idx_slot  = declare_anonymous_local
+      out_slot  = declare_anonymous_local
+      param_packed = block_node.node_int_value
+      param_slot = -1
+      if param_packed != 0
+        param_slot = declare_local(param_packed)
+      end
+
+      emit_store_to_slot(recv_node, recv_slot)
+      emit_init_counter(idx_slot)
+
+      # _out = []
+      @bytecode.push(Op::ARRAY_NEW); encode_signed(0)
+      @bytecode.push(Op::STORE_LOCAL); encode_signed(out_slot)
+      @bytecode.push(Op::POP)
+
+      # while _i < _recv.length
+      loop_start = @bytecode.length
+      @bytecode.push(Op::LOAD_LOCAL); encode_signed(idx_slot)
+      @bytecode.push(Op::LOAD_LOCAL); encode_signed(recv_slot)
+      @bytecode.push(Op::ARRAY_LEN)
+      @bytecode.push(Op::LT)
+      jexit = emit_jump(Op::JUMP_IF_FALSE)
+
+      # x = _recv[_i] (param 指定時のみ)
+      if param_slot >= 0
+        @bytecode.push(Op::LOAD_LOCAL); encode_signed(recv_slot)
+        @bytecode.push(Op::LOAD_LOCAL); encode_signed(idx_slot)
+        @bytecode.push(Op::ARRAY_GET)
+        @bytecode.push(Op::STORE_LOCAL); encode_signed(param_slot)
+        @bytecode.push(Op::POP)
+      end
+
+      # _out << body
+      @bytecode.push(Op::LOAD_LOCAL); encode_signed(out_slot)
+      compile_block(block_node.node_left)
+      @bytecode.push(Op::LSHIFT)
+      @bytecode.push(Op::POP)
+
+      emit_increment_slot(idx_slot)
+
+      back = emit_jump(Op::JUMP)
+      patch_jump(back, loop_start)
+      patch_jump(jexit, @bytecode.length)
+
+      # map は構築した出力配列を返す。
+      @bytecode.push(Op::LOAD_LOCAL); encode_signed(out_slot)
+      nil
+    end
+
     # 名前を持たない無名 local slot を 1 つ確保する。len=0 を埋めることで find_local の
     # bytes_eq マッチから永久に外す (= ユーザコードからは参照不可)。
     # コンパイラはここで返る slot idx を STORE_LOCAL/LOAD_LOCAL で直接使う。
@@ -1417,6 +1535,14 @@ module Setsunaruby
 
     def method_name_is_times?(packed)
       method_name_match?(packed, KW_TIMES_BYTES)
+    end
+
+    def method_name_is_map?(packed)
+      method_name_match?(packed, KW_MAP_BYTES)
+    end
+
+    def method_name_is_block_given?(packed)
+      method_name_match?(packed, KW_BLOCK_GIVEN_BYTES)
     end
 
     def method_name_match?(packed, kw_bytes)
@@ -1493,12 +1619,20 @@ module Setsunaruby
     def compile_method_call(node)
       name_packed = node.node_int_value
       block       = node.node_right    # :block_arg or nil (Stage 3c.2)
+      argc        = count_arg_chain(node.node_left)
+      # Stage 3c.3: block_given? は組み込み 0-arg method (block 不可、引数不可)。
+      if method_name_is_block_given?(name_packed)
+        if argc != 0 || block != nil
+          raise "Compile error: line #{@cur_token.line}: block_given? は引数とブロックを取りません"
+        end
+        @bytecode.push(Op::BLOCK_GIVEN_P)
+        return nil
+      end
       m_idx = find_method(name_packed)
       if m_idx < 0
         raise "Compile error: line #{@cur_token.line}: 未定義のメソッド呼び出しです"
       end
       expected = @method_arities[m_idx]
-      argc = count_arg_chain(node.node_left)
       if expected != argc
         raise "Compile error: line #{@cur_token.line}: 引数の個数が一致しません (期待 #{expected}, 実際 #{argc})"
       end
@@ -1844,6 +1978,8 @@ module Setsunaruby
           exec_yield
         elsif op == Op::BLOCK_RETURN
           exec_block_return
+        elsif op == Op::BLOCK_GIVEN_P
+          exec_block_given_p
         elsif op == Op::RETURN
           exec_return
         elsif op == Op::HALT
@@ -2387,6 +2523,18 @@ module Setsunaruby
       nil
     end
 
+    # Stage 3c.3: 現在のフレームが block を受け取って呼ばれていれば true、そうでなければ false。
+    # トップレベル (フレームなし) は false を返す (Ruby と同様: トップレベル yield は LocalJumpError)。
+    def exec_block_given_p
+      top = @cfp_block_pcs.length - 1
+      if top < 0 || @cfp_block_pcs[top] < 0
+        @stack.push(ObjectVal::FALSE_VAL)
+      else
+        @stack.push(ObjectVal::TRUE_VAL)
+      end
+      nil
+    end
+
     def exec_return
       v = @stack.pop
       # 自スコープのローカル領域を破棄 (caller の base に戻す)。
@@ -2686,6 +2834,10 @@ module Setsunaruby
           end
           v = sstack[sstack.length - 1]
           hir_id = emit_hir(HirOp::BLOCK_RETURN, v, 0, 0)
+        elsif op == Op::BLOCK_GIVEN_P
+          # Stage 3c.3: 引数なし、bool 値 1 つを sstack に push。
+          hir_id = emit_hir(HirOp::BLOCK_GIVEN_P, 0, 0, 0)
+          sstack.push(hir_id)
         elsif op == Op::RETURN
           v = sstack.pop
           hir_id = emit_hir(HirOp::RETURN, v, 0, 0)
@@ -2927,6 +3079,8 @@ module Setsunaruby
         result = format_yield_insn(op0, op1)
       elsif kind == HirOp::BLOCK_RETURN
         result = "BlockReturn v#{op0}"
+      elsif kind == HirOp::BLOCK_GIVEN_P
+        result = "BlockGivenP"
       elsif kind == HirOp::RETURN
         result = "Return v#{op0}"
       elsif kind == HirOp::GUARD_FIXNUM

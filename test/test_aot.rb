@@ -250,6 +250,15 @@ assert_output(File.read(File.expand_path('../examples/yield.rb', __dir__)),
               "examples/yield.rb")
 assert_fails("def f\n  yield\nend\nf\n", "YIELD: block なしで raise")
 
+# ---- Stage 3c.3: block_given? / Array#map / 中括弧ブロック ----
+assert_output("def f\n  puts block_given?\nend\nf\n", "false\n", "BLK?: false")
+assert_output("def f\n  puts block_given?\nend\nf do\nend\n", "true\n", "BLK?: true")
+assert_output("puts [1, 2, 3].map { |x| x + 100 }\n", "101\n102\n103\n", "MAP: 中括弧 + map")
+assert_output("3.times { |i| puts i }\n", "0\n1\n2\n", "中括弧: times")
+assert_output(File.read(File.expand_path('../examples/map.rb', __dir__)),
+              "1\n4\n9\n16\n25\n1\n2\n3\nHello, world\nWelcome, setsunaruby!\n101\n102\n103\n",
+              "examples/map.rb")
+
 # ---- エラー系 ----
 assert_fails(%(puts "a" + 1\n),  "STR: + 型エラー")
 assert_fails(%(puts 1 << 1\n),   "STR: << は (string|array) のみ (Fixnum 不可)")
