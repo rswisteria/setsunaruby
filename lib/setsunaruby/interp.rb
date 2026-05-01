@@ -3079,7 +3079,10 @@ module Setsunaruby
     def lower_load_const(i, bb)
       tag = @hir_op0[i]
       if tag == HirConstTag::INT
-        # box 形式 (n << 1 | 1) で MOV (16bit imm 限定の素朴版)。
+        # box 形式 (n << 1 | 1) で MOVZ。MOVZ は 16bit zero-extend なので、
+        # 負数の boxed 値や 16bit を超える整数は上位 bit が落ちて誤った値になる。
+        # 完全対応には MOVN または MOVZ + MOVK チェーンが必要だが、案 A (実機実行
+        # なし、ダンプのみ) では下位 16bit のみ表示する素朴版。
         v = (@hir_op1[i] << 1) | 1
         emit_lir(LirOp::MOV_IMM, hir_to_reg(i), v & 0xFFFF, 0, bb)
       elsif tag == HirConstTag::TRUE
@@ -3103,7 +3106,9 @@ module Setsunaruby
 
     def encode_arm64_insn(lir_id)
       kind = @lir_kind[lir_id]
-      result = 0
+      # 未知 kind のフォールバック値。0 は arm64 で UDF #0 (= 不正命令) なので、
+      # ダンプで「0xdead0000」が出れば「LirOp 追加忘れ」と気付ける目印。
+      result = 0xDEAD0000
       if kind == LirOp::MOV_IMM
         result = encode_movz(@lir_op0[lir_id], @lir_op1[lir_id])
       elsif kind == LirOp::MOV_REG
@@ -3199,16 +3204,16 @@ module Setsunaruby
       0xD65F0000 | (30 << 5)
     end
 
-    # TBZ Rt, #b40, label : sf(1) 011011 op(0=TBZ) b40(5) imm14 Rt(5)。
-    # 64bit variant (sf=1) → 上位バイト 0xB6。bit はビット番号の下位 5bit、
-    # target は 4byte 単位の PC 相対オフセット (現段階では BB id 生埋め)。
+    # TBZ Rt, #b40, label : b5(31) 011011 op(24=0=TBZ) b40(23:19) imm14(18:5) Rt(4:0)。
+    # b5 はビット番号の bit5 (0..31 のテストなら 0、32..63 なら 1)。setsunaruby は
+    # Fixnum タグ (bit 0) のチェックにしか使わないので b5=0 → ベース 0x36000000。
     # target=-1 (未解決) のときは imm14 が 0x3FFF に汚染されないよう 0 にクランプ。
     def encode_tbz(rt, bit, target)
       safe_target = target
       if safe_target < 0
         safe_target = 0
       end
-      0xB6000000 | ((bit & 0x1F) << 19) | ((safe_target & 0x3FFF) << 5) | (rt & 0x1F)
+      0x36000000 | ((bit & 0x1F) << 19) | ((safe_target & 0x3FFF) << 5) | (rt & 0x1F)
     end
 
     def dump_lir(m_idx)
