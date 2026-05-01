@@ -41,6 +41,11 @@ module Setsunaruby
     ARRAY_SET = 0x184       # op0 = arr (hir_id), op1 = idx (hir_id), op2 = val (hir_id)
     ARRAY_LEN = 0x185       # op0 = arr (hir_id)
 
+    # Stage 3c.2: ブロック付き呼び出しと yield。LIR には lower しない。
+    CALL_WITH_BLOCK = 0x190   # op0 = method_idx, op1 = args_start, op2 = arity
+    YIELD           = 0x191   # op0 = argc, op1 = args_start
+    BLOCK_RETURN    = 0x192   # op0 = value (hir_id)
+
     # JIT-3c: 型特化命令。GUARD_FIXNUM は値が Fixnum でなければ side exit。
     # FIXNUM_* は Fixnum 入力前提で動作する特化命令。
     GUARD_FIXNUM = 0x150    # op0 = guarded value (hir_id)

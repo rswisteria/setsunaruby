@@ -218,6 +218,38 @@ assert_output(File.read(File.expand_path('../examples/each.rb', __dir__)),
               "0\n1\n2\n10\n20\n30\n15\n1\n4\n9\n16\n25\n100\n",
               "examples/each.rb")
 
+# ---- Stage 3c.2: 一般 yield ----
+yield_basic = <<~RUBY
+  def emit(x)
+    yield x
+  end
+  emit(42) do |v|
+    puts v
+  end
+RUBY
+assert_output(yield_basic, "42\n", "YIELD: 引数 1 つ")
+
+yield_loop = <<~RUBY
+  def my_each(arr)
+    i = 0
+    while i < arr.length
+      yield arr[i]
+      i = i + 1
+    end
+  end
+  s = 0
+  my_each([1, 2, 3, 4, 5]) do |v|
+    s = s + v
+  end
+  puts s
+RUBY
+assert_output(yield_loop, "15\n", "YIELD: closure 経由の集計")
+
+assert_output(File.read(File.expand_path('../examples/yield.rb', __dir__)),
+              "10\n20\n30\n2\n4\n6\n8\nhi\nhi\nhi\n15\n",
+              "examples/yield.rb")
+assert_fails("def f\n  yield\nend\nf\n", "YIELD: block なしで raise")
+
 # ---- エラー系 ----
 assert_fails(%(puts "a" + 1\n),  "STR: + 型エラー")
 assert_fails(%(puts 1 << 1\n),   "STR: << は (string|array) のみ (Fixnum 不可)")

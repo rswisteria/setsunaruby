@@ -74,6 +74,7 @@ module Setsunaruby
     KW_DEF_BYTES    = [100, 101, 102].freeze                  # "def"
     KW_RETURN_BYTES = [114, 101, 116, 117, 114, 110].freeze   # "return"
     KW_DO_BYTES     = [100, 111].freeze                       # "do" (Stage 3c.1)
+    KW_YIELD_BYTES  = [121, 105, 101, 108, 100].freeze        # "yield" (Stage 3c.2)
     # Stage 3b/3c: ドット method 名 (現状 length / each / times をサポート)。
     # 将来 method_name_is_*? を増やすときも同じ場所に追加する。
     KW_LENGTH_BYTES = [108, 101, 110, 103, 116, 104].freeze   # "length"
@@ -169,6 +170,16 @@ module Setsunaruby
       @cfp_pcs   = []   # IntArray (戻り PC)
       @cfp_bases = []   # IntArray (戻り後の @cur_base)
       @cur_base  = 0    # 現在実行中の locals base
+      # Stage 3c.2: コールフレームに紐付くブロック PC (-1 = ブロックなし)。
+      # YIELD は @cfp_block_pcs.last を読んでブロックへ飛ぶ。
+      # @cfp_block_arities は yield argc とブロック param 数の不一致をランタイムで弾くため。
+      @cfp_block_pcs     = []
+      @cfp_block_arities = []
+      # Stage 3c.2: yield 中の block 本体実行のための保存スタック。
+      # YIELD で push、BLOCK_RETURN で pop して @pc / @cur_base を復元する。
+      # @cfp_* と独立: 1 つの method 呼び出しの間に複数回 yield する想定。
+      @yield_pcs   = []
+      @yield_bases = []
       # Stage 3a/3b: ヒープオブジェクト。obj_id = (idx << 3) | HEAP_TAG。
       # @heap_kind が 1=String, 2=Array を区別する (HEAP_KIND_STRING / HEAP_KIND_ARRAY)。
       # @heap_starts/lens の解釈は kind に依存:
@@ -246,6 +257,10 @@ module Setsunaruby
       @cfp_pcs   = []
       @cfp_bases = []
       @cur_base  = 0
+      @cfp_block_pcs     = []
+      @cfp_block_arities = []
+      @yield_pcs         = []
+      @yield_bases       = []
       # Stage 3a/3b: ヒープ状態のリセット。
       @heap_kind     = []
       @heap_starts   = []
@@ -438,6 +453,8 @@ module Setsunaruby
         result = TokenKind::KW_RETURN
       elsif match_bytes(start, len, KW_DO_BYTES)
         result = TokenKind::KW_DO
+      elsif match_bytes(start, len, KW_YIELD_BYTES)
+        result = TokenKind::KW_YIELD
       end
       result
     end
@@ -584,6 +601,35 @@ module Setsunaruby
       else
         return parse_expression
       end
+    end
+
+    # `yield` / `yield expr` / `yield (expr)` / `yield(expr)` のいずれかを 1 つ読む。
+    # Stage 3c.2 では argc 0 or 1 のみサポート。多引数 yield は将来。
+    # node_left に引数式を 1 つ載せる (引数なしのときは nil)。
+    def parse_yield
+      @cur_token = next_token   # consume `yield`
+      k = @cur_token.kind
+      val = nil
+      if k == TokenKind::NEWLINE || k == TokenKind::EOF ||
+         k == TokenKind::KW_END  || k == TokenKind::KW_ELSE ||
+         k == TokenKind::KW_ELSIF
+        # 引数なし
+      elsif k == TokenKind::LPAREN
+        @cur_token = next_token
+        if @cur_token.kind != TokenKind::RPAREN
+          val = parse_expression
+          if @cur_token.kind == TokenKind::COMMA
+            raise "Parse error: line #{@cur_token.line}: yield の多引数は Stage 3c.2 スコープ外"
+          end
+        end
+        expect(TokenKind::RPAREN)
+      else
+        val = parse_expression
+        if @cur_token.kind == TokenKind::COMMA
+          raise "Parse error: line #{@cur_token.line}: yield の多引数は Stage 3c.2 スコープ外"
+        end
+      end
+      ASTNode.new(:yield_expr, 0, false, :nop, val, nil, nil)
     end
 
     # 既に primary を 1 つ読み終えた状態から、続く演算子を取り込んで式を完成させる。
@@ -936,11 +982,22 @@ module Setsunaruby
           # :assign は名前 packed を node_int_value に格納
           return ASTNode.new(:assign, packed, false, :nop, value, nil, nil)
         elsif @cur_token.kind == TokenKind::LPAREN
-          # メソッド呼び出し: ident '(' args ')'
+          # メソッド呼び出し: ident '(' args ')' [do |p| body end]
           @cur_token = next_token
           args = parse_arg_list
           expect(TokenKind::RPAREN)
-          left_node = ASTNode.new(:method_call, packed, false, :nop, args, nil, nil)
+          # Stage 3c.2: 引数並びの直後に do ... end があればブロックとして取り込む。
+          # method_call の node_right にブロックを attach (method_call_on と同じ規約)。
+          block = nil
+          if @cur_token.kind == TokenKind::KW_DO
+            block = parse_block_arg
+          end
+          left_node = ASTNode.new(:method_call, packed, false, :nop, args, block, nil)
+          return parse_expression_from(left_node, line)
+        elsif @cur_token.kind == TokenKind::KW_DO
+          # Stage 3c.2: `f do ... end` 括弧省略形は 0-arg method_call + block として扱う。
+          block = parse_block_arg
+          left_node = ASTNode.new(:method_call, packed, false, :nop, nil, block, nil)
           return parse_expression_from(left_node, line)
         else
           left_node = ASTNode.new(:var_ref, packed, false, :nop, nil, nil, nil)
@@ -1024,6 +1081,8 @@ module Setsunaruby
         parse_if
       elsif k == TokenKind::KW_WHILE
         parse_while
+      elsif k == TokenKind::KW_YIELD
+        parse_yield
       else
         raise "Parse error: line #{@cur_token.line}: 式が必要です"
       end
@@ -1147,9 +1206,24 @@ module Setsunaruby
         @bytecode.push(Op::ARRAY_SET)
       elsif k == :method_call_on
         compile_method_call_on(node)
+      elsif k == :yield_expr
+        compile_yield(node)
       else
         raise "Compiler bug: unknown expression kind #{k}"
       end
+      nil
+    end
+
+    # `yield expr` または `yield`。argc は 0 or 1 (Stage 3c.2 制約)。
+    # 結果スタックには YIELD opcode が起動した block の return 値が残る。
+    def compile_yield(node)
+      argc = 0
+      if node.node_left != nil
+        compile_expr(node.node_left)
+        argc = 1
+      end
+      @bytecode.push(Op::YIELD)
+      encode_signed(argc)
       nil
     end
 
@@ -1419,6 +1493,7 @@ module Setsunaruby
 
     def compile_method_call(node)
       name_packed = node.node_int_value
+      block       = node.node_right    # :block_arg or nil (Stage 3c.2)
       m_idx = find_method(name_packed)
       if m_idx < 0
         raise "Compile error: line #{@cur_token.line}: 未定義のメソッド呼び出しです"
@@ -1428,15 +1503,55 @@ module Setsunaruby
       if expected != argc
         raise "Compile error: line #{@cur_token.line}: 引数の個数が一致しません (期待 #{expected}, 実際 #{argc})"
       end
+
+      block_pc = -1
+      block_arity = 0
+      if block != nil
+        block_pc = compile_inline_block(block)
+        if block.node_int_value != 0
+          block_arity = 1
+        end
+      end
+
       # 引数を左から右の順に評価して push (stack top が最後の引数)。
       cur = node.node_left
       while cur != nil
         compile_expr(cur.node_left)
         cur = cur.node_operand
       end
-      @bytecode.push(Op::CALL)
-      encode_signed(m_idx)
+
+      if block_pc >= 0
+        @bytecode.push(Op::CALL_WITH_BLOCK)
+        encode_signed(m_idx)
+        encode_signed(block_pc)
+        encode_signed(block_arity)
+      else
+        @bytecode.push(Op::CALL)
+        encode_signed(m_idx)
+      end
       nil
+    end
+
+    # `do |param| body end` ブロックを caller 側の bytecode に inline で配置する。
+    # 通常実行ではブロック領域を skip-jump で飛び越す。method_def の skip-jump パターンと同形。
+    # ブロック param は caller scope の名前付き local として宣言 (Stage 3c.1 と同じ flat scope)。
+    # 戻り値: ブロック先頭の PC (CALL_WITH_BLOCK の operand に渡す)。
+    def compile_inline_block(block_node)
+      skip = emit_jump(Op::JUMP)
+      block_pc = @bytecode.length
+      param_packed = block_node.node_int_value
+      if param_packed != 0
+        # YIELD は引数 1 個を stack に push してジャンプしてくる。STORE_LOCAL で param へ。
+        param_slot = declare_local(param_packed)
+        @bytecode.push(Op::STORE_LOCAL)
+        encode_signed(param_slot)
+        @bytecode.push(Op::POP)
+      end
+      # body は最後にスタックへ 1 値を残す不変条件 (compile_block の前提)。
+      compile_block(block_node.node_left)
+      @bytecode.push(Op::BLOCK_RETURN)
+      patch_jump(skip, @bytecode.length)
+      block_pc
     end
 
     def compile_return(node)
@@ -1725,6 +1840,12 @@ module Setsunaruby
           @stack.push(ObjectVal::NIL_VAL)   # Stage 1: puts は nil を返す
         elsif op == Op::CALL
           exec_call
+        elsif op == Op::CALL_WITH_BLOCK
+          exec_call_with_block
+        elsif op == Op::YIELD
+          exec_yield
+        elsif op == Op::BLOCK_RETURN
+          exec_block_return
         elsif op == Op::RETURN
           exec_return
         elsif op == Op::HALT
@@ -2169,9 +2290,23 @@ module Setsunaruby
 
     def exec_call
       m_idx = decode_signed
-      # 閾値到達後はカウントを止めて以降の配列 write を省く。
-      # 名前ではなく idx で出すのは @bytes 復元の文字列処理が spinel で
-      # 安全に動くか未検証なため (CLAUDE.md ルール 11)。
+      exec_call_common(m_idx, -1, 0)
+      nil
+    end
+
+    # Stage 3c.2: ブロック付き呼び出し。block_pc は caller bytecode 上のブロック先頭 PC。
+    # block_arity は yield argc とのランタイム不一致を検出するため。
+    def exec_call_with_block
+      m_idx       = decode_signed
+      block_pc    = decode_signed
+      block_arity = decode_signed
+      exec_call_common(m_idx, block_pc, block_arity)
+      nil
+    end
+
+    # 共通フレーム push 処理。block_pc=-1 なら通常呼び出し、>=0 ならブロック付き。
+    def exec_call_common(m_idx, block_pc, block_arity)
+      # JIT-1 プロファイル: 閾値到達後はカウントを止めて以降の配列 write を省く。
       cnt = @jit_call_counts[m_idx]
       if cnt < JIT_HOT_THRESHOLD
         cnt += 1
@@ -2203,8 +2338,39 @@ module Setsunaruby
 
       @cfp_pcs.push(@pc)
       @cfp_bases.push(@cur_base)
+      @cfp_block_pcs.push(block_pc)
+      @cfp_block_arities.push(block_arity)
       @cur_base = new_base
       @pc = @method_pcs[m_idx]
+      nil
+    end
+
+    # Stage 3c.2: yield。現在のフレームの block_pc に飛び、@cur_base を caller のものに切り替える。
+    # @yield_pcs / @yield_bases に method 側の状態を退避し、BLOCK_RETURN で復元する。
+    # 引数は YIELD 直前にスタック上に積まれており、ブロックのプロローグが消費する。
+    # argc とブロックの param 数が一致しない場合はランタイムで弾く (Stage 3c.2 制約: 0 or 1)。
+    def exec_yield
+      argc = decode_signed
+      if @cfp_block_pcs.length == 0 || @cfp_block_pcs[@cfp_block_pcs.length - 1] < 0
+        raise "LocalJumpError: no block given (yield)"
+      end
+      expected_arity = @cfp_block_arities[@cfp_block_arities.length - 1]
+      if argc != expected_arity
+        raise "ArgumentError: yield arity mismatch (block expects #{expected_arity}, got #{argc})"
+      end
+      block_pc    = @cfp_block_pcs[@cfp_block_pcs.length - 1]
+      caller_base = @cfp_bases[@cfp_bases.length - 1]
+      @yield_pcs.push(@pc)
+      @yield_bases.push(@cur_base)
+      @cur_base = caller_base
+      @pc = block_pc
+      nil
+    end
+
+    # Stage 3c.2: ブロック本体終端。スタック top はブロックの戻り値 (保持)。
+    def exec_block_return
+      @pc       = @yield_pcs.pop
+      @cur_base = @yield_bases.pop
       nil
     end
 
@@ -2216,6 +2382,8 @@ module Setsunaruby
       end
       @cur_base = @cfp_bases.pop
       @pc = @cfp_pcs.pop
+      @cfp_block_pcs.pop   # Stage 3c.2: 同フレームの block_pc も対で破棄
+      @cfp_block_arities.pop
       @stack.push(v)
       nil
     end
@@ -2478,24 +2646,36 @@ module Setsunaruby
         elsif op == Op::CALL
           callee_idx = decode_signed
           arity = @method_arities[callee_idx]
-          # underflow から `nil` が @hir_call_args (IntArray) に混入するのを防ぐ。
-          if sstack.length < arity
-            raise "JIT-2 bug: CALL underflow (need #{arity}, have #{sstack.length}) at pc=#{bc_pc}"
-          end
-          args_start = @hir_call_args.length
-          ai = sstack.length - arity
-          ae = sstack.length
-          while ai < ae
-            @hir_call_args.push(sstack[ai])
-            ai += 1
-          end
-          ai = 0
-          while ai < arity
-            sstack.pop
-            ai += 1
-          end
+          args_start = hir_collect_args(sstack, arity, "CALL", bc_pc)
           hir_id = emit_hir(HirOp::CALL, callee_idx, args_start, arity)
           sstack.push(hir_id)
+        elsif op == Op::CALL_WITH_BLOCK
+          # Stage 3c.2: CALL と同形 + block_pc / block_arity の追加 operand。
+          # HIR は CALL と同じ kind=CALL_WITH_BLOCK で扱い、LIR には lower しない。
+          callee_idx    = decode_signed
+          _block_pc     = decode_signed
+          _block_arity  = decode_signed
+          arity = @method_arities[callee_idx]
+          args_start = hir_collect_args(sstack, arity, "CALL_WITH_BLOCK", bc_pc)
+          hir_id = emit_hir(HirOp::CALL_WITH_BLOCK, callee_idx, args_start, arity)
+          sstack.push(hir_id)
+        elsif op == Op::YIELD
+          # Stage 3c.2: argc 個を sstack から消費し戻り値 1 値を push。
+          argc = decode_signed
+          args_start = hir_collect_args(sstack, argc, "YIELD", bc_pc)
+          hir_id = emit_hir(HirOp::YIELD, argc, args_start, 0)
+          sstack.push(hir_id)
+        elsif op == Op::BLOCK_RETURN
+          # Stage 3c.2: ブロック終端。VM はスタック top をそのまま保持して method 側に
+          # 戻すため、HIR の sstack model も pop ではなく peek で表現する。
+          # 通常 HIR builder はメソッド本体 (start_pc..end_pc) しか走査しないため、
+          # ブロック領域の BLOCK_RETURN は実際には到達しないが、将来 HIR がブロック内も
+          # 解析するパスで sstack 不整合を起こさないように整合させておく。
+          if sstack.length == 0
+            raise "JIT-2 bug: BLOCK_RETURN with empty sstack at pc=#{bc_pc}"
+          end
+          v = sstack[sstack.length - 1]
+          hir_id = emit_hir(HirOp::BLOCK_RETURN, v, 0, 0)
         elsif op == Op::RETURN
           v = sstack.pop
           hir_id = emit_hir(HirOp::RETURN, v, 0, 0)
@@ -2557,6 +2737,28 @@ module Setsunaruby
       @hir_deleted.push(0)
       @hir_bc_pc.push(-1)
       @hir_kind.length - 1
+    end
+
+    # CALL / CALL_WITH_BLOCK / YIELD で共有: sstack 末尾 n 個を @hir_call_args に
+    # コピーした上で sstack 側を pop。args_start (= 配置開始 idx) を返す。
+    # underflow ガードは nil 混入による IntArray 型崩壊 (spinel ルール 3) の防止。
+    def hir_collect_args(sstack, n, error_label, bc_pc)
+      if sstack.length < n
+        raise "JIT-2 bug: #{error_label} underflow (need #{n}, have #{sstack.length}) at pc=#{bc_pc}"
+      end
+      args_start = @hir_call_args.length
+      ai = sstack.length - n
+      ae = sstack.length
+      while ai < ae
+        @hir_call_args.push(sstack[ai])
+        ai += 1
+      end
+      ai = 0
+      while ai < n
+        sstack.pop
+        ai += 1
+      end
+      args_start
     end
 
     def dump_hir(m_idx, label)
@@ -2709,6 +2911,12 @@ module Setsunaruby
         result = "ArrayLen v#{op0}"
       elsif kind == HirOp::CALL
         result = format_call_insn(op0, op1, op2)
+      elsif kind == HirOp::CALL_WITH_BLOCK
+        result = "CallWithBlock " + format_call_insn(op0, op1, op2)
+      elsif kind == HirOp::YIELD
+        result = format_yield_insn(op0, op1)
+      elsif kind == HirOp::BLOCK_RETURN
+        result = "BlockReturn v#{op0}"
       elsif kind == HirOp::RETURN
         result = "Return v#{op0}"
       elsif kind == HirOp::GUARD_FIXNUM
@@ -2741,6 +2949,21 @@ module Setsunaruby
       result = "Call m#{callee_idx}("
       ci = 0
       while ci < arity
+        if ci > 0
+          result = result + ", "
+        end
+        arg_hid = @hir_call_args[args_start + ci]
+        result = result + "v#{arg_hid}"
+        ci += 1
+      end
+      result = result + ")"
+      result
+    end
+
+    def format_yield_insn(argc, args_start)
+      result = "Yield("
+      ci = 0
+      while ci < argc
         if ci > 0
           result = result + ", "
         end
@@ -2952,7 +3175,8 @@ module Setsunaruby
         use_counts[@hir_op0[i]] += 1
       elsif kind == HirOp::PUTS
         use_counts[@hir_op0[i]] += 1
-      elsif kind == HirOp::CALL
+      elsif kind == HirOp::CALL || kind == HirOp::CALL_WITH_BLOCK
+        # 引数並びは @hir_call_args 上、op1=args_start, op2=arity の規約を共有。
         args_start = @hir_op1[i]
         arity      = @hir_op2[i]
         j = 0
@@ -2960,6 +3184,16 @@ module Setsunaruby
           use_counts[@hir_call_args[args_start + j]] += 1
           j += 1
         end
+      elsif kind == HirOp::YIELD
+        argc       = @hir_op0[i]
+        args_start = @hir_op1[i]
+        j = 0
+        while j < argc
+          use_counts[@hir_call_args[args_start + j]] += 1
+          j += 1
+        end
+      elsif kind == HirOp::BLOCK_RETURN
+        use_counts[@hir_op0[i]] += 1
       elsif kind == HirOp::RETURN
         use_counts[@hir_op0[i]] += 1
       elsif kind == HirOp::PHI
@@ -3021,6 +3255,12 @@ module Setsunaruby
         result = true   # 型違いで raise しうる
       elsif kind == HirOp::ARRAY_NEW
         result = true   # 観察可能なヒープ確保 (slot idx が外部状態に効く)
+      elsif kind == HirOp::CALL_WITH_BLOCK
+        result = true
+      elsif kind == HirOp::YIELD
+        result = true   # block 経由で IO/状態変更しうる
+      elsif kind == HirOp::BLOCK_RETURN
+        result = true   # 制御フロー終端
       end
       result
     end
@@ -3060,7 +3300,7 @@ module Setsunaruby
           if i + 1 < n
             is_bb_start[i + 1] = 1
           end
-        elsif k == HirOp::RETURN
+        elsif k == HirOp::RETURN || k == HirOp::BLOCK_RETURN
           if i + 1 < n
             is_bb_start[i + 1] = 1
           end
@@ -3105,7 +3345,7 @@ module Setsunaruby
             # この raise は将来コード生成パターンが拡張されたときの早期検出用。
             raise "CFG bug: JUMP_IF_FALSE at HIR tail (id=#{last}), fallthrough BB missing"
           end
-        elsif k == HirOp::RETURN
+        elsif k == HirOp::RETURN || k == HirOp::BLOCK_RETURN
           @bb_succ0.push(-1)
           @bb_succ1.push(-1)
         else
@@ -3694,7 +3934,7 @@ module Setsunaruby
           @hir_op0[i] = resolve_rename(@hir_op0[i])
         elsif kind == HirOp::PUTS
           @hir_op0[i] = resolve_rename(@hir_op0[i])
-        elsif kind == HirOp::CALL
+        elsif kind == HirOp::CALL || kind == HirOp::CALL_WITH_BLOCK
           args_start = @hir_op1[i]
           arity      = @hir_op2[i]
           ai = 0
@@ -3702,6 +3942,16 @@ module Setsunaruby
             @hir_call_args[args_start + ai] = resolve_rename(@hir_call_args[args_start + ai])
             ai += 1
           end
+        elsif kind == HirOp::YIELD
+          argc       = @hir_op0[i]
+          args_start = @hir_op1[i]
+          ai = 0
+          while ai < argc
+            @hir_call_args[args_start + ai] = resolve_rename(@hir_call_args[args_start + ai])
+            ai += 1
+          end
+        elsif kind == HirOp::BLOCK_RETURN
+          @hir_op0[i] = resolve_rename(@hir_op0[i])
         elsif kind == HirOp::RETURN
           @hir_op0[i] = resolve_rename(@hir_op0[i])
         elsif kind == HirOp::PHI

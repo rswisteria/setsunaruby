@@ -7,7 +7,7 @@ Ruby 文法を持つ、スタックマシン型プログラミング言語の処
 「刹那」(10⁻¹⁸) から命名。mruby / nanoruby / picoruby に続く、
 さらに小さな Ruby 系列という位置付け。
 
-## 現状: Stage 0 / 0.5 / 1 / 2 / 3a / 3b / 3c.1 / JIT-1 / JIT-2 / JIT-3a / JIT-3b1 / JIT-3b2 / JIT-3b3 / JIT-3c / JIT-4 (案 A) 完了
+## 現状: Stage 0 / 0.5 / 1 / 2 / 3a / 3b / 3c.1 / 3c.2 / JIT-1 / JIT-2 / JIT-3a / JIT-3b1 / JIT-3b2 / JIT-3b3 / JIT-3c / JIT-4 (案 A) 完了
 
 スタックマシン上で **再帰 `fib(20)` / アッカーマン / tarai が CRuby + spinel AOT 両方で動作**。
 
@@ -39,8 +39,9 @@ Ruby 文法を持つ、スタックマシン型プログラミング言語の処
 - **配列の `<<`** (string と多相、要素 push)
 - **配列の `.length`** (Stage 3b 限定の dot method、一般 dispatch は Stage 3d)
 - **`puts` の配列展開** (要素ごとに別行、ネスト配列は再帰展開)
-- **`do |x| body end` ブロック** (`Array#each` と `Integer#times` 限定、コンパイラ展開)
+- **`do |x| body end` ブロック** (`Array#each` と `Integer#times` のコンパイラ展開 + ユーザ定義の一般 yield)
 - **ブロック内から外部変数の読み書き** (flat scope ベースの closure 的振る舞い)
+- **`yield` / ユーザ定義のブロック取り method** (`def f(...) ... yield x ... end` + `f(...) do |x| ... end`)
 
 ## クイックスタート
 
@@ -60,7 +61,7 @@ make test-aot
 make test-all
 ```
 
-(テスト件数は `make test-cruby` 出力で確認できる。Stage 3a +38 件、3b +42 件、3c.1 +24 件。)
+(テスト件数は `make test-cruby` 出力で確認できる。Stage 3a +38 件、3b +42 件、3c.1 +24 件、3c.2 +13 件。)
 
 ## ベンチマーク
 
@@ -135,6 +136,9 @@ CRuby の `VALUE` を踏襲したタグ付き即値方式。
 | ARRAY_GET | 0x45 | – | pop idx, pop arr, push arr[idx] (範囲外は nil) |
 | ARRAY_SET | 0x46 | – | pop val, pop idx, pop arr, arr[idx]=val, push val |
 | ARRAY_LEN | 0x47 | – | pop arr, push fixnum(len) |
+| CALL_WITH_BLOCK | 0x48 | SLEB128 method_idx + SLEB128 block_pc + SLEB128 block_arity | CALL と同じ + block_pc / block_arity を新フレームに紐付け |
+| YIELD | 0x49 | SLEB128 argc | フレームの block_pc に飛び @cur_base を caller's に切替、BLOCK_RETURN で復帰 |
+| BLOCK_RETURN | 0x4A | – | block 終端、yield の続きへ復帰 |
 | HALT | 0xFF | – | 終了 |
 
 `+` (ADD) と `==` (EQ) は VM で多相化されており、両辺がヒープ String の場合は文字列
@@ -179,7 +183,9 @@ spinel の型推論で混同されるのを防いでいる。
 - `:index_get` → `node_left` (receiver)、`node_right` (index 式)
 - `:index_set` → `node_left` (receiver)、`node_right` (index 式)、`node_operand` (value 式)
 - `:method_call_on` → `node_int_value` (method 名 packed)、`node_left` (receiver)、`node_right` (`:block_arg` or nil)、`node_operand` (`:arg_cons` チェーン)
+- `:method_call` → `node_int_value` (名前 packed)、`node_left` (`:arg_cons` チェーン or nil)、`node_right` (`:block_arg` or nil) (Stage 3c.2 で block 対応)
 - `:block_arg` → `node_int_value` (param 名 packed、省略時 0)、`node_left` (ブロック本体)
+- `:yield_expr` → `node_left` (引数式 or nil) (Stage 3c.2)
 
 ローカル変数名は **`@bytes` 上のバイト範囲 (start, len) で識別**。
 Symbol/sp_sym を経由すると spinel の Token フィールド型推論が崩壊するため、
@@ -205,7 +211,8 @@ Symbol/sp_sym を経由すると spinel の Token フィールド型推論が崩
 | 3a | 文字列リテラル・連結 (`+` `<<`) ・比較 (`==`) ・puts | ✅ 完了 |
 | 3b | 配列リテラル・index アクセス・`<<` 多相・`.length` | ✅ 完了 |
 | 3c.1 | `do \| \|` ブロック (`each` / `times` 特殊展開) | ✅ 完了 |
-| 3c.2〜 | 一般 `yield` / `block_given?` / `Array#map` | 未着手 |
+| 3c.2 | 一般 `yield` / ユーザ定義のブロック取り method | ✅ 完了 |
+| 3c.3〜 | `block_given?` / `Array#map` / `{ \| \| }` 中括弧構文 | 未着手 |
 | 3d〜3e | クラス・例外 | 未着手 |
 | ∞ | 自己ホスト (setsunaruby を setsunaruby で動かす) | 究極目標 |
 
@@ -231,7 +238,8 @@ Symbol/sp_sym を経由すると spinel の Token フィールド型推論が崩
 │   ├── fib.rb                # Stage 2: 再帰のショーケース
 │   ├── string.rb             # Stage 3a: 文字列リテラル/+ /<< /== のショーケース
 │   ├── array.rb              # Stage 3b: 配列/index/.length のショーケース
-│   └── each.rb               # Stage 3c.1: each / times ブロックのショーケース
+│   ├── each.rb               # Stage 3c.1: each / times ブロックのショーケース
+│   └── yield.rb              # Stage 3c.2: 一般 yield / 自前 each / 自前 map のショーケース
 ├── test/
 │   ├── test_stage0.rb        # CRuby Stage 0 テスト (38件)
 │   ├── test_stage1.rb        # CRuby Stage 1 テスト (28件)
@@ -239,8 +247,9 @@ Symbol/sp_sym を経由すると spinel の Token フィールド型推論が崩
 │   ├── test_stage3a.rb       # CRuby Stage 3a テスト (38件)
 │   ├── test_stage3b.rb       # CRuby Stage 3b テスト (42件)
 │   ├── test_stage3c1.rb      # CRuby Stage 3c.1 テスト (24件)
+│   ├── test_stage3c2.rb      # CRuby Stage 3c.2 テスト (13件)
 │   ├── test_stage_jit.rb     # CRuby JIT-1/2/3a/3b1/3b2/3b3/3c/4 テスト (108件)
-│   └── test_aot.rb           # AOT テスト (Stage 0/1/2/3a/3b/3c.1 + JIT)
+│   └── test_aot.rb           # AOT テスト (Stage 0/1/2/3a/3b/3c + JIT)
 ├── setsunaruby               # spinel ビルド成果物 (gitignore)
 └── Makefile
 ```
