@@ -35,6 +35,7 @@ module Setsunaruby
     SLASH_BYTE = 47
     LBRACK_B   = 91  # '[' (Stage 3b)
     RBRACK_B   = 93  # ']' (Stage 3b)
+    PIPE_B     = 124 # '|' (Stage 3c.1 ブロックパラメータ)
     PCT   = 37
     EQ    = 61
     LT_BYTE = 60
@@ -72,9 +73,12 @@ module Setsunaruby
     KW_THEN_BYTES   = [116, 104, 101, 110].freeze             # "then"
     KW_DEF_BYTES    = [100, 101, 102].freeze                  # "def"
     KW_RETURN_BYTES = [114, 101, 116, 117, 114, 110].freeze   # "return"
-    # Stage 3b: ドット method 名 (現状 length のみサポート)。将来 method_name_is_*? を
-    # 増やすときも同じ場所に追加する。
+    KW_DO_BYTES     = [100, 111].freeze                       # "do" (Stage 3c.1)
+    # Stage 3b/3c: ドット method 名 (現状 length / each / times をサポート)。
+    # 将来 method_name_is_*? を増やすときも同じ場所に追加する。
     KW_LENGTH_BYTES = [108, 101, 110, 103, 116, 104].freeze   # "length"
+    KW_EACH_BYTES   = [101, 97, 99, 104].freeze               # "each"
+    KW_TIMES_BYTES  = [116, 105, 109, 101, 115].freeze        # "times"
 
     def initialize
       @src       = ""
@@ -432,6 +436,8 @@ module Setsunaruby
         result = TokenKind::KW_DEF
       elsif match_bytes(start, len, KW_RETURN_BYTES)
         result = TokenKind::KW_RETURN
+      elsif match_bytes(start, len, KW_DO_BYTES)
+        result = TokenKind::KW_DO
       end
       result
     end
@@ -486,6 +492,9 @@ module Setsunaruby
       elsif b == DOT_BYTE
         @lex_pos += 1
         Token.new(TokenKind::DOT, 0, "", @line)
+      elsif b == PIPE_B
+        @lex_pos += 1
+        Token.new(TokenKind::PIPE, 0, "", @line)
       elsif b == EQ
         if @lex_pos + 1 < @bytes.length && @bytes[@lex_pos + 1] == EQ
           @lex_pos += 2
@@ -588,8 +597,8 @@ module Setsunaruby
       left
     end
 
-    # `[idx]` (read) / `[idx] = expr` (write) / `.name` / `.name(args)` の postfix チェーン。
-    # 左結合で繰り返し畳み込む。
+    # `[idx]` (read) / `[idx] = expr` (write) / `.name` / `.name(args)` / `.name do ... end` の
+    # postfix チェーン。左結合で繰り返し畳み込む。
     # `[idx] =` の右辺は parse_expression を呼ぶので、`a[i] = b[j] = v` のような
     # 右結合代入も自然に通る。
     def parse_postfix_from(node)
@@ -618,10 +627,44 @@ module Setsunaruby
             args = parse_arg_list
             expect(TokenKind::RPAREN)
           end
-          node = ASTNode.new(:method_call_on, name_packed, false, :nop, node, nil, args)
+          # Stage 3c.1: 引数並びの直後に `do |param| body end` があればブロックを取り込む。
+          # node_right に :block_arg を載せる (compile_method_call_on で each/times に展開)。
+          block = nil
+          if @cur_token.kind == TokenKind::KW_DO
+            block = parse_block_arg
+          end
+          node = ASTNode.new(:method_call_on, name_packed, false, :nop, node, block, args)
         end
       end
       node
+    end
+
+    # `do |param| body end` を 1 つ読む。`do body end` (param なし) も許容。
+    # 多パラメータ `|x, y|` は Stage 3c.1 では非対応。
+    # node_int_value: param 名 packed (param なしの場合は 0、len=0 の packed)
+    # node_left:      ブロック本体 (parse_block 結果)
+    # 注: 内部の parse_block は KW_DO を終端として認識しないが、ネストした
+    # `each`/`times` の `do` は parse_postfix_from が DOT 直後のチェックで先取り
+    # するため通常パスでは衝突しない。
+    def parse_block_arg
+      expect(TokenKind::KW_DO)
+      param_packed = 0
+      if @cur_token.kind == TokenKind::PIPE
+        @cur_token = next_token
+        if @cur_token.kind != TokenKind::IDENT
+          raise "Parse error: line #{@cur_token.line}: ブロックパラメータ名が必要です"
+        end
+        param_packed = @cur_token.int_value
+        @cur_token = next_token
+        if @cur_token.kind == TokenKind::COMMA
+          raise "Parse error: line #{@cur_token.line}: 多パラメータブロックは Stage 3c.1 スコープ外"
+        end
+        expect(TokenKind::PIPE)
+      end
+      skip_newlines
+      body = parse_block
+      expect(TokenKind::KW_END)
+      ASTNode.new(:block_arg, param_packed, false, :nop, body, nil, nil)
     end
 
     def parse_multiplicative_from(node)
@@ -1123,11 +1166,33 @@ module Setsunaruby
       nil
     end
 
-    # `obj.method(args)` の dispatch。Stage 3b では `length` (引数 0) のみ対応。
+    # `obj.method(args)` の dispatch。Stage 3b/3c.1 では `length` / `each` / `times` のみ対応。
     # 一般 method dispatch (vtable / hash) は Stage 3d で導入する想定。
+    # ASTNode 上の意味割り当て (parse_postfix_from が構築):
+    #   node_left    = receiver
+    #   node_right   = :block_arg (do |x| body end) or nil
+    #   node_operand = :arg_cons チェーン (() の中の引数並び) or nil
     def compile_method_call_on(node)
       name_packed = node.node_int_value
+      block       = node.node_right
       argc        = count_arg_chain(node.node_operand)
+
+      # Stage 3c.1: ブロック付き呼び出しは特殊形式 (each / times) 限定でインライン展開。
+      if block != nil
+        if argc != 0
+          raise "Compile error: line #{@cur_token.line}: Stage 3c.1 ではブロック付きメソッドの引数は 0 個のみ"
+        end
+        if method_name_is_each?(name_packed)
+          compile_each_block(node.node_left, block)
+        elsif method_name_is_times?(name_packed)
+          compile_times_block(node.node_left, block)
+        else
+          raise "Compile error: line #{@cur_token.line}: Stage 3c.1 ではブロック付きは .each / .times のみ"
+        end
+        return nil
+      end
+
+      # ブロックなしの dispatch (Stage 3b 互換)。
       compile_expr(node.node_left)   # receiver
       cur = node.node_operand
       while cur != nil
@@ -1137,18 +1202,154 @@ module Setsunaruby
       if argc == 0 && method_name_is_length?(name_packed)
         @bytecode.push(Op::ARRAY_LEN)
       else
-        # Stage 3b スコープ外。配列以外の receiver や length 以外の名前はここで弾く。
         raise "Compile error: line #{@cur_token.line}: Stage 3b ではドット method は .length のみ対応"
       end
       nil
     end
 
-    # ローカル変数表と同様の packed (start<<16)|len 比較で "length" 判定。
-    # KW_LENGTH_BYTES の定義はクラス先頭の KW_*_BYTES ブロックにある。
+    # 式を評価して slot に格納し、スタック上を空にする (`x = expr` 相当)。
+    # STORE_LOCAL は値を残すので POP で消費。
+    def emit_store_to_slot(expr_node, slot)
+      compile_expr(expr_node)
+      @bytecode.push(Op::STORE_LOCAL)
+      encode_signed(slot)
+      @bytecode.push(Op::POP)
+      nil
+    end
+
+    # counter slot を 0 で初期化。
+    def emit_init_counter(slot)
+      @bytecode.push(Op::PUSH_INT)
+      encode_signed(0)
+      @bytecode.push(Op::STORE_LOCAL)
+      encode_signed(slot)
+      @bytecode.push(Op::POP)
+      nil
+    end
+
+    # counter slot を +1 (LOAD / PUSH 1 / ADD / STORE / POP)。
+    def emit_increment_slot(slot)
+      @bytecode.push(Op::LOAD_LOCAL)
+      encode_signed(slot)
+      @bytecode.push(Op::PUSH_INT)
+      encode_signed(1)
+      @bytecode.push(Op::ADD)
+      @bytecode.push(Op::STORE_LOCAL)
+      encode_signed(slot)
+      @bytecode.push(Op::POP)
+      nil
+    end
+
+    # `arr.each do |x| body end` → while ループに展開する。
+    # 受信者と index は無名 local に保存し、param x はブロック内 var_ref できるよう
+    # 名前付き local として宣言。compile_stmt の不変条件 (1 値スタックに残す) を満たすため
+    # 末尾で受信者を再 push する (Ruby Array#each は self を返す)。
+    def compile_each_block(recv_node, block_node)
+      recv_slot = declare_anonymous_local
+      idx_slot  = declare_anonymous_local
+      param_packed = block_node.node_int_value
+      param_slot = -1
+      if param_packed != 0
+        param_slot = declare_local(param_packed)
+      end
+
+      emit_store_to_slot(recv_node, recv_slot)
+      emit_init_counter(idx_slot)
+
+      # while _i < _recv.length
+      loop_start = @bytecode.length
+      @bytecode.push(Op::LOAD_LOCAL); encode_signed(idx_slot)
+      @bytecode.push(Op::LOAD_LOCAL); encode_signed(recv_slot)
+      @bytecode.push(Op::ARRAY_LEN)
+      @bytecode.push(Op::LT)
+      jexit = emit_jump(Op::JUMP_IF_FALSE)
+
+      # x = _recv[_i] (param が指定された場合のみ)
+      if param_slot >= 0
+        @bytecode.push(Op::LOAD_LOCAL); encode_signed(recv_slot)
+        @bytecode.push(Op::LOAD_LOCAL); encode_signed(idx_slot)
+        @bytecode.push(Op::ARRAY_GET)
+        @bytecode.push(Op::STORE_LOCAL); encode_signed(param_slot)
+        @bytecode.push(Op::POP)
+      end
+
+      compile_block(block_node.node_left)
+      @bytecode.push(Op::POP)
+
+      emit_increment_slot(idx_slot)
+
+      back = emit_jump(Op::JUMP)
+      patch_jump(back, loop_start)
+      patch_jump(jexit, @bytecode.length)
+
+      # each は receiver (self) を返す。
+      @bytecode.push(Op::LOAD_LOCAL); encode_signed(recv_slot)
+      nil
+    end
+
+    # `n.times do |i| body end` → counter ループ。param `|i|` 自体が counter 兼用。
+    # param が省略されたら無名 counter を使う。Ruby Integer#times は self (= n) を返す。
+    def compile_times_block(recv_node, block_node)
+      n_slot       = declare_anonymous_local
+      param_packed = block_node.node_int_value
+      counter_slot = -1
+      if param_packed != 0
+        counter_slot = declare_local(param_packed)
+      else
+        counter_slot = declare_anonymous_local
+      end
+
+      emit_store_to_slot(recv_node, n_slot)
+      emit_init_counter(counter_slot)
+
+      # while i < _n
+      loop_start = @bytecode.length
+      @bytecode.push(Op::LOAD_LOCAL); encode_signed(counter_slot)
+      @bytecode.push(Op::LOAD_LOCAL); encode_signed(n_slot)
+      @bytecode.push(Op::LT)
+      jexit = emit_jump(Op::JUMP_IF_FALSE)
+
+      compile_block(block_node.node_left)
+      @bytecode.push(Op::POP)
+
+      emit_increment_slot(counter_slot)
+
+      back = emit_jump(Op::JUMP)
+      patch_jump(back, loop_start)
+      patch_jump(jexit, @bytecode.length)
+
+      # times は self (= n) を返す。
+      @bytecode.push(Op::LOAD_LOCAL); encode_signed(n_slot)
+      nil
+    end
+
+    # 名前を持たない無名 local slot を 1 つ確保する。len=0 を埋めることで find_local の
+    # bytes_eq マッチから永久に外す (= ユーザコードからは参照不可)。
+    # コンパイラはここで返る slot idx を STORE_LOCAL/LOAD_LOCAL で直接使う。
+    def declare_anonymous_local
+      @local_starts.push(0)
+      @local_lens.push(0)
+      @local_starts.length - 1 - @scope_base
+    end
+
+    # ローカル変数表と同様の packed (start<<16)|len 比較で "length" / "each" / "times" 判定。
+    # KW_*_BYTES の定義はクラス先頭の KW_*_BYTES ブロックにある。
     def method_name_is_length?(packed)
+      method_name_match?(packed, KW_LENGTH_BYTES)
+    end
+
+    def method_name_is_each?(packed)
+      method_name_match?(packed, KW_EACH_BYTES)
+    end
+
+    def method_name_is_times?(packed)
+      method_name_match?(packed, KW_TIMES_BYTES)
+    end
+
+    def method_name_match?(packed, kw_bytes)
       pkg_start = packed >> 16
       pkg_len   = packed & 0xffff
-      match_bytes(pkg_start, pkg_len, KW_LENGTH_BYTES)
+      match_bytes(pkg_start, pkg_len, kw_bytes)
     end
 
     def compile_if(node)
@@ -1277,9 +1478,15 @@ module Setsunaruby
     # 並列 IntArray (starts, lens) で構成された name table を線形探索する。
     # start_idx 以降だけ走査するので、スコープ相対探索 (find_local) も同じ
     # ヘルパーで賄える。見つかれば絶対 idx を、見つからなければ -1 を返す。
+    # pkg_len == 0 は Stage 3c.1 の declare_anonymous_local が使う sentinel と衝突
+    # するため必ず -1 を返す (lexer は len>=1 の識別子しか生成しないので packed=0 は
+    # 名前検索からは来ないはずだが防御として早期 return)。
     def find_in_table(starts, lens, start_idx, packed)
+      pkg_len = packed & 0xffff
+      if pkg_len == 0
+        return -1
+      end
       pkg_start = packed >> 16
-      pkg_len   = packed & 0xffff
       i = start_idx
       result = -1
       while i < starts.length && result < 0

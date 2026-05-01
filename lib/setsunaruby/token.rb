@@ -14,6 +14,7 @@ module Setsunaruby
     KW_THEN   = :kw_then
     KW_DEF    = :kw_def
     KW_RETURN = :kw_return
+    KW_DO     = :kw_do     # `do ... end` ブロック開始 (Stage 3c.1)
     STR      = :str        # 文字列リテラル (Stage 3a)。int_value = strlit_idx
     PLUS      = :plus
     MINUS    = :minus
@@ -32,6 +33,7 @@ module Setsunaruby
     LBRACK   = :lbrack     # `[` (Stage 3b 配列リテラル/index アクセス)
     RBRACK   = :rbrack     # `]`
     DOT      = :dot        # `.` (Stage 3b: 配列の length のみ。一般 method dispatch は Stage 3d)
+    PIPE     = :pipe       # `|` (Stage 3c.1 ブロックパラメータ区切り)
     COMMA    = :comma
     NEWLINE  = :newline
     EOF      = :eof
