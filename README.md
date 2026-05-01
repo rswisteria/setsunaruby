@@ -7,7 +7,7 @@ Ruby 文法を持つ、スタックマシン型プログラミング言語の処
 「刹那」(10⁻¹⁸) から命名。mruby / nanoruby / picoruby に続く、
 さらに小さな Ruby 系列という位置付け。
 
-## 現状: Stage 0 / 0.5 / 1 / 2 / JIT-1 / JIT-2 完了
+## 現状: Stage 0 / 0.5 / 1 / 2 / JIT-1 / JIT-2 / JIT-3a 完了
 
 スタックマシン上で **再帰 `fib(20)` / アッカーマン / tarai が CRuby + spinel AOT 両方で動作**。
 
@@ -43,7 +43,7 @@ make build       # ./setsunaruby を生成
 # AOT 実行
 ./setsunaruby examples/hello.rb
 
-# テスト (CRuby Stage 0:38 + Stage 1:28 + Stage 2:26 + JIT-1/2:27 / AOT:47)
+# テスト (CRuby Stage 0:38 + Stage 1:28 + Stage 2:26 + JIT-1/2/3a:45 / AOT:47)
 make test-cruby
 make test-aot
 make test-all
@@ -159,7 +159,9 @@ Symbol/sp_sym を経由すると spinel の Token フィールド型推論が崩
 | 2 | メソッド定義 + 呼び出し + 再帰 | ✅ 完了 (fib(20) / アッカーマン / tarai 動作) |
 | JIT-1 | プロファイル収集 + ホットメソッド検出 (ZJIT 風) | ✅ 完了 (CRuby でログ視認) |
 | JIT-2 | bytecode → HIR (lite SSA) 変換 + ダンプ | ✅ 完了 (`SETSUNARUBY_DUMP_HIR=1` で出力) |
-| JIT-3 | HIR 最適化パス (type_specialize / fold_constants 等) | 未着手 |
+| JIT-3a | HIR 最適化: fold_constants + eliminate_dead_code | ✅ 完了 (raw / optimized を両方ダンプ) |
+| JIT-3b | basic block + 本格 phi 挿入 + clean_cfg | 未着手 |
+| JIT-3c | プロファイル収集 + type_specialize + GuardType | 未着手 |
 | JIT-4 | LIR + arm64 codegen + ディスパッチ切替 + side exit | 未着手 |
 | 3+ | 文字列・配列・ブロック・クラス・例外 | 未着手 |
 | ∞ | 自己ホスト (setsunaruby を setsunaruby で動かす) | 究極目標 |
@@ -187,7 +189,7 @@ Symbol/sp_sym を経由すると spinel の Token フィールド型推論が崩
 │   ├── test_stage0.rb        # CRuby Stage 0 テスト (38件)
 │   ├── test_stage1.rb        # CRuby Stage 1 テスト (28件)
 │   ├── test_stage2.rb        # CRuby Stage 2 テスト (26件)
-│   ├── test_stage_jit.rb     # CRuby JIT-1/2 テスト (27件)
+│   ├── test_stage_jit.rb     # CRuby JIT-1/2/3a テスト (45件)
 │   └── test_aot.rb           # AOT テスト (47件)
 ├── setsunaruby               # spinel ビルド成果物 (gitignore)
 └── Makefile

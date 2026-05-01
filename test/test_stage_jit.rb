@@ -161,7 +161,7 @@ ensure
 end
 assert_eq(out, "55\n", "JIT-2 ON: fib(10) 結果は不変")
 assert_includes(err, "ZJIT: hot method detected (idx=0)", "JIT-2 ON: hot 検出ログ")
-assert_includes(err, "ZJIT HIR for method idx=0:",        "JIT-2 ON: HIR ヘッダ")
+assert_includes(err, "ZJIT HIR (raw) for method idx=0:",        "JIT-2 ON: HIR ヘッダ")
 assert_includes(err, "LoadLocal slot=0",                  "JIT-2 ON: 引数 n の load")
 assert_includes(err, "LoadConst 2",                       "JIT-2 ON: 定数 2")
 assert_includes(err, "Lt ",                               "JIT-2 ON: < 比較")
@@ -189,7 +189,7 @@ ensure
   ENV.delete("SETSUNARUBY_DUMP_HIR")
 end
 assert_eq(out, "6\n", "JIT-2 ON: tarai 結果は不変")
-assert_includes(err, "ZJIT HIR for method idx=0:", "JIT-2 ON: tarai HIR ヘッダ")
+assert_includes(err, "ZJIT HIR (raw) for method idx=0:", "JIT-2 ON: tarai HIR ヘッダ")
 assert_includes(err, "Le ",                        "JIT-2 ON: tarai の <= 比較")
 # 3 引数 CALL は "Call m0(vA, vB, vC)" 形式
 assert_includes(err, ", ",                         "JIT-2 ON: 引数区切り (多引数 CALL)")
@@ -228,6 +228,113 @@ else
   puts "  err: #{err.inspect}"
 end
 
+def assert_excludes(haystack, needle, label)
+  if !haystack.include?(needle)
+    $pass += 1
+    puts "ok   #{label}"
+  else
+    $fail += 1
+    puts "FAIL #{label}"
+    puts "  needle (should NOT appear): #{needle.inspect}"
+    puts "  haystack: #{haystack.inspect}"
+  end
+end
+
+# raw / optimized の 2 セクションだけを切り出す。
+# index が見つからない場合でもテストハーネスを止めず、後続 assert に失敗させる。
+def split_dump_sections(err)
+  raw_idx = err.index("ZJIT HIR (raw)") || 0
+  opt_idx = err.index("ZJIT HIR (optimized)") || err.length
+  [err[raw_idx...opt_idx].to_s, err[opt_idx..-1].to_s]
+end
+
+# ============================================================
+# JIT-3a: fold_constants + eliminate_dead_code (HIR 最適化)
+# ============================================================
+
+# ---- fold_constants: 整数算術 ----
+ENV["SETSUNARUBY_DUMP_HIR"] = "1"
+fold_arith_src = <<~RUBY
+  def f
+    1 + 2 * 3
+  end
+RUBY
+THRESHOLD.times { fold_arith_src << "f\n" }
+fold_arith_src << "puts 0\n"
+begin
+  out, err = run_capture(fold_arith_src)
+ensure
+  ENV.delete("SETSUNARUBY_DUMP_HIR")
+end
+raw_section, opt_section = split_dump_sections(err)
+assert_eq(out, "0\n", "JIT-3a: 算術畳み込み 結果不変")
+assert_includes(raw_section, "Add ",       "JIT-3a: raw に Add がある")
+assert_includes(raw_section, "Mul ",       "JIT-3a: raw に Mul がある")
+assert_excludes(opt_section, "Add ",       "JIT-3a: optimized で Add が畳み込み済み")
+assert_excludes(opt_section, "Mul ",       "JIT-3a: optimized で Mul が畳み込み済み")
+assert_includes(opt_section, "LoadConst 7", "JIT-3a: 1 + 2 * 3 = 7 に畳み込まれた")
+
+# ---- fold_constants: 比較 ----
+ENV["SETSUNARUBY_DUMP_HIR"] = "1"
+fold_cmp_src = <<~RUBY
+  def g
+    5 < 10
+  end
+RUBY
+THRESHOLD.times { fold_cmp_src << "g\n" }
+fold_cmp_src << "puts 0\n"
+begin
+  out, err = run_capture(fold_cmp_src)
+ensure
+  ENV.delete("SETSUNARUBY_DUMP_HIR")
+end
+raw_section, opt_section = split_dump_sections(err)
+assert_eq(out, "0\n", "JIT-3a: 比較畳み込み 結果不変")
+assert_includes(raw_section, "Lt ",                 "JIT-3a: raw に Lt がある")
+assert_excludes(opt_section, "Lt ",                 "JIT-3a: optimized で Lt が畳み込み済み")
+assert_includes(opt_section, "LoadConst true",      "JIT-3a: 5 < 10 = true に畳み込まれた")
+
+# ---- DIV by 0 は畳み込まない (raise を保つ) ----
+ENV["SETSUNARUBY_DUMP_HIR"] = "1"
+div_zero_src = <<~RUBY
+  def h(n)
+    10 / n
+  end
+RUBY
+THRESHOLD.times { div_zero_src << "h(2)\n" }
+div_zero_src << "puts 0\n"
+begin
+  out, err = run_capture(div_zero_src)
+ensure
+  ENV.delete("SETSUNARUBY_DUMP_HIR")
+end
+_raw, opt_section = split_dump_sections(err)
+# n は LoadLocal なので畳み込めない (= Div は残る)
+assert_includes(opt_section, "Div ",          "JIT-3a: 変数を含む Div は畳まれず残る")
+
+# ---- 変数を含む式は畳まれない (fib の n は LoadLocal) ----
+ENV["SETSUNARUBY_DUMP_HIR"] = "1"
+fib_src_short = <<~RUBY
+  def fib(n)
+    if n < 2
+      n
+    else
+      fib(n - 1) + fib(n - 2)
+    end
+  end
+  puts fib(10)
+RUBY
+begin
+  out, err = run_capture(fib_src_short)
+ensure
+  ENV.delete("SETSUNARUBY_DUMP_HIR")
+end
+_raw, opt_section = split_dump_sections(err)
+assert_eq(out, "55\n", "JIT-3a: fib(10) 結果不変")
+assert_includes(opt_section, "Lt ",  "JIT-3a: fib の Lt は LoadLocal を含むので残る")
+assert_includes(opt_section, "Add ", "JIT-3a: fib(n-1) + fib(n-2) の Add は Call を含むので残る")
+assert_includes(opt_section, "Sub ", "JIT-3a: n - 1 の Sub も残る")
+
 puts ""
-puts "#{$pass} passed, #{$fail} failed (JIT-1/2)"
+puts "#{$pass} passed, #{$fail} failed (JIT-1/2/3a)"
 exit($fail == 0 ? 0 : 1)

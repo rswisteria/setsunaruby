@@ -92,6 +92,7 @@ module Setsunaruby
       @hir_op1       = []   # IntArray
       @hir_op2       = []   # IntArray
       @hir_call_args = []   # IntArray (CALL の引数 hir_id を flat に並べる)
+      @hir_deleted   = []   # IntArray (JIT-3: 0=alive, 1=dead。eliminate_dead_code が mark)
       # spinel AOT で ENV が解釈されない場合は常に false 相当 (HIR ダンプは CRuby のみ)。
       @dump_hir      = ENV["SETSUNARUBY_DUMP_HIR"] == "1"
       # VM のコールフレームスタック (並列 IntArray)。
@@ -129,6 +130,7 @@ module Setsunaruby
       @hir_op1       = []
       @hir_op2       = []
       @hir_call_args = []
+      @hir_deleted   = []
       @dump_hir      = ENV["SETSUNARUBY_DUMP_HIR"] == "1"
       @cfp_pcs   = []
       @cfp_bases = []
@@ -1381,6 +1383,7 @@ module Setsunaruby
       @hir_op1  = []
       @hir_op2  = []
       @hir_call_args = []
+      @hir_deleted   = []
 
       start_pc = @method_pcs[m_idx]
       end_pc   = @method_body_ends[m_idx]
@@ -1561,7 +1564,9 @@ module Setsunaruby
         pi += 1
       end
 
-      dump_hir(m_idx)
+      dump_hir(m_idx, "raw")
+      optimize_hir
+      dump_hir(m_idx, "optimized")
       nil
     end
 
@@ -1570,14 +1575,17 @@ module Setsunaruby
       @hir_op0.push(op0)
       @hir_op1.push(op1)
       @hir_op2.push(op2)
+      @hir_deleted.push(0)
       @hir_kind.length - 1
     end
 
-    def dump_hir(m_idx)
-      STDERR.puts "ZJIT HIR for method idx=#{m_idx}:"
+    def dump_hir(m_idx, label)
+      STDERR.puts "ZJIT HIR (#{label}) for method idx=#{m_idx}:"
       i = 0
       while i < @hir_kind.length
-        STDERR.puts "  v#{i} = #{format_hir_insn(i)}"
+        if @hir_deleted[i] == 0
+          STDERR.puts "  v#{i} = #{format_hir_insn(i)}"
+        end
         i += 1
       end
       nil
@@ -1651,6 +1659,206 @@ module Setsunaruby
         ci += 1
       end
       result = result + ")"
+      result
+    end
+
+    # ============================================================
+    # JIT-3a: HIR 最適化パス
+    # ============================================================
+
+    def optimize_hir
+      pass_fold_constants
+      pass_eliminate_dead_code
+      nil
+    end
+
+    # 二項算術 (ADD/SUB/MUL/DIV/MOD) と二項比較 (EQ/LT/GT/LE/GE) で両オペランドが
+    # LOAD_CONST(INT) なら定数畳み込みする。DIV/MOD は rhs=0 のときのみ畳まずに
+    # 残す (VM の ZeroDivisionError と挙動を一致させるため)。畳まれた DIV/MOD は
+    # LOAD_CONST に in-place で書き換えられ、has_side_effect の DIV/MOD ガードは
+    # 「畳まれずに残った」DIV/MOD insn を eliminate_dead_code から守るためのもの。
+    def pass_fold_constants
+      i = 0
+      while i < @hir_kind.length
+        if @hir_deleted[i] == 0
+          kind = @hir_kind[i]
+          if arith_kind?(kind) || compare_kind?(kind)
+            try_fold_binop(i, kind)
+          end
+        end
+        i += 1
+      end
+      nil
+    end
+
+    def arith_kind?(kind)
+      kind >= HirOp::ADD && kind <= HirOp::MOD
+    end
+
+    def compare_kind?(kind)
+      kind >= HirOp::EQ && kind <= HirOp::GE
+    end
+
+    def try_fold_binop(i, kind)
+      lhs_id = @hir_op0[i]
+      rhs_id = @hir_op1[i]
+      if !const_int?(lhs_id) || !const_int?(rhs_id)
+        return nil
+      end
+      a = @hir_op1[lhs_id]
+      b = @hir_op1[rhs_id]
+      if kind == HirOp::DIV || kind == HirOp::MOD
+        if b == 0
+          return nil
+        end
+      end
+      if arith_kind?(kind)
+        v = eval_arith(kind, a, b)
+        @hir_kind[i] = HirOp::LOAD_CONST
+        @hir_op0[i]  = HirConstTag::INT
+        @hir_op1[i]  = v
+        @hir_op2[i]  = 0
+      else
+        tag = eval_compare(kind, a, b)
+        @hir_kind[i] = HirOp::LOAD_CONST
+        @hir_op0[i]  = tag
+        @hir_op1[i]  = 0
+        @hir_op2[i]  = 0
+      end
+      nil
+    end
+
+    # `@hir_deleted == 0` チェックは現行のパス順 (fold → eliminate_dead_code)
+    # では redundant だが、将来パスの順序が変わったときの防衛として残す。
+    def const_int?(hir_id)
+      @hir_kind[hir_id] == HirOp::LOAD_CONST &&
+        @hir_op0[hir_id] == HirConstTag::INT &&
+        @hir_deleted[hir_id] == 0
+    end
+
+    def eval_arith(kind, a, b)
+      r = 0
+      if kind == HirOp::ADD
+        r = a + b
+      elsif kind == HirOp::SUB
+        r = a - b
+      elsif kind == HirOp::MUL
+        r = a * b
+      elsif kind == HirOp::DIV
+        r = a / b
+      elsif kind == HirOp::MOD
+        r = a % b
+      end
+      r
+    end
+
+    def eval_compare(kind, a, b)
+      result = HirConstTag::FALSE
+      if kind == HirOp::EQ
+        if a == b
+          result = HirConstTag::TRUE
+        end
+      elsif kind == HirOp::LT
+        if a < b
+          result = HirConstTag::TRUE
+        end
+      elsif kind == HirOp::GT
+        if a > b
+          result = HirConstTag::TRUE
+        end
+      elsif kind == HirOp::LE
+        if a <= b
+          result = HirConstTag::TRUE
+        end
+      elsif kind == HirOp::GE
+        if a >= b
+          result = HirConstTag::TRUE
+        end
+      end
+      result
+    end
+
+    # 副作用なし & どこからも参照されていない insn を deleted=1 にする。
+    # JUMP/JUMP_IF_FALSE の target も use として数えるので、jump 先の insn が
+    # 誤って削除されることはない (副作用判定だけでは LoadLocal/LoadConst が
+    # 落ちる可能性があるが、use 数で守られる)。
+    def pass_eliminate_dead_code
+      use_counts = []
+      i = 0
+      while i < @hir_kind.length
+        use_counts.push(0)
+        i += 1
+      end
+      i = 0
+      while i < @hir_kind.length
+        if @hir_deleted[i] == 0
+          accumulate_uses(i, use_counts)
+        end
+        i += 1
+      end
+      i = 0
+      while i < @hir_kind.length
+        if @hir_deleted[i] == 0 && !side_effect?(@hir_kind[i]) && use_counts[i] == 0
+          @hir_deleted[i] = 1
+        end
+        i += 1
+      end
+      nil
+    end
+
+    def accumulate_uses(i, use_counts)
+      kind = @hir_kind[i]
+      if kind == HirOp::STORE_LOCAL
+        use_counts[@hir_op1[i]] += 1
+      elsif kind == HirOp::JUMP
+        use_counts[@hir_op0[i]] += 1
+      elsif kind == HirOp::JUMP_IF_FALSE
+        use_counts[@hir_op0[i]] += 1
+        use_counts[@hir_op1[i]] += 1
+      elsif arith_kind?(kind) || compare_kind?(kind)
+        use_counts[@hir_op0[i]] += 1
+        use_counts[@hir_op1[i]] += 1
+      elsif kind == HirOp::PUTS
+        use_counts[@hir_op0[i]] += 1
+      elsif kind == HirOp::CALL
+        args_start = @hir_op1[i]
+        arity      = @hir_op2[i]
+        j = 0
+        while j < arity
+          use_counts[@hir_call_args[args_start + j]] += 1
+          j += 1
+        end
+      elsif kind == HirOp::RETURN
+        use_counts[@hir_op0[i]] += 1
+      end
+      # LOAD_CONST / LOAD_LOCAL / POP は op が即値またはなしなので加算不要。
+      nil
+    end
+
+    # 副作用あり = 削除すると意味論が壊れる kind。LOAD_CONST/LOAD_LOCAL や
+    # 算術/比較は use 0 なら落としてよい (= 副作用なし)。
+    # DIV/MOD は折り畳まれずに残ったときゼロ除算で raise しうるので副作用あり扱い。
+    def side_effect?(kind)
+      result = false
+      if kind == HirOp::STORE_LOCAL
+        result = true
+      elsif kind == HirOp::POP
+        result = true
+      elsif kind == HirOp::JUMP
+        result = true
+      elsif kind == HirOp::JUMP_IF_FALSE
+        result = true
+      elsif kind == HirOp::PUTS
+        result = true
+      elsif kind == HirOp::CALL
+        result = true
+      elsif kind == HirOp::RETURN
+        result = true
+      elsif kind == HirOp::DIV
+        result = true   # ゼロ除算で raise しうる
+      elsif kind == HirOp::MOD
+        result = true
+      end
       result
     end
   end
