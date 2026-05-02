@@ -271,10 +271,11 @@ module Setsunaruby
       # まだ NIL_VAL でなければ再 unwind する。
       @exception = ObjectVal::NIL_VAL
       # ハンドラスタック (parallel IntArray)。PUSH_HANDLER/POP_HANDLER で push/pop する。
-      # 各エントリは catch_pc / ensure_pc / 当時の stack 深さ / cfp 深さ / yield 深さ を記録し、
-      # RAISE で unwind する際これらを使って状態を巻き戻す。
+      # 各エントリは catch_pc / 当時の stack 深さ / cfp 深さ / yield 深さ を記録し、
+      # RAISE で unwind する際これらを使って状態を巻き戻す。ensure は catch_pc 経由で
+      # rescue chain を fall-through するか success path の JUMP で到達するので、handler に
+      # ensure_pc を別途持たせる必要はない (rescue なしの begin は catch_pc = ensure 先頭にする)。
       @handler_catch_pcs    = []
-      @handler_ensure_pcs   = []
       @handler_stack_depths = []
       @handler_cfp_depths   = []
       @handler_yield_depths = []
@@ -373,7 +374,6 @@ module Setsunaruby
       # Stage 3e: 例外処理用の VM 状態を run_string ごとにリセット。
       @exception            = ObjectVal::NIL_VAL
       @handler_catch_pcs    = []
-      @handler_ensure_pcs   = []
       @handler_stack_depths = []
       @handler_cfp_depths   = []
       @handler_yield_depths = []
@@ -1582,11 +1582,11 @@ module Setsunaruby
 
     # Stage 3e: `begin BODY [rescue ...]+ [ensure E] end` を 3 セクションの bytecode に展開。
     # レイアウト:
-    #   PUSH_HANDLER catch, ensure
+    #   PUSH_HANDLER catch
     #   <body>; POP                   ; 成功時: body の値を捨てる
     #   POP_HANDLER
     #   JUMP ensure
-    #   catch:
+    #   catch:                          ; rescue 節がなければ catch == ensure に縮退
     #     for each rescue:
     #       CHECK_EXCEPTION_CLASS C   ; -1 = catch-all
     #       JUMP_IF_FALSE next_rescue
@@ -1610,21 +1610,18 @@ module Setsunaruby
       @bytecode.push(Op::PUSH_HANDLER)
       catch_pos = @bytecode.length
       @bytecode.push(0x80); @bytecode.push(0x80); @bytecode.push(0x00)
-      ensure_pos_in_handler = @bytecode.length
-      @bytecode.push(0x80); @bytecode.push(0x80); @bytecode.push(0x00)
 
       compile_block(body)
       @bytecode.push(Op::POP)
       @bytecode.push(Op::POP_HANDLER)
       jump_to_ensure_success = emit_jump(Op::JUMP)
 
-      # catch_pc target
+      # catch_pc target = rescue chain の先頭 (rescue が無ければ ensure 先頭と同じ)。
       patch_jump(catch_pos, @bytecode.length)
       end_jumps = compile_rescue_chain(rescues)
 
-      # ensure_pc target (handler の ensure_pos と success/rescue の jump_to_ensure 全てを patch)
+      # ensure_pc target: success path の JUMP と各 rescue マッチ後の JUMP を patch。
       ensure_pc = @bytecode.length
-      patch_jump(ensure_pos_in_handler, ensure_pc)
       patch_jump(jump_to_ensure_success, ensure_pc)
       i = 0
       while i < end_jumps.length
@@ -3436,6 +3433,14 @@ module Setsunaruby
     # total_ivar_count (= 親祖先 + 自分) を使うことで継承された ivar の slot も確保される。
     def exec_instance_new
       class_idx = decode_signed
+      @stack.push(alloc_instance(class_idx))
+      nil
+    end
+
+    # 指定クラスのインスタンスを 1 つ確保し obj_id を返す (@stack には push しない)。
+    # ivar slot は total_ivar_count (親 chain 込み) ぶんを NIL_VAL で初期化する。
+    # exec_instance_new と Stage 3e の wrap_str_in_stderr (raise "string" の暗黙ラップ) で共有する。
+    def alloc_instance(class_idx)
       ivar_count = total_ivar_count(class_idx)
       ivar_start = @instance_ivar_pool.length
       i = 0
@@ -3443,8 +3448,7 @@ module Setsunaruby
         @instance_ivar_pool.push(ObjectVal::NIL_VAL)
         i += 1
       end
-      @stack.push(alloc_heap_slot(HEAP_KIND_INSTANCE, ivar_start, ivar_count, class_idx))
-      nil
+      alloc_heap_slot(HEAP_KIND_INSTANCE, ivar_start, ivar_count, class_idx)
     end
 
     # Stage 3d.1: obj.method(args) の動的ディスパッチ。
@@ -3555,16 +3559,13 @@ module Setsunaruby
     end
 
     # Stage 3e: PUSH_HANDLER は begin の入口で例外ハンドラを 1 つ登録する。
-    # operand は catch_pc / ensure_pc の 2 つの 3-byte SLEB 相対 offset。decode_signed_3 後の
-    # @pc を base に絶対 PC を計算するので、`@pc + rel == target_abs` が成立する
+    # operand は catch_pc の 3-byte SLEB 相対 offset。decode_signed_3 後の @pc を base に
+    # 絶対 PC を計算するので、`@pc + rel == target_abs` が成立する
     # (patch_jump がそのように rel を計算しているため)。
     def exec_push_handler
       catch_rel = decode_signed_3
       catch_abs = @pc + catch_rel
-      ensure_rel = decode_signed_3
-      ensure_abs = @pc + ensure_rel
       @handler_catch_pcs.push(catch_abs)
-      @handler_ensure_pcs.push(ensure_abs)
       @handler_stack_depths.push(@stack.length)
       @handler_cfp_depths.push(@cfp_pcs.length)
       @handler_yield_depths.push(@yield_pcs.length)
@@ -3575,7 +3576,6 @@ module Setsunaruby
       @handler_yield_depths.pop
       @handler_cfp_depths.pop
       @handler_stack_depths.pop
-      @handler_ensure_pcs.pop
       @handler_catch_pcs.pop
       nil
     end
@@ -3602,18 +3602,12 @@ module Setsunaruby
     end
 
     # 文字列を @message として持つ StandardError instance を直接構築する。
-    # exec_instance_new + initialize 呼び出しを経由せず inline でアロケート (initialize は
-    # 実は同じことをするが、VM 内部からの単純パスとして直接 ivar を埋める)。
+    # initialize 呼び出しを経由せず alloc_instance で確保したあと slot 0 に直接書く
+    # (StandardError#initialize と等価だが VM-internal の最短パス)。
     def wrap_str_in_stderr(str_id)
-      ivar_count = total_ivar_count(BUILTIN_CLASS_STDERR)
-      ivar_start = @instance_ivar_pool.length
-      i = 0
-      while i < ivar_count
-        @instance_ivar_pool.push(ObjectVal::NIL_VAL)
-        i += 1
-      end
-      @instance_ivar_pool[ivar_start] = str_id   # @message slot 0
-      alloc_heap_slot(HEAP_KIND_INSTANCE, ivar_start, ivar_count, BUILTIN_CLASS_STDERR)
+      obj_id = alloc_instance(BUILTIN_CLASS_STDERR)
+      @instance_ivar_pool[@heap_starts[obj_id >> 3]] = str_id   # @message slot 0
+      obj_id
     end
 
     def unwind_to_handler
@@ -3624,7 +3618,6 @@ module Setsunaruby
       cfp_depth   = @handler_cfp_depths.pop
       yield_depth = @handler_yield_depths.pop
       catch_abs   = @handler_catch_pcs.pop
-      @handler_ensure_pcs.pop   # ensure_pc は handler 経由ではなく rescue chain の fall-through で到達するので捨てる
       while @cfp_pcs.length > cfp_depth
         # @locals も対応スコープ分破棄。pop_call_frame は @cur_base を caller のものに戻すので、
         # その前に「現フレームのローカル領域」を捨てる必要がある。
@@ -3646,12 +3639,12 @@ module Setsunaruby
 
     # ハンドラが無い状態で raise が起きたらプロセスを abort させる (Ruby レベル raise で stderr へ流す)。
     def unhandled_exception_abort
-      idx = @exception >> 3
-      cls_idx = @heap_instance_class[idx]
+      cls_idx = class_of_value(@exception)
       cls_name = bytes_to_ruby(@class_name_starts[cls_idx], @class_name_lens[cls_idx])
       msg_val = ObjectVal::NIL_VAL
       # @message は StandardError 由来なら slot 0 にある。継承先 (own ivars 0) でも instance の
       # @heap_lens が total_ivar_count を反映しているのでそれで存在を判定する。
+      idx = @exception >> 3
       if @heap_lens[idx] > 0
         msg_val = @instance_ivar_pool[@heap_starts[idx]]
       end
@@ -3678,23 +3671,27 @@ module Setsunaruby
     # (Ruby の rescue 節と同じ is_a? semantics、Stage 3d.4 で導入した親 chain を walk)。
     def exec_check_exception_class
       target_idx = decode_signed
-      result = ObjectVal::FALSE_VAL
-      if target_idx < 0
-        result = ObjectVal::TRUE_VAL
+      matched = target_idx < 0 || is_subclass?(class_of_value(@exception), target_idx)
+      if matched
+        @stack.push(ObjectVal::TRUE_VAL)
       else
-        ex_cls = @heap_instance_class[@exception >> 3]
-        cur = ex_cls
-        while cur >= 0
-          if cur == target_idx
-            result = ObjectVal::TRUE_VAL
-            cur = -1
-          else
-            cur = @class_parent_idx[cur]
-          end
-        end
+        @stack.push(ObjectVal::FALSE_VAL)
       end
-      @stack.push(result)
       nil
+    end
+
+    # child_idx が ancestor_idx と等しいか、その先祖チェーンに含まれるかを判定する。
+    # @class_parent_idx を walk するだけのシンプルなヘルパで、ancestor_idx == child_idx も
+    # true を返す (=== Class semantics と同じ)。
+    def is_subclass?(child_idx, ancestor_idx)
+      cur = child_idx
+      while cur >= 0
+        if cur == ancestor_idx
+          return true
+        end
+        cur = @class_parent_idx[cur]
+      end
+      false
     end
 
     # ensure 末尾。@exception が残っていれば再度 unwind (上位ハンドラへ伝播)、

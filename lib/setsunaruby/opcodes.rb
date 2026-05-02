@@ -72,14 +72,15 @@ module Setsunaruby
 
     # Stage 3e: 例外処理。
     # PUSH_HANDLER は begin の入口で例外ハンドラを登録 (現在の stack/cfp/yield depth を記録)。
-    # operand = catch_rel (3-byte SLEB), ensure_rel (3-byte SLEB)。両者とも PUSH_HANDLER 命令終端からの相対 PC。
+    # operand = catch_rel (3-byte SLEB)。ensure には catch_pc から rescue chain を fall-through
+    # して自然到達するため別 operand は不要 (rescue なし=ensure-only の場合は catch_pc を ensure 先頭に向ける)。
     # POP_HANDLER は本体が例外なく抜けた時にハンドラを 1 つ取り除く。
     # RAISE は stack top を pop してそれを例外として handler stack まで unwind する。
     # LOAD_EXCEPTION / CLEAR_EXCEPTION は rescue chain で @exception を読み書きする。
     # CHECK_EXCEPTION_CLASS は operand の class_idx (または継承先) と一致するか bool で push。
     # operand=-1 は catch-all (`rescue` クラス指定なし) 用センチネル。
     # RERAISE_OR_END は ensure 末尾。@exception が残っていれば再 unwind、なければ次へ流す。
-    PUSH_HANDLER          = 0x53   # operands: catch_rel(3-byte), ensure_rel(3-byte)
+    PUSH_HANDLER          = 0x53   # operand: catch_rel(3-byte)
     POP_HANDLER           = 0x54
     RAISE                 = 0x55
     LOAD_EXCEPTION        = 0x56
