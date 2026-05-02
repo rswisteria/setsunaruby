@@ -16,6 +16,9 @@ module Setsunaruby
     KW_RETURN = :kw_return
     KW_DO     = :kw_do     # `do ... end` ブロック開始 (Stage 3c.1)
     KW_YIELD  = :kw_yield  # `yield` (Stage 3c.2)
+    KW_CLASS  = :kw_class  # `class` (Stage 3d.1)
+    KW_SELF   = :kw_self   # `self` (Stage 3d.1)
+    IVAR     = :ivar       # `@var` インスタンス変数 (Stage 3d.1)。int_value = (start<<16)|len (start は @ の次)
     STR      = :str        # 文字列リテラル (Stage 3a)。int_value = strlit_idx
     PLUS      = :plus
     MINUS    = :minus

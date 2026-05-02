@@ -259,6 +259,15 @@ assert_output(File.read(File.expand_path('../examples/map.rb', __dir__)),
               "1\n4\n9\n16\n25\n1\n2\n3\nHello, world\nWelcome, setsunaruby!\n101\n102\n103\n",
               "examples/map.rb")
 
+# ---- Stage 3d.1: クラス / @var / self / .new ----
+assert_output("class C\n  def hi\n    42\n  end\nend\nputs C.new.hi\n", "42\n", "CLS: 引数なし method")
+assert_output("class C\n  def add(a, b)\n    a + b\n  end\nend\nputs C.new.add(3, 4)\n", "7\n", "CLS: 引数あり method")
+assert_output("class C\n  def set(n)\n    @n = n\n  end\n  def get\n    @n\n  end\nend\nc = C.new\nc.set(99)\nputs c.get\n",
+              "99\n", "CLS: @var read/write")
+assert_output(File.read(File.expand_path('../examples/class.rb', __dir__)),
+              "3\n1\n3\n12\n24\n15\n2\n4\n6\n",
+              "examples/class.rb")
+
 # ---- エラー系 ----
 assert_fails(%(puts "a" + 1\n),  "STR: + 型エラー")
 assert_fails(%(puts 1 << 1\n),   "STR: << は (string|array) のみ (Fixnum 不可)")
