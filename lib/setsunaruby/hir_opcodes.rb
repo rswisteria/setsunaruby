@@ -49,6 +49,13 @@ module Setsunaruby
     # Stage 3c.3: block_given? built-in。引数なしで bool を push。
     BLOCK_GIVEN_P   = 0x193
 
+    # Stage 3d.1: クラス関連。LIR には lower しない。
+    INSTANCE_NEW = 0x1A0   # op0 = class_idx
+    CALL_METHOD  = 0x1A1   # op0 = name_packed, op1 = args_start (含む receiver), op2 = argc
+    LOAD_SELF    = 0x1A2
+    LOAD_IVAR    = 0x1A3   # op0 = ivar_slot
+    STORE_IVAR   = 0x1A4   # op0 = ivar_slot, op1 = value (hir_id)
+
     # JIT-3c: 型特化命令。GUARD_FIXNUM は値が Fixnum でなければ side exit。
     # FIXNUM_* は Fixnum 入力前提で動作する特化命令。
     GUARD_FIXNUM = 0x150    # op0 = guarded value (hir_id)

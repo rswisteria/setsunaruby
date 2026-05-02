@@ -40,6 +40,7 @@ module Setsunaruby
     PIPE_B     = 124 # '|' (Stage 3c.1 ブロックパラメータ)
     Q_MARK_B   = 63  # '?' (Stage 3c.3 識別子末尾)
     BANG_B     = 33  # '!' (Stage 3c.3 識別子末尾)
+    AT_B       = 64  # '@' (Stage 3d.1 インスタンス変数)
     PCT   = 37
     EQ    = 61
     LT_BYTE = 60
@@ -60,8 +61,9 @@ module Setsunaruby
     # ヒープオブジェクト obj_id の下位 3 bit タグ。Stage 0 で予約した (idx<<3)|0b110。
     HEAP_TAG = 6
     # ヒープオブジェクトの kind (= @heap_kind の値)。Stage 3b 以降は要素を増やしていく。
-    HEAP_KIND_STRING = 1
-    HEAP_KIND_ARRAY  = 2
+    HEAP_KIND_STRING   = 1
+    HEAP_KIND_ARRAY    = 2
+    HEAP_KIND_INSTANCE = 3   # Stage 3d.1: ユーザ定義クラスのインスタンス
 
     # キーワードバイト列。spinel の sp_String / const char* 不整合を避けるため
     # 文字列ではなくバイト配列で直接比較する。
@@ -79,6 +81,9 @@ module Setsunaruby
     KW_RETURN_BYTES = [114, 101, 116, 117, 114, 110].freeze   # "return"
     KW_DO_BYTES     = [100, 111].freeze                       # "do" (Stage 3c.1)
     KW_YIELD_BYTES  = [121, 105, 101, 108, 100].freeze        # "yield" (Stage 3c.2)
+    KW_CLASS_BYTES  = [99, 108, 97, 115, 115].freeze          # "class" (Stage 3d.1)
+    KW_SELF_BYTES   = [115, 101, 108, 102].freeze             # "self" (Stage 3d.1)
+    KW_NEW_BYTES    = [110, 101, 119].freeze                  # "new" (Stage 3d.1: ClassName.new 専用認識)
     # Stage 3b/3c: ドット method 名 (現状 length / each / times / map をサポート)。
     # 将来 method_name_is_*? を増やすときも同じ場所に追加する。
     KW_LENGTH_BYTES = [108, 101, 110, 103, 116, 104].freeze   # "length"
@@ -202,6 +207,29 @@ module Setsunaruby
       @strlit_lens   = []
       # Stage 3b: 配列要素プール (要素は obj_id = tagged value)。
       @heap_arr_pool = []
+      # Stage 3d.1: ユーザ定義クラスとインスタンス状態。
+      # クラス表 (parallel IntArray):
+      @class_name_starts   = []   # クラス名 packed の start (= @bytes 上の offset)
+      @class_name_lens     = []
+      @class_method_starts = []   # @method_*  上のこのクラスのメソッド開始 idx
+      @class_method_counts = []
+      @class_ivar_starts   = []   # @class_ivar_name_* 上のこのクラスの ivar 開始 idx
+      @class_ivar_counts   = []
+      # クラスごとの ivar 名 packed テーブル (flat、@class_ivar_starts/_counts でスライス)。
+      @class_ivar_name_starts = []
+      @class_ivar_name_lens   = []
+      # 既存 @method_* に並列の class_idx (-1 = トップレベル method)。
+      @method_class_idx = []
+      # インスタンス状態:
+      # @heap_kind[idx] == HEAP_KIND_INSTANCE のとき、@heap_instance_class[idx] が class idx、
+      # @heap_starts[idx] が @instance_ivar_pool 上の slot 開始 offset、@heap_lens[idx] が ivar 数。
+      @heap_instance_class = []
+      @instance_ivar_pool  = []   # 各インスタンスの ivar 値 (obj_id) を flat に並べる
+      # コンパイル中の class context (-1 = トップレベル)。
+      @cur_class = -1
+      # コールフレームに紐付く self (NIL_VAL = self なし、トップレベル相当)。
+      @cfp_selfs = []
+      @cur_self  = ObjectVal::NIL_VAL
     end
 
     def run_file(path)
@@ -276,6 +304,20 @@ module Setsunaruby
       @strlit_starts = []
       @strlit_lens   = []
       @heap_arr_pool = []
+      @class_name_starts   = []
+      @class_name_lens     = []
+      @class_method_starts = []
+      @class_method_counts = []
+      @class_ivar_starts   = []
+      @class_ivar_counts   = []
+      @class_ivar_name_starts = []
+      @class_ivar_name_lens   = []
+      @method_class_idx       = []
+      @heap_instance_class    = []
+      @instance_ivar_pool     = []
+      @cur_class = -1
+      @cfp_selfs = []
+      @cur_self  = ObjectVal::NIL_VAL
 
       @cur_token = next_token
       while !at_end?
@@ -332,6 +374,8 @@ module Setsunaruby
           end
         elsif b == DQUOTE_B
           return read_string
+        elsif b == AT_B
+          return read_ivar
         elsif digit?(b)
           return read_number
         elsif ident_start?(b)
@@ -415,6 +459,23 @@ module Setsunaruby
       Token.new(TokenKind::INT, n, "", @line)
     end
 
+    # `@ident` インスタンス変数を 1 つ読む。`@` の次に通常の識別子が続く必要あり。
+    # int_value は packed `(start<<16)|len` で、start は `@` を含む先頭、len は `@` 込みの長さ。
+    # 同名のインスタンス変数は同じ packed 値を持つので、ローカル名と同じ流儀で解決できる。
+    def read_ivar
+      start = @lex_pos
+      @lex_pos += 1   # consume `@`
+      if @lex_pos >= @bytes.length || !ident_start?(@bytes[@lex_pos])
+        raise "Lexer error: line #{@line}: @ の後に識別子が必要です"
+      end
+      while @lex_pos < @bytes.length && ident_cont?(@bytes[@lex_pos])
+        @lex_pos += 1
+      end
+      len = @lex_pos - start
+      packed = (start << 16) | len
+      Token.new(TokenKind::IVAR, packed, "", @line)
+    end
+
     def read_ident_or_keyword
       start = @lex_pos
       while @lex_pos < @bytes.length && ident_cont?(@bytes[@lex_pos])
@@ -472,6 +533,10 @@ module Setsunaruby
         result = TokenKind::KW_DO
       elsif match_bytes(start, len, KW_YIELD_BYTES)
         result = TokenKind::KW_YIELD
+      elsif match_bytes(start, len, KW_CLASS_BYTES)
+        result = TokenKind::KW_CLASS
+      elsif match_bytes(start, len, KW_SELF_BYTES)
+        result = TokenKind::KW_SELF
       end
       result
     end
@@ -621,9 +686,45 @@ module Setsunaruby
         return parse_def
       elsif k == TokenKind::KW_RETURN
         return parse_return
+      elsif k == TokenKind::KW_CLASS
+        return parse_class
       else
         return parse_expression
       end
+    end
+
+    # `class Name body end` を 1 つ読む。Name は IDENT (Ruby と異なり大文字必須は強制しない)。
+    # 内部は `def` のみ許可 (Stage 3d.1)。トップレベル定義のみ。
+    def parse_class
+      @cur_token = next_token   # consume `class`
+      if @cur_token.kind != TokenKind::IDENT
+        raise "Parse error: line #{@cur_token.line}: クラス名が必要です"
+      end
+      name_packed = @cur_token.int_value
+      @cur_token = next_token
+      skip_newlines
+      body = parse_class_body
+      expect(TokenKind::KW_END)
+      ASTNode.new(:class_def, name_packed, false, :nop, body, nil, nil)
+    end
+
+    # クラス本体: 0 個以上の `def` を :seq でリンクリスト化。
+    # トップレベル parse_block と異なり、終端は KW_END のみ、許可される文も `def` のみ。
+    def parse_class_body
+      skip_newlines
+      if @cur_token.kind == TokenKind::KW_END
+        return ASTNode.new(:nil_lit, 0, false, :nop, nil, nil, nil)
+      end
+      if @cur_token.kind != TokenKind::KW_DEF
+        raise "Parse error: line #{@cur_token.line}: class 内には def のみ書けます (Stage 3d.1)"
+      end
+      first = parse_def
+      skip_newlines
+      if @cur_token.kind == TokenKind::KW_END
+        return first
+      end
+      rest = parse_class_body
+      ASTNode.new(:seq, 0, false, :nop, first, nil, rest)
     end
 
     # `yield` / `yield expr` / `yield(expr)` のいずれかを 1 つ読む。多引数は raise。
@@ -1006,9 +1107,23 @@ module Setsunaruby
     end
 
     # expression := IDENT '=' expression       (代入は右結合)
+    #             | IVAR '=' expression        (Stage 3d.1)
     #             | comparison
     # 代入は最も低い優先順位で右結合。`x = y = 1` は `x = (y = 1)` となる。
     def parse_expression
+      if @cur_token.kind == TokenKind::IVAR
+        # `@var` または `@var = expr`。parse_primary 経路と同じ AST を生成。
+        packed = @cur_token.int_value
+        line   = @cur_token.line
+        @cur_token = next_token
+        if @cur_token.kind == TokenKind::EQ
+          @cur_token = next_token
+          value = parse_expression
+          return ASTNode.new(:ivar_assign, packed, false, :nop, value, nil, nil)
+        end
+        left_node = ASTNode.new(:ivar_ref, packed, false, :nop, nil, nil, nil)
+        return parse_expression_from(left_node, line)
+      end
       if @cur_token.kind == TokenKind::IDENT
         # IDENT の int_value は (start << 16) | len の packed 値。
         # 名前識別はこの packed 値そのもので比較できる (同じバイト列なら同じ start)。
@@ -1098,6 +1213,20 @@ module Setsunaruby
       elsif k == TokenKind::KW_NIL
         @cur_token = next_token
         ASTNode.new(:nil_lit, 0, false, :nop, nil, nil, nil)
+      elsif k == TokenKind::KW_SELF
+        @cur_token = next_token
+        ASTNode.new(:self_lit, 0, false, :nop, nil, nil, nil)
+      elsif k == TokenKind::IVAR
+        # `@var` を読み、続く `=` で代入かどうか判定。
+        # 代入は :assign と同じく右結合で parse_expression を呼ぶ。
+        packed = @cur_token.int_value
+        @cur_token = next_token
+        if @cur_token.kind == TokenKind::EQ
+          @cur_token = next_token
+          value = parse_expression
+          return ASTNode.new(:ivar_assign, packed, false, :nop, value, nil, nil)
+        end
+        ASTNode.new(:ivar_ref, packed, false, :nop, nil, nil, nil)
       elsif k == TokenKind::IDENT
         packed = @cur_token.int_value   # (start << 16) | len の packed 値
         @cur_token = next_token
@@ -1155,6 +1284,8 @@ module Setsunaruby
         compile_block(node)
       elsif k == :method_def
         compile_method_def(node)
+      elsif k == :class_def
+        compile_class_def(node)
       elsif k == :return_stmt
         compile_return(node)
       else
@@ -1254,6 +1385,12 @@ module Setsunaruby
         compile_method_call_on(node)
       elsif k == :yield_expr
         compile_yield(node)
+      elsif k == :self_lit
+        @bytecode.push(Op::LOAD_SELF)
+      elsif k == :ivar_ref
+        compile_ivar_ref(node)
+      elsif k == :ivar_assign
+        compile_ivar_assign(node)
       else
         raise "Compiler bug: unknown expression kind #{k}"
       end
@@ -1298,23 +1435,57 @@ module Setsunaruby
       argc        = count_arg_chain(node.node_operand)
 
       # Stage 3c.1/3c.3: ブロック付き呼び出しは特殊形式 (each / times / map) 限定でインライン展開。
+      # Stage 3d.1: 上記以外でも user-defined method なら CALL_METHOD_WITH_BLOCK で受ける。
       if block != nil
-        if argc != 0
-          raise "Compile error: line #{@cur_token.line}: ブロック付きメソッドの引数は 0 個のみ"
+        if method_name_is_each?(name_packed) || method_name_is_times?(name_packed) ||
+           method_name_is_map?(name_packed)
+          if argc != 0
+            raise "Compile error: line #{@cur_token.line}: each/times/map にブロック付き引数は使えません"
+          end
+          if method_name_is_each?(name_packed)
+            compile_each_block(node.node_left, block)
+          elsif method_name_is_times?(name_packed)
+            compile_times_block(node.node_left, block)
+          else
+            compile_map_block(node.node_left, block)
+          end
+          return nil
         end
-        if method_name_is_each?(name_packed)
-          compile_each_block(node.node_left, block)
-        elsif method_name_is_times?(name_packed)
-          compile_times_block(node.node_left, block)
-        elsif method_name_is_map?(name_packed)
-          compile_map_block(node.node_left, block)
-        else
-          raise "Compile error: line #{@cur_token.line}: ブロック付きは .each / .times / .map のみ"
+        # 一般ユーザ method 呼び出しにブロックを渡す。compile_method_call と同形の
+        # skip-jump パターンでブロックを inline 配置し、CALL_METHOD_WITH_BLOCK で呼ぶ。
+        block_pc = compile_inline_block(block)
+        block_arity = 0
+        if block.node_int_value != 0
+          block_arity = 1
         end
+        compile_expr(node.node_left)
+        cur = node.node_operand
+        while cur != nil
+          compile_expr(cur.node_left)
+          cur = cur.node_operand
+        end
+        @bytecode.push(Op::CALL_METHOD_WITH_BLOCK)
+        encode_signed(name_packed)
+        encode_signed(argc)
+        encode_signed(block_pc)
+        encode_signed(block_arity)
         return nil
       end
 
-      # ブロックなしの dispatch (Stage 3b 互換)。
+      # Stage 3d.1: `ClassName.new` (引数なし) はインスタンス確保に展開。
+      # 受信者は :var_ref で、その名前がクラステーブルにあるかで判別する。
+      if argc == 0 && method_name_is_new?(name_packed) &&
+         node.node_left.node_kind == :var_ref
+        cls_packed = node.node_left.node_int_value
+        cls_idx = find_class_by_packed(cls_packed)
+        if cls_idx >= 0
+          @bytecode.push(Op::INSTANCE_NEW)
+          encode_signed(cls_idx)
+          return nil
+        end
+      end
+
+      # ブロックなしの dispatch (Stage 3b/3d.1)。
       compile_expr(node.node_left)   # receiver
       cur = node.node_operand
       while cur != nil
@@ -1324,7 +1495,10 @@ module Setsunaruby
       if argc == 0 && method_name_is_length?(name_packed)
         @bytecode.push(Op::ARRAY_LEN)
       else
-        raise "Compile error: line #{@cur_token.line}: Stage 3b ではドット method は .length のみ対応"
+        # Stage 3d.1: 一般 method dispatch。受信者の class を runtime で見て解決。
+        @bytecode.push(Op::CALL_METHOD)
+        encode_signed(name_packed)
+        encode_signed(argc)
       end
       nil
     end
@@ -1531,6 +1705,10 @@ module Setsunaruby
       method_name_match?(packed, KW_BLOCK_GIVEN_BYTES)
     end
 
+    def method_name_is_new?(packed)
+      method_name_match?(packed, KW_NEW_BYTES)
+    end
+
     def method_name_match?(packed, kw_bytes)
       pkg_start = packed >> 16
       pkg_len   = packed & 0xffff
@@ -1704,8 +1882,144 @@ module Setsunaruby
       nil
     end
 
+    # トップレベル method (class_idx == -1) のみを走査する。同名再定義は最後を採る。
     def find_method(name_packed)
-      find_in_table(@method_name_starts, @method_name_lens, 0, name_packed)
+      find_method_in_class(-1, name_packed)
+    end
+
+    # Stage 3d.1: 指定 class に属する method を後ろから走査 (= 最後の定義を採る)。
+    # class_idx = -1 ならトップレベル method を検索。
+    def find_method_in_class(class_idx, name_packed)
+      pkg_start = name_packed >> 16
+      pkg_len   = name_packed & 0xffff
+      if pkg_len == 0
+        return -1
+      end
+      i = @method_name_starts.length - 1
+      while i >= 0
+        if @method_class_idx[i] == class_idx &&
+           @method_name_lens[i] == pkg_len &&
+           bytes_eq(@method_name_starts[i], pkg_start, pkg_len)
+          return i
+        end
+        i -= 1
+      end
+      -1
+    end
+
+    # ============================================================
+    # Stage 3d.1: クラス定義 / インスタンス変数 / self
+    # ============================================================
+
+    def compile_class_def(node)
+      if @in_method
+        raise "Compile error: line #{@cur_token.line}: class はトップレベルでのみ定義できます"
+      end
+      if @cur_class >= 0
+        raise "Compile error: line #{@cur_token.line}: ネストしたクラス定義はできません"
+      end
+      name_packed = node.node_int_value
+      class_idx = declare_class(name_packed)
+      saved_class = @cur_class
+      @cur_class = class_idx
+      compile_class_body_seq(node.node_left)
+      @cur_class = saved_class
+      # class def の値は nil (compile_stmt の不変条件「1 値残す」を維持)。
+      @bytecode.push(Op::PUSH_NIL)
+      nil
+    end
+
+    # クラス本体 (parse_class_body 由来の :seq チェーン or 単一 :method_def or :nil_lit) を
+    # コンパイルし、各 method def 後に POP で値を捨てる (compile_class_def 自身が末尾に
+    # PUSH_NIL を 1 つ emit する想定)。
+    def compile_class_body_seq(node)
+      k = node.node_kind
+      if k == :nil_lit
+        return nil
+      end
+      if k == :seq
+        compile_class_body_member(node.node_left)
+        compile_class_body_seq(node.node_operand)
+      else
+        compile_class_body_member(node)
+      end
+      nil
+    end
+
+    def compile_class_body_member(node)
+      if node.node_kind != :method_def
+        raise "Compile error: line #{@cur_token.line}: class 内には def のみ"
+      end
+      compile_method_def(node)        # 末尾に PUSH_NIL を 1 つ残す
+      @bytecode.push(Op::POP)         # その PUSH_NIL を消費
+      @class_method_counts[@cur_class] = @class_method_counts[@cur_class] + 1
+      nil
+    end
+
+    # 同名クラスの再定義は禁止 (Stage 3d.1 はシンプルに保つ)。
+    def declare_class(name_packed)
+      pkg_start = name_packed >> 16
+      pkg_len   = name_packed & 0xffff
+      i = find_class_by_packed(name_packed)
+      if i >= 0
+        raise "Compile error: line #{@cur_token.line}: クラスは既に定義済み (Stage 3d.1)"
+      end
+      @class_name_starts.push(pkg_start)
+      @class_name_lens.push(pkg_len)
+      @class_method_starts.push(@method_name_starts.length)
+      @class_method_counts.push(0)
+      @class_ivar_starts.push(@class_ivar_name_starts.length)
+      @class_ivar_counts.push(0)
+      @class_name_starts.length - 1
+    end
+
+    def find_class_by_packed(name_packed)
+      find_in_table(@class_name_starts, @class_name_lens, 0, name_packed)
+    end
+
+    # 現在の class の ivar table から name_packed の slot idx を返す。未登録なら append。
+    # 戻り値は class 相対 slot idx (0..count-1)。LOAD_IVAR / STORE_IVAR が直接使う。
+    def find_or_declare_ivar_slot(class_idx, name_packed)
+      pkg_start = name_packed >> 16
+      pkg_len   = name_packed & 0xffff
+      base = @class_ivar_starts[class_idx]
+      n    = @class_ivar_counts[class_idx]
+      i = 0
+      while i < n
+        if @class_ivar_name_lens[base + i] == pkg_len &&
+           bytes_eq(@class_ivar_name_starts[base + i], pkg_start, pkg_len)
+          return i
+        end
+        i += 1
+      end
+      # 末尾に append。@class_ivar_starts は固定 (= base) なのでここに追加することで
+      # 後続クラスの ivar とも干渉しない (まだそのクラスは登録されていない前提)。
+      @class_ivar_name_starts.push(pkg_start)
+      @class_ivar_name_lens.push(pkg_len)
+      @class_ivar_counts[class_idx] = n + 1
+      n
+    end
+
+    def compile_ivar_ref(node)
+      if @cur_class < 0
+        raise "Compile error: line #{@cur_token.line}: @var はクラスメソッド内でのみ使えます"
+      end
+      slot = find_or_declare_ivar_slot(@cur_class, node.node_int_value)
+      @bytecode.push(Op::LOAD_IVAR)
+      encode_signed(slot)
+      nil
+    end
+
+    def compile_ivar_assign(node)
+      if @cur_class < 0
+        raise "Compile error: line #{@cur_token.line}: @var はクラスメソッド内でのみ使えます"
+      end
+      compile_expr(node.node_left)
+      slot = find_or_declare_ivar_slot(@cur_class, node.node_int_value)
+      @bytecode.push(Op::STORE_IVAR)
+      encode_signed(slot)
+      # STORE_IVAR は値を残す (代入式の値として)
+      nil
     end
 
     # 並列 IntArray (starts, lens) で構成された name table を線形探索する。
@@ -1733,24 +2047,18 @@ module Setsunaruby
 
     # local_count は body コンパイル後に compile_method_def が確定させる。
     def declare_method(name_packed, method_pc, arity)
-      i = find_method(name_packed)
-      if i < 0
-        @method_name_starts.push(name_packed >> 16)
-        @method_name_lens.push(name_packed & 0xffff)
-        @method_pcs.push(method_pc)
-        @method_arities.push(arity)
-        @method_local_counts.push(0)
-        @method_body_ends.push(-1)
-        @jit_call_counts.push(0)
-        i = @method_name_starts.length - 1
-      else
-        @method_pcs[i] = method_pc
-        @method_arities[i] = arity
-        @method_local_counts[i] = 0
-        @method_body_ends[i] = -1
-        @jit_call_counts[i] = 0
-      end
-      i
+      # Stage 3d.1: 常に append し、class_idx も並列に記録する。
+      # 同名再定義 (Stage 2 の振る舞い) は find_method 側で「最後に登録された一致」を
+      # 返すことで保持。既存テストの top-level method 再定義シナリオはこの仕様で動く。
+      @method_name_starts.push(name_packed >> 16)
+      @method_name_lens.push(name_packed & 0xffff)
+      @method_pcs.push(method_pc)
+      @method_arities.push(arity)
+      @method_local_counts.push(0)
+      @method_body_ends.push(-1)
+      @jit_call_counts.push(0)
+      @method_class_idx.push(@cur_class)
+      @method_name_starts.length - 1
     end
 
     def compile_while(node)
@@ -1966,6 +2274,18 @@ module Setsunaruby
           exec_block_return
         elsif op == Op::BLOCK_GIVEN_P
           exec_block_given_p
+        elsif op == Op::INSTANCE_NEW
+          exec_instance_new
+        elsif op == Op::CALL_METHOD
+          exec_call_method
+        elsif op == Op::CALL_METHOD_WITH_BLOCK
+          exec_call_method_with_block
+        elsif op == Op::LOAD_SELF
+          exec_load_self
+        elsif op == Op::LOAD_IVAR
+          exec_load_ivar
+        elsif op == Op::STORE_IVAR
+          exec_store_ivar
         elsif op == Op::RETURN
           exec_return
         elsif op == Op::HALT
@@ -2109,10 +2429,7 @@ module Setsunaruby
       new_start = @str_pool.length
       src_len   = @strlit_lens[lit_idx]
       str_pool_copy(@strlit_starts[lit_idx], src_len)
-      @heap_kind.push(HEAP_KIND_STRING)
-      @heap_starts.push(new_start)
-      @heap_lens.push(src_len)
-      box_heap(@heap_kind.length - 1)
+      alloc_heap_slot(HEAP_KIND_STRING, new_start, src_len, -1)
     end
 
     # `+`: 新しいヒープ String を確保し、lhs/rhs のバイトを順に append する。
@@ -2124,9 +2441,17 @@ module Setsunaruby
       new_start = @str_pool.length
       str_pool_copy(@heap_starts[lhs_idx], ll)
       str_pool_copy(@heap_starts[rhs_idx], rl)
-      @heap_kind.push(HEAP_KIND_STRING)
-      @heap_starts.push(new_start)
-      @heap_lens.push(ll + rl)
+      alloc_heap_slot(HEAP_KIND_STRING, new_start, ll + rl, -1)
+    end
+
+    # Stage 3d.1: ヒープ slot 確保ヘルパ。@heap_kind / @heap_starts / @heap_lens /
+    # @heap_instance_class の 4 並列 IntArray を 1 操作で push し、新 obj_id を返す。
+    # 非インスタンス (string/array) は class_idx = -1 で push する。
+    def alloc_heap_slot(kind, start, len, class_idx)
+      @heap_kind.push(kind)
+      @heap_starts.push(start)
+      @heap_lens.push(len)
+      @heap_instance_class.push(class_idx)
       box_heap(@heap_kind.length - 1)
     end
 
@@ -2196,10 +2521,7 @@ module Setsunaruby
         @heap_arr_pool.push(reversed[i])
         i -= 1
       end
-      @heap_kind.push(HEAP_KIND_ARRAY)
-      @heap_starts.push(new_start)
-      @heap_lens.push(size)
-      box_heap(@heap_kind.length - 1)
+      alloc_heap_slot(HEAP_KIND_ARRAY, new_start, size, -1)
     end
 
     # 配列 obj_id と idx を渡すと、共通の検証 (負 index 拒否) を行ってから
@@ -2462,21 +2784,24 @@ module Setsunaruby
       nil
     end
 
-    # コールフレームの 4 並列 IntArray を 1 操作に集約する。フィールド追加時に
+    # コールフレームの並列 IntArray を 1 操作に集約する。フィールド追加時に
     # exec_call_common と exec_return の 2 箇所を同期する手間 (= ドリフト由来のバグ) を防ぐ。
+    # Stage 3d.1: @cur_self も同フレームに紐付けて保存する。
     def push_call_frame(pc, base, block_pc, block_arity)
       @cfp_pcs.push(pc)
       @cfp_bases.push(base)
       @cfp_block_pcs.push(block_pc)
       @cfp_block_arities.push(block_arity)
+      @cfp_selfs.push(@cur_self)
       nil
     end
 
-    # 4 並列 IntArray を pop し @pc / @cur_base に復元。block 情報は破棄。
+    # 並列 IntArray を pop し @pc / @cur_base / @cur_self に復元。block 情報は破棄。
     # 複数戻り値で渡すと spinel の poly 推論を誘発しがちなので ivar を直接書き換える。
     def pop_call_frame
       @cfp_block_arities.pop
       @cfp_block_pcs.pop
+      @cur_self = @cfp_selfs.pop
       @cur_base = @cfp_bases.pop
       @pc       = @cfp_pcs.pop
       nil
@@ -2521,13 +2846,119 @@ module Setsunaruby
       nil
     end
 
+    # Stage 3d.1: ClassName.new — class_idx に対応するインスタンスを 1 つ確保する。
+    # ivar slot を全 NIL_VAL で初期化し、obj_id を push。Stage 3d.2 で initialize 連動を入れる。
+    def exec_instance_new
+      class_idx = decode_signed
+      ivar_count = @class_ivar_counts[class_idx]
+      ivar_start = @instance_ivar_pool.length
+      i = 0
+      while i < ivar_count
+        @instance_ivar_pool.push(ObjectVal::NIL_VAL)
+        i += 1
+      end
+      @stack.push(alloc_heap_slot(HEAP_KIND_INSTANCE, ivar_start, ivar_count, class_idx))
+      nil
+    end
+
+    # Stage 3d.1: obj.method(args) の動的ディスパッチ。
+    def exec_call_method
+      name_packed = decode_signed
+      argc        = decode_signed
+      exec_dispatch_method(name_packed, argc, -1, 0)
+    end
+
+    # Stage 3d.1: obj.method(args) do |x| ... end の動的ディスパッチ + block 付き。
+    def exec_call_method_with_block
+      name_packed = decode_signed
+      argc        = decode_signed
+      block_pc    = decode_signed
+      block_arity = decode_signed
+      exec_dispatch_method(name_packed, argc, block_pc, block_arity)
+    end
+
+    # CALL_METHOD / CALL_METHOD_WITH_BLOCK の共通ディスパッチ。
+    # スタック [..., self, arg1, ..., argN] から self を抜き、args だけ残してから call_common。
+    # @cur_self の更新は push_call_frame 完了後に行う (push_call_frame は caller's self を退避する)。
+    def exec_dispatch_method(name_packed, argc, block_pc, block_arity)
+      self_pos  = @stack.length - argc - 1
+      receiver  = @stack[self_pos]
+      class_idx = class_of_value(receiver)
+      if class_idx < 0
+        raise "NoMethodError: 受信者がユーザ定義クラスのインスタンスでありません"
+      end
+      m_idx = find_method_in_class(class_idx, name_packed)
+      if m_idx < 0
+        raise "NoMethodError: そのクラスに該当 method がありません"
+      end
+      expected = @method_arities[m_idx]
+      if expected != argc
+        raise "ArgumentError: arity mismatch (expected #{expected}, got #{argc})"
+      end
+      # スタック上の self ([-argc-1] 位置) を抜き取って args だけ残す
+      # (exec_call_common は最後の argc 個を pop してメソッド locals に書く前提)。
+      tmp = []
+      i = 0
+      while i < argc
+        tmp.push(@stack.pop)
+        i += 1
+      end
+      @stack.pop   # discard self (caller's @cur_self は push_call_frame で退避済み)
+      i = argc - 1
+      while i >= 0
+        @stack.push(tmp[i])
+        i -= 1
+      end
+      exec_call_common(m_idx, block_pc, block_arity)
+      @cur_self = receiver
+      nil
+    end
+
+    # 値の class を返す (-1 = ユーザ定義クラスのインスタンスでない)。
+    def class_of_value(v)
+      if (v & 7) != HEAP_TAG
+        return -1
+      end
+      idx = v >> 3
+      if @heap_kind[idx] != HEAP_KIND_INSTANCE
+        return -1
+      end
+      @heap_instance_class[idx]
+    end
+
+    def exec_load_self
+      @stack.push(@cur_self)
+      nil
+    end
+
+    def exec_load_ivar
+      slot = decode_signed
+      if (@cur_self & 7) != HEAP_TAG || @heap_kind[@cur_self >> 3] != HEAP_KIND_INSTANCE
+        raise "RuntimeError: @var の self がインスタンスではありません"
+      end
+      idx = @cur_self >> 3
+      @stack.push(@instance_ivar_pool[@heap_starts[idx] + slot])
+      nil
+    end
+
+    def exec_store_ivar
+      slot = decode_signed
+      if (@cur_self & 7) != HEAP_TAG || @heap_kind[@cur_self >> 3] != HEAP_KIND_INSTANCE
+        raise "RuntimeError: @var の self がインスタンスではありません"
+      end
+      idx = @cur_self >> 3
+      v = @stack[@stack.length - 1]   # peek (代入は値を残す)
+      @instance_ivar_pool[@heap_starts[idx] + slot] = v
+      nil
+    end
+
     def exec_return
       v = @stack.pop
       # 自スコープのローカル領域を破棄 (caller の base に戻す)。
       while @locals.length > @cur_base
         @locals.pop
       end
-      pop_call_frame
+      pop_call_frame   # Stage 3d.1: pop_call_frame 内で @cur_self も復元
       @stack.push(v)
       nil
     end

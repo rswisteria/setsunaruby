@@ -55,6 +55,17 @@ module Setsunaruby
     # Stage 3c.3: 現フレームにブロックが紐付いているかを true/false で push する組み込み。
     BLOCK_GIVEN_P   = 0x4B
 
+    # Stage 3d.1: クラス。
+    # INSTANCE_NEW は class_idx に対応するインスタンスを 1 つ確保 (ivar 全 NIL_VAL 初期化)。
+    # CALL_METHOD は受信者の class を見て name で method を解決し、self 付きで呼び出す。
+    # LOAD_SELF / LOAD_IVAR / STORE_IVAR は method 内部用。
+    INSTANCE_NEW    = 0x4C   # operand: SLEB128 class_idx
+    CALL_METHOD     = 0x4D   # operands: SLEB128 name_packed, SLEB128 argc
+    LOAD_SELF       = 0x4E
+    LOAD_IVAR       = 0x4F   # operand: SLEB128 ivar_slot
+    STORE_IVAR      = 0x50   # operand: SLEB128 ivar_slot
+    CALL_METHOD_WITH_BLOCK = 0x51   # operands: name_packed, argc, block_pc, block_arity
+
     HALT = 0xFF
   end
 end
