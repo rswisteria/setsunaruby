@@ -18,6 +18,11 @@ module Setsunaruby
     KW_YIELD  = :kw_yield  # `yield` (Stage 3c.2)
     KW_CLASS  = :kw_class  # `class` (Stage 3d.1)
     KW_SELF   = :kw_self   # `self` (Stage 3d.1)
+    KW_BEGIN   = :kw_begin   # `begin` (Stage 3e)
+    KW_RESCUE  = :kw_rescue  # `rescue` (Stage 3e)
+    KW_ENSURE  = :kw_ensure  # `ensure` (Stage 3e)
+    KW_RAISE   = :kw_raise   # `raise` (Stage 3e)
+    HASH_ROCKET = :hash_rocket   # `=>` (Stage 3e: rescue Class => e の束縛)
     IVAR     = :ivar       # `@var` インスタンス変数 (Stage 3d.1)。int_value = (start<<16)|len (start は @ の次)
     STR      = :str        # 文字列リテラル (Stage 3a)。int_value = strlit_idx
     PLUS      = :plus

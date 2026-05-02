@@ -74,6 +74,20 @@ module Setsunaruby
     BUILTIN_CLASS_ARRAY   = 1
     BUILTIN_CLASS_STRING  = 2
     BUILTIN_CLASS_COUNT   = 3
+    # Stage 3e: StandardError は名前付きで pre-register され (BUILTIN_CLASS_COUNT loop の外で
+    # declare_class)、idx は BUILTIN_CLASS_COUNT (= 3) に固定される。`raise "msg"` の文字列
+    # 自動ラップと、user-defined error class の親 lookup の両方で参照する。
+    BUILTIN_CLASS_STDERR  = 3
+
+    # Stage 3e: @bytes prefix のレイアウト。register_builtin_classes_and_methods が
+    # 各 builtin method 名/クラス名/ivar 名を ここに置かれた byte 列として参照する。
+    # ユーザコードはこの prefix の直後から始まる (init_bytes_with_builtin_prefix が @lex_pos を
+    # PREFIX_TOTAL_LEN にセットする)。
+    PREFIX_LENGTH_OFFSET   = 0                                                # "length"
+    PREFIX_STDERR_OFFSET   = PREFIX_LENGTH_OFFSET + 6                         # "StandardError"
+    PREFIX_MESSAGE_OFFSET  = PREFIX_STDERR_OFFSET + 13                        # "message"
+    PREFIX_INIT_OFFSET     = PREFIX_MESSAGE_OFFSET + 7                        # "initialize"
+    PREFIX_TOTAL_LEN       = PREFIX_INIT_OFFSET + 10
 
     # キーワードバイト列。spinel の sp_String / const char* 不整合を避けるため
     # 文字列ではなくバイト配列で直接比較する。
@@ -103,6 +117,13 @@ module Setsunaruby
     KW_MAP_BYTES    = [109, 97, 112].freeze                   # "map" (Stage 3c.3)
     # Stage 3c.3: block_given? は識別子として lex され、compile 時に名前判定する。
     KW_BLOCK_GIVEN_BYTES = [98, 108, 111, 99, 107, 95, 103, 105, 118, 101, 110, 63].freeze   # "block_given?"
+    # Stage 3e: 例外処理キーワード。
+    KW_BEGIN_BYTES   = [98, 101, 103, 105, 110].freeze            # "begin"
+    KW_RESCUE_BYTES  = [114, 101, 115, 99, 117, 101].freeze       # "rescue"
+    KW_ENSURE_BYTES  = [101, 110, 115, 117, 114, 101].freeze      # "ensure"
+    KW_RAISE_BYTES   = [114, 97, 105, 115, 101].freeze            # "raise"
+    KW_MESSAGE_BYTES = [109, 101, 115, 115, 97, 103, 101].freeze  # "message"
+    KW_STDERR_BYTES  = [83, 116, 97, 110, 100, 97, 114, 100, 69, 114, 114, 111, 114].freeze   # "StandardError"
 
     def initialize
       @src       = ""
@@ -244,6 +265,20 @@ module Setsunaruby
       # コールフレームに紐付く self (NIL_VAL = self なし、トップレベル相当)。
       @cfp_selfs = []
       @cur_self  = ObjectVal::NIL_VAL
+      # Stage 3e: 例外処理。
+      # @exception は現在伝播中の例外オブジェクト (NIL_VAL = なし)。RAISE が値を入れて unwind し、
+      # rescue で CLEAR_EXCEPTION することでハンドル済みにする。RERAISE_OR_END は ensure 末尾で
+      # まだ NIL_VAL でなければ再 unwind する。
+      @exception = ObjectVal::NIL_VAL
+      # ハンドラスタック (parallel IntArray)。PUSH_HANDLER/POP_HANDLER で push/pop する。
+      # 各エントリは catch_pc / 当時の stack 深さ / cfp 深さ / yield 深さ を記録し、
+      # RAISE で unwind する際これらを使って状態を巻き戻す。ensure は catch_pc 経由で
+      # rescue chain を fall-through するか success path の JUMP で到達するので、handler に
+      # ensure_pc を別途持たせる必要はない (rescue なしの begin は catch_pc = ensure 先頭にする)。
+      @handler_catch_pcs    = []
+      @handler_stack_depths = []
+      @handler_cfp_depths   = []
+      @handler_yield_depths = []
     end
 
     def run_file(path)
@@ -336,6 +371,16 @@ module Setsunaruby
       @cur_class = -1
       @cfp_selfs = []
       @cur_self  = ObjectVal::NIL_VAL
+      # Stage 3e: 例外処理用の VM 状態を run_string ごとにリセット。
+      @exception            = ObjectVal::NIL_VAL
+      @handler_catch_pcs    = []
+      @handler_stack_depths = []
+      @handler_cfp_depths   = []
+      @handler_yield_depths = []
+      # コンパイル中の method idx (-1 = method 外)。raise/begin を含む method を JIT skip 扱いに
+      # するため、compile_raise / compile_begin_rescue がこの idx を見て jit_call_counts を
+      # 即 threshold に上げる。
+      @cur_method_idx_for_jit = -1
 
       register_builtin_classes_and_methods
 
@@ -557,6 +602,14 @@ module Setsunaruby
         result = TokenKind::KW_CLASS
       elsif match_bytes(start, len, KW_SELF_BYTES)
         result = TokenKind::KW_SELF
+      elsif match_bytes(start, len, KW_BEGIN_BYTES)
+        result = TokenKind::KW_BEGIN
+      elsif match_bytes(start, len, KW_RESCUE_BYTES)
+        result = TokenKind::KW_RESCUE
+      elsif match_bytes(start, len, KW_ENSURE_BYTES)
+        result = TokenKind::KW_ENSURE
+      elsif match_bytes(start, len, KW_RAISE_BYTES)
+        result = TokenKind::KW_RAISE
       end
       result
     end
@@ -624,6 +677,10 @@ module Setsunaruby
         if @lex_pos + 1 < @bytes.length && @bytes[@lex_pos + 1] == EQ
           @lex_pos += 2
           Token.new(TokenKind::EQ_EQ, 0, "", @line)
+        elsif @lex_pos + 1 < @bytes.length && @bytes[@lex_pos + 1] == GT_BYTE
+          # Stage 3e: `=>` は rescue Class => e の束縛にのみ使う。
+          @lex_pos += 2
+          Token.new(TokenKind::HASH_ROCKET, 0, "", @line)
         else
           @lex_pos += 1
           Token.new(TokenKind::EQ, 0, "", @line)
@@ -1119,8 +1176,12 @@ module Setsunaruby
       if mode == BLOCK_SEQ_MODE_BRACE
         return k == TokenKind::RBRACE
       end
+      # Stage 3e: KW_RESCUE / KW_ENSURE は begin の本体および前の rescue 節を終端させる。
+      # begin 以外の context (def 本体や if 本体) で出現した場合は parse_begin_rescue に
+      # 戻った時点で「rescue/ensure もない begin」エラーになるか、外側でも未対応として弾かれる。
       k == TokenKind::KW_END || k == TokenKind::KW_ELSE ||
-        k == TokenKind::KW_ELSIF || k == TokenKind::EOF
+        k == TokenKind::KW_ELSIF || k == TokenKind::EOF ||
+        k == TokenKind::KW_RESCUE || k == TokenKind::KW_ENSURE
     end
 
     def consume_block_seq_terminator(mode)
@@ -1288,9 +1349,70 @@ module Setsunaruby
         parse_while
       elsif k == TokenKind::KW_YIELD
         parse_yield
+      elsif k == TokenKind::KW_BEGIN
+        parse_begin_rescue
+      elsif k == TokenKind::KW_RAISE
+        parse_raise
       else
         raise "Parse error: line #{@cur_token.line}: 式が必要です"
       end
+    end
+
+    # Stage 3e: `begin BODY [rescue ...]+ [ensure ...] end`。
+    # rescue/ensure のいずれかは必須 (両方欠落はパースエラー)。
+    # AST: :begin_rescue (left=body, right=first :rescue_clause チェーン or nil, operand=ensure body or nil)
+    def parse_begin_rescue
+      @cur_token = next_token   # consume `begin`
+      skip_newlines
+      body = parse_block_seq(BLOCK_SEQ_MODE_DO_END)
+      rescues = parse_rescue_chain
+      ensure_body = nil
+      if @cur_token.kind == TokenKind::KW_ENSURE
+        @cur_token = next_token
+        skip_newlines
+        ensure_body = parse_block_seq(BLOCK_SEQ_MODE_DO_END)
+      end
+      if rescues.nil? && ensure_body.nil?
+        raise "Parse error: line #{@cur_token.line}: begin には rescue または ensure が必要です"
+      end
+      expect(TokenKind::KW_END)
+      ASTNode.new(:begin_rescue, 0, false, :nop, body, rescues, ensure_body)
+    end
+
+    # `rescue [Class] [=> name]` 節の連鎖。最後の節の node_right は nil。
+    # AST: :rescue_clause (int_value=class_packed, 0=catch-all,
+    #        left=body, right=次の節 or nil, operand=:rescue_bind 子ノード or nil)
+    def parse_rescue_chain
+      if @cur_token.kind != TokenKind::KW_RESCUE
+        return nil
+      end
+      @cur_token = next_token   # consume `rescue`
+      class_packed = 0
+      if @cur_token.kind == TokenKind::IDENT
+        class_packed = @cur_token.int_value
+        @cur_token = next_token
+      end
+      bind_node = nil
+      if @cur_token.kind == TokenKind::HASH_ROCKET
+        @cur_token = next_token
+        if @cur_token.kind != TokenKind::IDENT
+          raise "Parse error: line #{@cur_token.line}: => の後に束縛変数名が必要です"
+        end
+        bind_packed = @cur_token.int_value
+        @cur_token = next_token
+        bind_node = ASTNode.new(:rescue_bind, bind_packed, false, :nop, nil, nil, nil)
+      end
+      skip_newlines
+      body = parse_block_seq(BLOCK_SEQ_MODE_DO_END)
+      rest = parse_rescue_chain
+      ASTNode.new(:rescue_clause, class_packed, false, :nop, body, rest, bind_node)
+    end
+
+    # `raise expr` を 1 つ読む。`raise` 単独 (再 raise) は Stage 3e スコープ外。
+    def parse_raise
+      @cur_token = next_token   # consume `raise`
+      arg = parse_expression
+      ASTNode.new(:raise, 0, false, :nop, arg, nil, nil)
     end
 
     # ============================================================
@@ -1424,10 +1546,140 @@ module Setsunaruby
         compile_ivar_ref(node)
       elsif k == :ivar_assign
         compile_ivar_assign(node)
+      elsif k == :begin_rescue
+        compile_begin_rescue(node)
+      elsif k == :raise
+        compile_raise(node)
       else
         raise "Compiler bug: unknown expression kind #{k}"
       end
       nil
+    end
+
+    # Stage 3e: `raise expr` を bytecode に展開。VM 側 RAISE が値を 1 つ pop し、
+    # 文字列なら StandardError でラップ、heap instance ならそのまま例外として伝播する。
+    # raise の値は通常は破棄される (rescue されれば rescue body の値、unhandled なら exit) が、
+    # 構文上 expression のため compile_stmt の POP 対称性を維持するために PUSH_NIL も emit。
+    def compile_raise(node)
+      mark_current_method_jit_unsafe
+      compile_expr(node.node_left)
+      @bytecode.push(Op::RAISE)
+      # RAISE は到達した時点で unwind するので RAISE 後の命令は到達しないが、
+      # コンパイラ側のスタック整合 (compile_expr は値 1 つを残す契約) を保つため PUSH_NIL を置く。
+      @bytecode.push(Op::PUSH_NIL)
+      nil
+    end
+
+    # 例外関連 opcode は HIR/LIR でサポートしていないため、現在の method を JIT 対象外にする。
+    # method 外 (= top-level / class body 直下) で呼ばれた場合は @cur_method_idx_for_jit が -1
+    # なので no-op (top-level は最初から JIT 走査されない)。
+    def mark_current_method_jit_unsafe
+      if @cur_method_idx_for_jit >= 0
+        @jit_call_counts[@cur_method_idx_for_jit] = JIT_HOT_THRESHOLD
+      end
+      nil
+    end
+
+    # Stage 3e: `begin BODY [rescue ...]+ [ensure E] end` を 3 セクションの bytecode に展開。
+    # レイアウト:
+    #   PUSH_HANDLER catch
+    #   <body>; POP                   ; 成功時: body の値を捨てる
+    #   POP_HANDLER
+    #   JUMP ensure
+    #   catch:                          ; rescue 節がなければ catch == ensure に縮退
+    #     for each rescue:
+    #       CHECK_EXCEPTION_CLASS C   ; -1 = catch-all
+    #       JUMP_IF_FALSE next_rescue
+    #         [LOAD_EXCEPTION; STORE_LOCAL bind; POP] (bind がある場合のみ)
+    #         CLEAR_EXCEPTION
+    #         <rescue body>; POP
+    #         JUMP ensure
+    #       next_rescue:
+    #     (どの rescue にもマッチしない: @exception を残したまま fall through)
+    #   ensure:
+    #     <ensure body>; POP          ; ensure 節がなければスキップ
+    #     RERAISE_OR_END               ; @exception 残存なら再 unwind、無ければ次へ
+    #   end_label:
+    #     PUSH_NIL                     ; begin/rescue 全体の値は nil
+    def compile_begin_rescue(node)
+      mark_current_method_jit_unsafe
+      body        = node.node_left
+      rescues     = node.node_right
+      ensure_body = node.node_operand
+
+      @bytecode.push(Op::PUSH_HANDLER)
+      catch_pos = @bytecode.length
+      @bytecode.push(0x80); @bytecode.push(0x80); @bytecode.push(0x00)
+
+      compile_block(body)
+      @bytecode.push(Op::POP)
+      @bytecode.push(Op::POP_HANDLER)
+      jump_to_ensure_success = emit_jump(Op::JUMP)
+
+      # catch_pc target = rescue chain の先頭 (rescue が無ければ ensure 先頭と同じ)。
+      patch_jump(catch_pos, @bytecode.length)
+      end_jumps = compile_rescue_chain(rescues)
+
+      # ensure_pc target: success path の JUMP と各 rescue マッチ後の JUMP を patch。
+      ensure_pc = @bytecode.length
+      patch_jump(jump_to_ensure_success, ensure_pc)
+      i = 0
+      while i < end_jumps.length
+        patch_jump(end_jumps[i], ensure_pc)
+        i += 1
+      end
+
+      if ensure_body != nil
+        compile_block(ensure_body)
+        @bytecode.push(Op::POP)
+      end
+      @bytecode.push(Op::RERAISE_OR_END)
+
+      # begin/rescue/ensure 式自体の値は nil (rescue body の値を返す形は Stage 3e スコープ外)。
+      @bytecode.push(Op::PUSH_NIL)
+      nil
+    end
+
+    # rescue 節のチェーンを順次 emit。各節はマッチ時に ensure へ JUMP する placeholder を
+    # IntArray (end_jumps) に貯めて返す。呼び出し側が ensure_pc 確定後に一括 patch する。
+    # 引数 cur は ASTNode (:rescue_clause) または nil。spinel 推論を ASTNode にロックさせる
+    # ために最初から cur.node_kind を 1 度参照する: assignment 経由のみだと mrb_int に
+    # 推論される。
+    def compile_rescue_chain(cur)
+      end_jumps = []
+      while cur != nil
+        # ここで cur.node_int_value を読む時点で cur は ASTNode に確定する。
+        class_packed = cur.node_int_value
+        @bytecode.push(Op::CHECK_EXCEPTION_CLASS)
+        if class_packed == 0
+          encode_signed(-1)
+        else
+          cls_idx = find_class_by_packed(class_packed)
+          if cls_idx < 0
+            raise "Compile error: line #{@cur_token.line}: rescue で参照したクラスが未定義です"
+          end
+          encode_signed(cls_idx)
+        end
+        skip_pos = emit_jump(Op::JUMP_IF_FALSE)
+
+        bind_node = cur.node_operand
+        if bind_node != nil
+          @bytecode.push(Op::LOAD_EXCEPTION)
+          slot = declare_local(bind_node.node_int_value)
+          @bytecode.push(Op::STORE_LOCAL)
+          encode_signed(slot)
+          @bytecode.push(Op::POP)
+        end
+        @bytecode.push(Op::CLEAR_EXCEPTION)
+
+        compile_block(cur.node_left)
+        @bytecode.push(Op::POP)
+        end_jumps.push(emit_jump(Op::JUMP))
+
+        patch_jump(skip_pos, @bytecode.length)
+        cur = cur.node_right
+      end
+      end_jumps
     end
 
     # `yield expr` または `yield`。argc は 0 or 1 (Stage 3c.2 制約)。
@@ -1822,6 +2074,9 @@ module Setsunaruby
       saved_scope_base = @scope_base
       @scope_base = @local_starts.length
       @in_method = true
+      # Stage 3e: raise/begin が出てきたら現在の method を JIT skip にするため、現 m_idx を退避。
+      saved_method_idx_for_jit = @cur_method_idx_for_jit
+      @cur_method_idx_for_jit = m_idx
 
       # パラメータを slot 0..argc-1 に登録。declare_local は @scope_base 相対の
       # slot idx (= 0..argc-1) を返す。
@@ -1843,6 +2098,7 @@ module Setsunaruby
       end
       @scope_base = saved_scope_base
       @in_method = false
+      @cur_method_idx_for_jit = saved_method_idx_for_jit
 
       patch_jump(skip_jump_pos, @bytecode.length)
       # def 文自体の値は nil (compile_stmt の不変条件「1 値残す」を維持)。
@@ -2074,18 +2330,26 @@ module Setsunaruby
     # bytes_eq が user source 側の同名識別子と正しく match する。
     def init_bytes_with_builtin_prefix(src)
       @bytes = []
-      i = 0
-      while i < KW_LENGTH_BYTES.length
-        @bytes.push(KW_LENGTH_BYTES[i])
-        i += 1
-      end
+      append_bytes(KW_LENGTH_BYTES)
+      append_bytes(KW_STDERR_BYTES)
+      append_bytes(KW_MESSAGE_BYTES)
+      append_bytes(KW_INITIALIZE_BYTES)
       src_bytes = src.bytes
       i = 0
       while i < src_bytes.length
         @bytes.push(src_bytes[i])
         i += 1
       end
-      @lex_pos = KW_LENGTH_BYTES.length
+      @lex_pos = PREFIX_TOTAL_LEN
+      nil
+    end
+
+    def append_bytes(arr)
+      i = 0
+      while i < arr.length
+        @bytes.push(arr[i])
+        i += 1
+      end
       nil
     end
 
@@ -2102,31 +2366,82 @@ module Setsunaruby
         i += 1
       end
 
-      # `Array#length` の name は run_string の init_bytes_with_builtin_prefix が
-      # @bytes 先頭に置いた prefix の offset 0..len-1 に存在する。
-      length_packed = (0 << 16) | KW_LENGTH_BYTES.length
+      # Stage 3e: StandardError を名前付きで pre-register。
+      # idx は BUILTIN_CLASS_STDERR (= 3) に決まる (BUILTIN_CLASS_COUNT 個 anonymous の後ろ)。
+      # ユーザは `raise "msg"` で暗黙にこのクラスのインスタンスを発生させ、
+      # `class MyError < StandardError` で継承できる。
+      stderr_packed = pack_prefix_name(PREFIX_STDERR_OFFSET, KW_STDERR_BYTES.length)
+      stderr_idx    = declare_class(stderr_packed, -1)
+      # @message ivar (slot 0) を StandardError 自身に登録。
+      @class_ivar_name_starts.push(PREFIX_MESSAGE_OFFSET)
+      @class_ivar_name_lens.push(KW_MESSAGE_BYTES.length)
+      @class_ivar_counts[stderr_idx] = 1
 
       # ユーザコード実行は JUMP の patch target から始まるので、その間に builtin の本体を
       # 詰める。method_pc は @bytecode 上の現在位置を記録。
       skip = emit_jump(Op::JUMP)
+      saved_class = @cur_class
 
       # Array#length: arity=0, locals=0, body = LOAD_SELF; ARRAY_LEN; RETURN
-      saved_class = @cur_class
+      length_packed = pack_prefix_name(PREFIX_LENGTH_OFFSET, KW_LENGTH_BYTES.length)
+      register_builtin_method_array_length(length_packed)
+
+      # StandardError#initialize(msg): @message = msg
+      init_packed = pack_prefix_name(PREFIX_INIT_OFFSET, KW_INITIALIZE_BYTES.length)
+      register_builtin_method_stderr_initialize(stderr_idx, init_packed)
+
+      # StandardError#message: @message を返す
+      message_packed = pack_prefix_name(PREFIX_MESSAGE_OFFSET, KW_MESSAGE_BYTES.length)
+      register_builtin_method_stderr_message(stderr_idx, message_packed)
+
+      @cur_class = saved_class
+      patch_jump(skip, @bytecode.length)
+      nil
+    end
+
+    def pack_prefix_name(offset, len)
+      (offset << 16) | len
+    end
+
+    def register_builtin_method_array_length(name_packed)
       @cur_class = BUILTIN_CLASS_ARRAY
       method_pc = @bytecode.length
-      m_idx = declare_method(length_packed, method_pc, 0)
+      m_idx = declare_method(name_packed, method_pc, 0)
       @bytecode.push(Op::LOAD_SELF)
       @bytecode.push(Op::ARRAY_LEN)
       @bytecode.push(Op::RETURN)
-      @method_local_counts[m_idx] = 0
-      @method_body_ends[m_idx]    = @bytecode.length
-      @class_method_counts[BUILTIN_CLASS_ARRAY] = @class_method_counts[BUILTIN_CLASS_ARRAY] + 1
-      # builtin method は JIT hot 検出の対象外にする (= 既に閾値到達済みとして扱う)。
-      # body は数命令で JIT の利得もないため。
-      @jit_call_counts[m_idx] = JIT_HOT_THRESHOLD
-      @cur_class = saved_class
+      finalize_builtin_method(m_idx, BUILTIN_CLASS_ARRAY, 0)
+      nil
+    end
 
-      patch_jump(skip, @bytecode.length)
+    def register_builtin_method_stderr_initialize(stderr_idx, name_packed)
+      @cur_class = stderr_idx
+      method_pc = @bytecode.length
+      m_idx = declare_method(name_packed, method_pc, 1)
+      @bytecode.push(Op::LOAD_LOCAL); encode_signed(0)   # msg
+      @bytecode.push(Op::STORE_IVAR); encode_signed(0)   # @message slot 0
+      @bytecode.push(Op::RETURN)
+      finalize_builtin_method(m_idx, stderr_idx, 1)
+      nil
+    end
+
+    def register_builtin_method_stderr_message(stderr_idx, name_packed)
+      @cur_class = stderr_idx
+      method_pc = @bytecode.length
+      m_idx = declare_method(name_packed, method_pc, 0)
+      @bytecode.push(Op::LOAD_IVAR); encode_signed(0)   # @message slot 0
+      @bytecode.push(Op::RETURN)
+      finalize_builtin_method(m_idx, stderr_idx, 0)
+      nil
+    end
+
+    # body emit 後の共通後処理: local count / body_end / class method count / JIT skip。
+    def finalize_builtin_method(m_idx, class_idx, local_count)
+      @method_local_counts[m_idx] = local_count
+      @method_body_ends[m_idx]    = @bytecode.length
+      @class_method_counts[class_idx] = @class_method_counts[class_idx] + 1
+      # builtin method は JIT hot 検出の対象外 (短くて利得が無い)。
+      @jit_call_counts[m_idx] = JIT_HOT_THRESHOLD
       nil
     end
 
@@ -2535,6 +2850,20 @@ module Setsunaruby
           exec_store_ivar
         elsif op == Op::RETURN
           exec_return
+        elsif op == Op::PUSH_HANDLER
+          exec_push_handler
+        elsif op == Op::POP_HANDLER
+          exec_pop_handler
+        elsif op == Op::RAISE
+          exec_raise
+        elsif op == Op::LOAD_EXCEPTION
+          @stack.push(@exception)
+        elsif op == Op::CLEAR_EXCEPTION
+          @exception = ObjectVal::NIL_VAL
+        elsif op == Op::CHECK_EXCEPTION_CLASS
+          exec_check_exception_class
+        elsif op == Op::RERAISE_OR_END
+          exec_reraise_or_end
         elsif op == Op::HALT
           return nil
         else
@@ -3104,6 +3433,14 @@ module Setsunaruby
     # total_ivar_count (= 親祖先 + 自分) を使うことで継承された ivar の slot も確保される。
     def exec_instance_new
       class_idx = decode_signed
+      @stack.push(alloc_instance(class_idx))
+      nil
+    end
+
+    # 指定クラスのインスタンスを 1 つ確保し obj_id を返す (@stack には push しない)。
+    # ivar slot は total_ivar_count (親 chain 込み) ぶんを NIL_VAL で初期化する。
+    # exec_instance_new と Stage 3e の wrap_str_in_stderr (raise "string" の暗黙ラップ) で共有する。
+    def alloc_instance(class_idx)
       ivar_count = total_ivar_count(class_idx)
       ivar_start = @instance_ivar_pool.length
       i = 0
@@ -3111,8 +3448,7 @@ module Setsunaruby
         @instance_ivar_pool.push(ObjectVal::NIL_VAL)
         i += 1
       end
-      @stack.push(alloc_heap_slot(HEAP_KIND_INSTANCE, ivar_start, ivar_count, class_idx))
-      nil
+      alloc_heap_slot(HEAP_KIND_INSTANCE, ivar_start, ivar_count, class_idx)
     end
 
     # Stage 3d.1: obj.method(args) の動的ディスパッチ。
@@ -3219,6 +3555,151 @@ module Setsunaruby
       idx = @cur_self >> 3
       v = @stack[@stack.length - 1]   # peek (代入は値を残す)
       @instance_ivar_pool[@heap_starts[idx] + slot] = v
+      nil
+    end
+
+    # Stage 3e: PUSH_HANDLER は begin の入口で例外ハンドラを 1 つ登録する。
+    # operand は catch_pc の 3-byte SLEB 相対 offset。decode_signed_3 後の @pc を base に
+    # 絶対 PC を計算するので、`@pc + rel == target_abs` が成立する
+    # (patch_jump がそのように rel を計算しているため)。
+    def exec_push_handler
+      catch_rel = decode_signed_3
+      catch_abs = @pc + catch_rel
+      @handler_catch_pcs.push(catch_abs)
+      @handler_stack_depths.push(@stack.length)
+      @handler_cfp_depths.push(@cfp_pcs.length)
+      @handler_yield_depths.push(@yield_pcs.length)
+      nil
+    end
+
+    def exec_pop_handler
+      @handler_yield_depths.pop
+      @handler_cfp_depths.pop
+      @handler_stack_depths.pop
+      @handler_catch_pcs.pop
+      nil
+    end
+
+    # Stage 3e: RAISE は stack top を例外として取り、必要なら StandardError でラップ、
+    # ハンドラスタックの top に向けて unwind する (cfp / yield / stack 全てを当時の深さに戻す)。
+    # ハンドラが無ければ Ruby レベルの raise で plain な abort に到達する (CRuby/spinel 共通)。
+    def exec_raise
+      v = @stack.pop
+      @exception = wrap_as_exception(v)
+      unwind_to_handler
+      nil
+    end
+
+    # heap String → StandardError ラップ。heap Instance はそのまま。それ以外は型エラー。
+    def wrap_as_exception(v)
+      if heap_str?(v)
+        wrap_str_in_stderr(v)
+      elsif heap_obj?(v) && @heap_kind[v >> 3] == HEAP_KIND_INSTANCE
+        v
+      else
+        raise "TypeError: raise の引数は String または Exception instance のみ可能です"
+      end
+    end
+
+    # 文字列を @message として持つ StandardError instance を直接構築する。
+    # initialize 呼び出しを経由せず alloc_instance で確保したあと slot 0 に直接書く
+    # (StandardError#initialize と等価だが VM-internal の最短パス)。
+    def wrap_str_in_stderr(str_id)
+      obj_id = alloc_instance(BUILTIN_CLASS_STDERR)
+      @instance_ivar_pool[@heap_starts[obj_id >> 3]] = str_id   # @message slot 0
+      obj_id
+    end
+
+    def unwind_to_handler
+      if @handler_catch_pcs.length == 0
+        unhandled_exception_abort
+      end
+      stack_depth = @handler_stack_depths.pop
+      cfp_depth   = @handler_cfp_depths.pop
+      yield_depth = @handler_yield_depths.pop
+      catch_abs   = @handler_catch_pcs.pop
+      while @cfp_pcs.length > cfp_depth
+        # @locals も対応スコープ分破棄。pop_call_frame は @cur_base を caller のものに戻すので、
+        # その前に「現フレームのローカル領域」を捨てる必要がある。
+        while @locals.length > @cur_base
+          @locals.pop
+        end
+        pop_call_frame
+      end
+      while @yield_pcs.length > yield_depth
+        @yield_bases.pop
+        @yield_pcs.pop
+      end
+      while @stack.length > stack_depth
+        @stack.pop
+      end
+      @pc = catch_abs
+      nil
+    end
+
+    # ハンドラが無い状態で raise が起きたらプロセスを abort させる (Ruby レベル raise で stderr へ流す)。
+    def unhandled_exception_abort
+      cls_idx = class_of_value(@exception)
+      cls_name = bytes_to_ruby(@class_name_starts[cls_idx], @class_name_lens[cls_idx])
+      msg_val = ObjectVal::NIL_VAL
+      # @message は StandardError 由来なら slot 0 にある。継承先 (own ivars 0) でも instance の
+      # @heap_lens が total_ivar_count を反映しているのでそれで存在を判定する。
+      idx = @exception >> 3
+      if @heap_lens[idx] > 0
+        msg_val = @instance_ivar_pool[@heap_starts[idx]]
+      end
+      msg_str = ""
+      if heap_str?(msg_val)
+        msg_str = heap_str_to_ruby(msg_val)
+      end
+      raise "#{cls_name}: #{msg_str}"
+    end
+
+    # @bytes 上の (start, len) を Ruby String 化。class 名/ivar 名の表示用。
+    def bytes_to_ruby(start, len)
+      result = ""
+      i = 0
+      while i < len
+        result = result + @bytes[start + i].chr
+        i += 1
+      end
+      result
+    end
+
+    # CHECK_EXCEPTION_CLASS class_idx — operand が -1 のときは catch-all (常に true)。
+    # それ以外のときは @exception の class が class_idx もしくはその先祖クラスかどうかを判定する
+    # (Ruby の rescue 節と同じ is_a? semantics、Stage 3d.4 で導入した親 chain を walk)。
+    def exec_check_exception_class
+      target_idx = decode_signed
+      matched = target_idx < 0 || is_subclass?(class_of_value(@exception), target_idx)
+      if matched
+        @stack.push(ObjectVal::TRUE_VAL)
+      else
+        @stack.push(ObjectVal::FALSE_VAL)
+      end
+      nil
+    end
+
+    # child_idx が ancestor_idx と等しいか、その先祖チェーンに含まれるかを判定する。
+    # @class_parent_idx を walk するだけのシンプルなヘルパで、ancestor_idx == child_idx も
+    # true を返す (=== Class semantics と同じ)。
+    def is_subclass?(child_idx, ancestor_idx)
+      cur = child_idx
+      while cur >= 0
+        if cur == ancestor_idx
+          return true
+        end
+        cur = @class_parent_idx[cur]
+      end
+      false
+    end
+
+    # ensure 末尾。@exception が残っていれば再度 unwind (上位ハンドラへ伝播)、
+    # 残っていなければそのまま次の命令 (PUSH_NIL → end_label) へ進む。
+    def exec_reraise_or_end
+      if @exception != ObjectVal::NIL_VAL
+        unwind_to_handler
+      end
       nil
     end
 

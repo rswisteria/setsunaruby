@@ -7,7 +7,7 @@ Ruby 文法を持つ、スタックマシン型プログラミング言語の処
 「刹那」(10⁻¹⁸) から命名。mruby / nanoruby / picoruby に続く、
 さらに小さな Ruby 系列という位置付け。
 
-## 現状: Stage 0 / 0.5 / 1 / 2 / 3a / 3b / 3c.1 / 3c.2 / 3c.3 / 3d.1 / 3d.2 / 3d.3 / 3d.4 / JIT-1 / JIT-2 / JIT-3a / JIT-3b1 / JIT-3b2 / JIT-3b3 / JIT-3c / JIT-4 (案 A) 完了
+## 現状: Stage 0 / 0.5 / 1 / 2 / 3a / 3b / 3c.1 / 3c.2 / 3c.3 / 3d.1 / 3d.2 / 3d.3 / 3d.4 / 3e / JIT-1 / JIT-2 / JIT-3a / JIT-3b1 / JIT-3b2 / JIT-3b3 / JIT-3c / JIT-4 (案 A) 完了
 
 スタックマシン上で **再帰 `fib(20)` / アッカーマン / tarai が CRuby + spinel AOT 両方で動作**。
 
@@ -75,7 +75,7 @@ make test-aot
 make test-all
 ```
 
-(テスト件数は `make test-cruby` 出力で確認できる。Stage 3a +38 件、3b +42 件、3c.1 +24 件、3c.2 +15 件、3c.3 +24 件、3d.1 +22 件、3d.2 +15 件、3d.3 +17 件、3d.4 +14 件。)
+(テスト件数は `make test-cruby` 出力で確認できる。Stage 3a +38 件、3b +42 件、3c.1 +24 件、3c.2 +15 件、3c.3 +24 件、3d.1 +22 件、3d.2 +15 件、3d.3 +17 件、3d.4 +14 件、3e +21 件。)
 
 ## ベンチマーク
 
@@ -239,7 +239,8 @@ Symbol/sp_sym を経由すると spinel の Token フィールド型推論が崩
 | 3d.2 | `initialize` + 引数付き `.new(args)` | ✅ 完了 |
 | 3d.3 | 一般 method dispatch (Array#length を builtin class table 経由に) | ✅ 完了 |
 | 3d.4 | 継承 (`class B < A`、method/ivar/initialize 継承) | ✅ 完了 |
-| 3d.5〜3e | each/times/map の class table 化 / `super` / 例外 | 未着手 |
+| 3e | 例外処理 (`begin/rescue/ensure`、`raise`、StandardError builtin) | ✅ 完了 |
+| 3d.5 | each/times/map の class table 化 / `super` | 未着手 |
 | ∞ | 自己ホスト (setsunaruby を setsunaruby で動かす) | 究極目標 |
 
 ## ディレクトリ構成
@@ -268,7 +269,9 @@ Symbol/sp_sym を経由すると spinel の Token フィールド型推論が崩
 │   ├── yield.rb              # Stage 3c.2: 一般 yield / 自前 each / 自前 map のショーケース
 │   ├── map.rb                # Stage 3c.3: map / 中括弧 / block_given? のショーケース
 │   ├── class.rb              # Stage 3d.1: クラス / @var / self / .new のショーケース
-│   └── initialize.rb         # Stage 3d.2: initialize + 引数付き .new のショーケース
+│   ├── initialize.rb         # Stage 3d.2: initialize + 引数付き .new のショーケース
+│   ├── inherit.rb            # Stage 3d.4: 継承 (class B < A) のショーケース
+│   └── exception.rb          # Stage 3e: begin/rescue/ensure + raise のショーケース
 ├── test/
 │   ├── test_stage0.rb        # CRuby Stage 0 テスト (38件)
 │   ├── test_stage1.rb        # CRuby Stage 1 テスト (28件)
@@ -282,8 +285,9 @@ Symbol/sp_sym を経由すると spinel の Token フィールド型推論が崩
 │   ├── test_stage3d2.rb      # CRuby Stage 3d.2 テスト (15件)
 │   ├── test_stage3d3.rb      # CRuby Stage 3d.3 テスト (17件)
 │   ├── test_stage3d4.rb      # CRuby Stage 3d.4 テスト (14件)
+│   ├── test_stage3e.rb       # CRuby Stage 3e テスト (21件)
 │   ├── test_stage_jit.rb     # CRuby JIT-1/2/3a/3b1/3b2/3b3/3c/4 テスト (108件)
-│   └── test_aot.rb           # AOT テスト (Stage 0/1/2/3a/3b/3c + JIT)
+│   └── test_aot.rb           # AOT テスト (Stage 0/1/2/3a/3b/3c/3d/3e + JIT)
 ├── setsunaruby               # spinel ビルド成果物 (gitignore)
 └── Makefile
 ```

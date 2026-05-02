@@ -302,6 +302,20 @@ assert_output(File.read(File.expand_path('../examples/inherit.rb', __dir__)),
               "examples/inherit.rb")
 assert_fails("class B < Undef\nend\n", "INH: 未定義の親")
 
+# ---- Stage 3e: 例外処理 ----
+assert_output("begin\n  raise \"x\"\nrescue => e\n  puts e.message\nend\n",
+              "x\n", "EXC: raise + rescue")
+assert_output("class E < StandardError\nend\nbegin\n  raise E.new(\"y\")\nrescue StandardError => e\n  puts e.message\nend\n",
+              "y\n", "EXC: 継承クラスを親で捕捉")
+assert_output("def f\n  begin\n    raise \"a\"\n  ensure\n    puts \"e\"\n  end\nend\nbegin\n  f\nrescue => e\n  puts e.message\nend\n",
+              "e\na\n", "EXC: ensure 後に再 raise")
+assert_output(File.read(File.expand_path('../examples/exception.rb', __dir__)),
+              "boom\nhello\nvalidation failed: input is empty\nwork\ncleanup\ncleanup\ngot: boom\n1\ninterrupted: stop at 2\nauth: forbidden\n",
+              "examples/exception.rb")
+assert_fails("raise \"unhandled\"\n", "EXC: 未捕捉 raise はプロセスを abort")
+assert_fails("begin\n  raise \"x\"\nrescue Undef\n  nil\nend\n", "EXC: 未定義クラスを rescue")
+assert_fails("begin\n  1\nend\n", "EXC: rescue/ensure なしの begin はパースエラー")
+
 # ---- エラー系 ----
 assert_fails(%(puts "a" + 1\n),  "STR: + 型エラー")
 assert_fails(%(puts 1 << 1\n),   "STR: << は (string|array) のみ (Fixnum 不可)")
