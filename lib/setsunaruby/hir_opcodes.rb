@@ -56,6 +56,9 @@ module Setsunaruby
     LOAD_IVAR    = 0x1A3   # op0 = ivar_slot
     STORE_IVAR   = 0x1A4   # op0 = ivar_slot, op1 = value (hir_id)
 
+    # Stage 3d.2: スタック top の duplicate。
+    DUP = 0x1A5            # op0 = value (hir_id), 結果は同 hir_id を再 push (= sstack 上は同じ)
+
     # JIT-3c: 型特化命令。GUARD_FIXNUM は値が Fixnum でなければ side exit。
     # FIXNUM_* は Fixnum 入力前提で動作する特化命令。
     GUARD_FIXNUM = 0x150    # op0 = guarded value (hir_id)

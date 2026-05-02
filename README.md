@@ -7,7 +7,7 @@ Ruby 文法を持つ、スタックマシン型プログラミング言語の処
 「刹那」(10⁻¹⁸) から命名。mruby / nanoruby / picoruby に続く、
 さらに小さな Ruby 系列という位置付け。
 
-## 現状: Stage 0 / 0.5 / 1 / 2 / 3a / 3b / 3c.1 / 3c.2 / 3c.3 / 3d.1 / JIT-1 / JIT-2 / JIT-3a / JIT-3b1 / JIT-3b2 / JIT-3b3 / JIT-3c / JIT-4 (案 A) 完了
+## 現状: Stage 0 / 0.5 / 1 / 2 / 3a / 3b / 3c.1 / 3c.2 / 3c.3 / 3d.1 / 3d.2 / JIT-1 / JIT-2 / JIT-3a / JIT-3b1 / JIT-3b2 / JIT-3b3 / JIT-3c / JIT-4 (案 A) 完了
 
 スタックマシン上で **再帰 `fib(20)` / アッカーマン / tarai が CRuby + spinel AOT 両方で動作**。
 
@@ -48,7 +48,8 @@ Ruby 文法を持つ、スタックマシン型プログラミング言語の処
 - **識別子末尾の `?` / `!`** (lexer 拡張、Ruby 同様の述語/破壊的命名規則)
 - **`class Name ... end`** (トップレベル定義のみ、再定義禁止)
 - **インスタンスメソッド `def name(params)`** (クラス内のみ、`self` 経由で互いに呼び出し可)
-- **`Name.new`** (引数なし、`initialize` は Stage 3d.2 で導入予定)
+- **`Name.new(args)`** (引数を `initialize` に渡す。`initialize` 未定義時は引数なしのみ可)
+- **`def initialize(...)`** (`.new` から自動呼び出し、戻り値は無視されインスタンスが返る)
 - **`obj.method(args)` 動的ディスパッチ** (受信者の class を runtime で解決)
 - **`@var` インスタンス変数** (read/write、未代入は nil)
 - **`self` キーワード** (現フレームの receiver を返す)
@@ -71,7 +72,7 @@ make test-aot
 make test-all
 ```
 
-(テスト件数は `make test-cruby` 出力で確認できる。Stage 3a +38 件、3b +42 件、3c.1 +24 件、3c.2 +15 件、3c.3 +24 件、3d.1 +22 件。)
+(テスト件数は `make test-cruby` 出力で確認できる。Stage 3a +38 件、3b +42 件、3c.1 +24 件、3c.2 +15 件、3c.3 +24 件、3d.1 +22 件、3d.2 +15 件。)
 
 ## ベンチマーク
 
@@ -156,6 +157,7 @@ CRuby の `VALUE` を踏襲したタグ付き即値方式。
 | LOAD_IVAR | 0x4F | SLEB128 ivar_slot | self の @var 値を push |
 | STORE_IVAR | 0x50 | SLEB128 ivar_slot | スタック top を self の @var に書く (top は保持) |
 | CALL_METHOD_WITH_BLOCK | 0x51 | name_packed + argc + block_pc + block_arity | block 付きの動的ディスパッチ |
+| DUP | 0x52 | – | スタック top を複製 (Stage 3d.2 で `.new` 展開に使用) |
 | HALT | 0xFF | – | 終了 |
 
 `+` (ADD) と `==` (EQ) は VM で多相化されており、両辺がヒープ String の場合は文字列
@@ -231,7 +233,8 @@ Symbol/sp_sym を経由すると spinel の Token フィールド型推論が崩
 | 3c.2 | 一般 `yield` / ユーザ定義のブロック取り method | ✅ 完了 |
 | 3c.3 | `block_given?` / `Array#map` / `{ \| \| }` 中括弧構文 / 識別子末尾 `?`/`!` | ✅ 完了 |
 | 3d.1 | クラス + インスタンスメソッド + `@var` + `self` + `.new` (引数なし) | ✅ 完了 |
-| 3d.2〜3e | `initialize` / 一般 method dispatch / 継承 / 例外 | 未着手 |
+| 3d.2 | `initialize` + 引数付き `.new(args)` | ✅ 完了 |
+| 3d.3〜3e | 一般 method dispatch / 継承 / 例外 | 未着手 |
 | ∞ | 自己ホスト (setsunaruby を setsunaruby で動かす) | 究極目標 |
 
 ## ディレクトリ構成
@@ -259,7 +262,8 @@ Symbol/sp_sym を経由すると spinel の Token フィールド型推論が崩
 │   ├── each.rb               # Stage 3c.1: each / times ブロックのショーケース
 │   ├── yield.rb              # Stage 3c.2: 一般 yield / 自前 each / 自前 map のショーケース
 │   ├── map.rb                # Stage 3c.3: map / 中括弧 / block_given? のショーケース
-│   └── class.rb              # Stage 3d.1: クラス / @var / self / .new のショーケース
+│   ├── class.rb              # Stage 3d.1: クラス / @var / self / .new のショーケース
+│   └── initialize.rb         # Stage 3d.2: initialize + 引数付き .new のショーケース
 ├── test/
 │   ├── test_stage0.rb        # CRuby Stage 0 テスト (38件)
 │   ├── test_stage1.rb        # CRuby Stage 1 テスト (28件)
@@ -270,6 +274,7 @@ Symbol/sp_sym を経由すると spinel の Token フィールド型推論が崩
 │   ├── test_stage3c2.rb      # CRuby Stage 3c.2 テスト (15件)
 │   ├── test_stage3c3.rb      # CRuby Stage 3c.3 テスト (24件)
 │   ├── test_stage3d1.rb      # CRuby Stage 3d.1 テスト (22件)
+│   ├── test_stage3d2.rb      # CRuby Stage 3d.2 テスト (15件)
 │   ├── test_stage_jit.rb     # CRuby JIT-1/2/3a/3b1/3b2/3b3/3c/4 テスト (108件)
 │   └── test_aot.rb           # AOT テスト (Stage 0/1/2/3a/3b/3c + JIT)
 ├── setsunaruby               # spinel ビルド成果物 (gitignore)
