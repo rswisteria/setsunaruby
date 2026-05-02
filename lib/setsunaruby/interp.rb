@@ -2228,14 +2228,10 @@ module Setsunaruby
       ivar_slot_offset_for_class(class_idx) + own
     end
 
-    # Stage 3d.4: 当該 class の ivar slot の起点 (= 全祖先の ivar 数の合計)。
-    # 親なし (= -1) なら 0。親があれば total_ivar_count(parent)。
+    # Stage 3d.4: 当該 class の ivar slot の起点 (= 全祖先の ivar 数の合計、自分は含まない)。
+    # parent が -1 のとき total_ivar_count(-1) は while cur >= 0 が即偽になり 0 を返すので両用で安全。
     def ivar_slot_offset_for_class(class_idx)
-      parent = @class_parent_idx[class_idx]
-      if parent < 0
-        return 0
-      end
-      total_ivar_count(parent)
+      total_ivar_count(@class_parent_idx[class_idx])
     end
 
     # Stage 3d.4: class_idx および全祖先の ivar 数の合計 (= instance の slot 数)。
@@ -2243,7 +2239,7 @@ module Setsunaruby
       result = 0
       cur = class_idx
       while cur >= 0
-        result = result + @class_ivar_counts[cur]
+        result += @class_ivar_counts[cur]
         cur = @class_parent_idx[cur]
       end
       result
