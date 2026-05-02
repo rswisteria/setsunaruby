@@ -65,6 +65,16 @@ module Setsunaruby
     HEAP_KIND_ARRAY    = 2
     HEAP_KIND_INSTANCE = 3   # Stage 3d.1: ユーザ定義クラスのインスタンス
 
+    # Stage 3d.3: builtin class を class table の先頭 3 スロットに pre-register する。
+    # Fixnum / Array / String が `obj.method(args)` でメソッドディスパッチを受けるとき、
+    # class_of_value が以下の class_idx にマップする。これにより Array#length のような
+    # builtin メソッドを通常の class table 経由で resolve できるようになり、user 定義の
+    # 同名メソッドが衝突せず class_idx で区別される。
+    BUILTIN_CLASS_INTEGER = 0
+    BUILTIN_CLASS_ARRAY   = 1
+    BUILTIN_CLASS_STRING  = 2
+    BUILTIN_CLASS_COUNT   = 3
+
     # キーワードバイト列。spinel の sp_String / const char* 不整合を避けるため
     # 文字列ではなくバイト配列で直接比較する。
     KW_PUTS_BYTES  = [112, 117, 116, 115].freeze              # "puts"
@@ -239,8 +249,11 @@ module Setsunaruby
 
     def run_string(src)
       @src          = src
-      @bytes        = src.bytes
-      @lex_pos      = 0
+      # Stage 3d.3: builtin method 名 (= "length" など) のバイト列を @bytes 先頭に
+      # prepend する。lex_pos はこの prefix 後ろから開始するので、lexer は user source
+      # しか走査しない。@method_name_starts は prefix 内の offset を指すことで、
+      # find_method_in_class の bytes_eq が user source 側の同名識別子と正しく match する。
+      init_bytes_with_builtin_prefix(src)
       @line         = 1
       @bytecode     = []
       @stack        = []
@@ -319,6 +332,8 @@ module Setsunaruby
       @cur_class = -1
       @cfp_selfs = []
       @cur_self  = ObjectVal::NIL_VAL
+
+      register_builtin_classes_and_methods
 
       @cur_token = next_token
       while !at_end?
@@ -1494,14 +1509,12 @@ module Setsunaruby
         compile_expr(cur.node_left)
         cur = cur.node_operand
       end
-      if argc == 0 && method_name_is_length?(name_packed)
-        @bytecode.push(Op::ARRAY_LEN)
-      else
-        # Stage 3d.1: 一般 method dispatch。受信者の class を runtime で見て解決。
-        @bytecode.push(Op::CALL_METHOD)
-        encode_signed(name_packed)
-        encode_signed(argc)
-      end
+      # Stage 3d.1/3d.3: 一般 method dispatch。受信者の class を runtime で見て解決。
+      # length は Stage 3d.3 で builtin Array class の method として class table に乗ったので
+      # ここでの compile-time 特殊形式は不要 (CALL_METHOD で resolve される)。
+      @bytecode.push(Op::CALL_METHOD)
+      encode_signed(name_packed)
+      encode_signed(argc)
       nil
     end
 
@@ -1555,6 +1568,9 @@ module Setsunaruby
       emit_init_counter(idx_slot)
 
       # while _i < _recv.length
+      # 注: Stage 3d.3 から `.length` は CALL_METHOD 経由だが、each/map の inline 展開は
+      # perf-critical なため receiver=Array 前提で ARRAY_LEN を直接 emit する
+      # (Stage 3d.4 で each/map も class table 経由にするとこの carve-out も解消予定)。
       loop_start = @bytecode.length
       @bytecode.push(Op::LOAD_LOCAL); encode_signed(idx_slot)
       @bytecode.push(Op::LOAD_LOCAL); encode_signed(recv_slot)
@@ -1643,6 +1659,9 @@ module Setsunaruby
       @bytecode.push(Op::POP)
 
       # while _i < _recv.length
+      # 注: Stage 3d.3 から `.length` は CALL_METHOD 経由だが、each/map の inline 展開は
+      # perf-critical なため receiver=Array 前提で ARRAY_LEN を直接 emit する
+      # (Stage 3d.4 で each/map も class table 経由にするとこの carve-out も解消予定)。
       loop_start = @bytecode.length
       @bytecode.push(Op::LOAD_LOCAL); encode_signed(idx_slot)
       @bytecode.push(Op::LOAD_LOCAL); encode_signed(recv_slot)
@@ -1687,10 +1706,6 @@ module Setsunaruby
 
     # ローカル変数表と同様の packed (start<<16)|len 比較で "length" / "each" / "times" 判定。
     # KW_*_BYTES の定義はクラス先頭の KW_*_BYTES ブロックにある。
-    def method_name_is_length?(packed)
-      method_name_match?(packed, KW_LENGTH_BYTES)
-    end
-
     def method_name_is_each?(packed)
       method_name_match?(packed, KW_EACH_BYTES)
     end
@@ -1972,6 +1987,72 @@ module Setsunaruby
       compile_method_def(node)        # 末尾に PUSH_NIL を 1 つ残す
       @bytecode.push(Op::POP)         # その PUSH_NIL を消費
       @class_method_counts[@cur_class] = @class_method_counts[@cur_class] + 1
+      nil
+    end
+
+    # Stage 3d.3: @bytes に builtin method 名のバイト列を prepend し、@lex_pos を user
+    # source 開始位置 (= prefix 末尾) に設定する。
+    # 現状の prefix レイアウト (将来 builtin を増やしたらここに追加):
+    #   - "length"  offset 0, len 6 (KW_LENGTH_BYTES.length)
+    # @method_name_starts は prefix 内の offset を指すので、find_method_in_class の
+    # bytes_eq が user source 側の同名識別子と正しく match する。
+    def init_bytes_with_builtin_prefix(src)
+      @bytes = []
+      i = 0
+      while i < KW_LENGTH_BYTES.length
+        @bytes.push(KW_LENGTH_BYTES[i])
+        i += 1
+      end
+      src_bytes = src.bytes
+      i = 0
+      while i < src_bytes.length
+        @bytes.push(src_bytes[i])
+        i += 1
+      end
+      @lex_pos = KW_LENGTH_BYTES.length
+      nil
+    end
+
+    # Stage 3d.3: builtin class (Integer/Array/String) を class table 先頭 3 スロットに
+    # 匿名で登録 + Array#length を bytecode method として skip-jump パターンで emit する。
+    # ユーザコード開始 PC は skip target に揃う (ユーザの method PC 計算は影響を受けない)。
+    def register_builtin_classes_and_methods
+      i = 0
+      while i < BUILTIN_CLASS_COUNT
+        @class_name_starts.push(0)
+        @class_name_lens.push(0)
+        @class_method_starts.push(@method_name_starts.length)
+        @class_method_counts.push(0)
+        @class_ivar_starts.push(@class_ivar_name_starts.length)
+        @class_ivar_counts.push(0)
+        i += 1
+      end
+
+      # `Array#length` の name は run_string の init_bytes_with_builtin_prefix が
+      # @bytes 先頭に置いた prefix の offset 0..len-1 に存在する。
+      length_packed = (0 << 16) | KW_LENGTH_BYTES.length
+
+      # ユーザコード実行は JUMP の patch target から始まるので、その間に builtin の本体を
+      # 詰める。method_pc は @bytecode 上の現在位置を記録。
+      skip = emit_jump(Op::JUMP)
+
+      # Array#length: arity=0, locals=0, body = LOAD_SELF; ARRAY_LEN; RETURN
+      saved_class = @cur_class
+      @cur_class = BUILTIN_CLASS_ARRAY
+      method_pc = @bytecode.length
+      m_idx = declare_method(length_packed, method_pc, 0)
+      @bytecode.push(Op::LOAD_SELF)
+      @bytecode.push(Op::ARRAY_LEN)
+      @bytecode.push(Op::RETURN)
+      @method_local_counts[m_idx] = 0
+      @method_body_ends[m_idx]    = @bytecode.length
+      @class_method_counts[BUILTIN_CLASS_ARRAY] = @class_method_counts[BUILTIN_CLASS_ARRAY] + 1
+      # builtin method は JIT hot 検出の対象外にする (= 既に閾値到達済みとして扱う)。
+      # body は数命令で JIT の利得もないため。
+      @jit_call_counts[m_idx] = JIT_HOT_THRESHOLD
+      @cur_class = saved_class
+
+      patch_jump(skip, @bytecode.length)
       nil
     end
 
@@ -2954,7 +3035,9 @@ module Setsunaruby
       receiver  = @stack[self_pos]
       class_idx = class_of_value(receiver)
       if class_idx < 0
-        raise "NoMethodError: 受信者がユーザ定義クラスのインスタンスでありません"
+        # nil / true / false 等の class が未対応の値。Stage 3d.3 から Fixnum/Array/String は
+        # builtin class を持つので、ここに来るのはそれら以外 (= class_of_value が -1 を返す値)。
+        raise "NoMethodError: 受信者の class にこのメソッドはありません (nil/true/false 等は class 未対応)"
       end
       m_idx = find_method_in_class(class_idx, name_packed)
       if m_idx < 0
@@ -2983,16 +3066,28 @@ module Setsunaruby
       nil
     end
 
-    # 値の class を返す (-1 = ユーザ定義クラスのインスタンスでない)。
+    # 値の class を返す。Stage 3d.3 から builtin (Fixnum/Array/String) も class_idx を返す。
+    # ユーザ定義クラスは BUILTIN_CLASS_COUNT 以降の idx に登録される。
+    # nil/true/false 等は対応 builtin がまだないため -1 (NoMethodError)。
     def class_of_value(v)
+      if (v & 1) == 1
+        return BUILTIN_CLASS_INTEGER
+      end
       if (v & 7) != HEAP_TAG
         return -1
       end
       idx = v >> 3
-      if @heap_kind[idx] != HEAP_KIND_INSTANCE
-        return -1
+      kind = @heap_kind[idx]
+      if kind == HEAP_KIND_STRING
+        return BUILTIN_CLASS_STRING
       end
-      @heap_instance_class[idx]
+      if kind == HEAP_KIND_ARRAY
+        return BUILTIN_CLASS_ARRAY
+      end
+      if kind == HEAP_KIND_INSTANCE
+        return @heap_instance_class[idx]
+      end
+      -1
     end
 
     def exec_load_self
