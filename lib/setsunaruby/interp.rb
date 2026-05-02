@@ -226,6 +226,9 @@ module Setsunaruby
       @class_method_counts = []
       @class_ivar_starts   = []   # @class_ivar_name_* 上のこのクラスの ivar 開始 idx
       @class_ivar_counts   = []
+      # Stage 3d.4: 親クラスの class_idx (-1 = 親なし、Object 相当)。
+      # method dispatch / ivar slot lookup は parent chain を walk する。
+      @class_parent_idx    = []
       # クラスごとの ivar 名 packed テーブル (flat、@class_ivar_starts/_counts でスライス)。
       @class_ivar_name_starts = []
       @class_ivar_name_lens   = []
@@ -324,6 +327,7 @@ module Setsunaruby
       @class_method_counts = []
       @class_ivar_starts   = []
       @class_ivar_counts   = []
+      @class_parent_idx    = []
       @class_ivar_name_starts = []
       @class_ivar_name_lens   = []
       @method_class_idx       = []
@@ -709,8 +713,11 @@ module Setsunaruby
       end
     end
 
-    # `class Name body end` を 1 つ読む。Name は IDENT (Ruby と異なり大文字必須は強制しない)。
-    # 内部は `def` のみ許可 (Stage 3d.1)。トップレベル定義のみ。
+    # `class Name [< Parent] body end` を 1 つ読む。Name は IDENT。
+    # 内部は `def` のみ許可。トップレベル定義のみ。
+    # Stage 3d.4: 親クラス指定は `< IDENT`。親は事前定義必須 (1-pass コンパイラ制約)。
+    # 親情報は :class_parent_ref (node_int_value = parent name packed) として class_def の
+    # node_right に attach する。親なしのときは nil。
     def parse_class
       @cur_token = next_token   # consume `class`
       if @cur_token.kind != TokenKind::IDENT
@@ -718,10 +725,20 @@ module Setsunaruby
       end
       name_packed = @cur_token.int_value
       @cur_token = next_token
+      parent_node = nil
+      if @cur_token.kind == TokenKind::LT
+        @cur_token = next_token
+        if @cur_token.kind != TokenKind::IDENT
+          raise "Parse error: line #{@cur_token.line}: 親クラス名が必要です"
+        end
+        parent_packed = @cur_token.int_value
+        @cur_token = next_token
+        parent_node = ASTNode.new(:class_parent_ref, parent_packed, false, :nop, nil, nil, nil)
+      end
       skip_newlines
       body = parse_class_body
       expect(TokenKind::KW_END)
-      ASTNode.new(:class_def, name_packed, false, :nop, body, nil, nil)
+      ASTNode.new(:class_def, name_packed, false, :nop, body, parent_node, nil)
     end
 
     # クラス本体: 0 個以上の `def` を :seq でリンクリスト化。
@@ -1726,11 +1743,30 @@ module Setsunaruby
       method_name_match?(packed, KW_NEW_BYTES)
     end
 
-    # Stage 3d.2: クラスの initialize method を検索。見つからなければ -1。
+    # Stage 3d.2/3d.4: クラスの initialize method を検索。見つからなければ -1。
     # @bytes 上に "initialize" 文字列が常に含まれる保証はない (ユーザコードに登場しない場合)。
     # よって find_method_in_class (packed name 比較) は使えず、KW_INITIALIZE_BYTES との
-    # バイト比較で線形走査する。
+    # バイト比較で線形走査する。Stage 3d.4 から parent chain も辿る。
+    # find_method_in_chain と同じ while ループ構造で揃えてある (再帰回避)。
     def find_initialize_in_class(class_idx)
+      cur = class_idx
+      while cur >= -1
+        result = find_initialize_in_single_class(cur)
+        if result >= 0
+          return result
+        end
+        if cur < 0
+          return -1
+        end
+        cur = @class_parent_idx[cur]
+        if cur < 0
+          return -1
+        end
+      end
+      -1
+    end
+
+    def find_initialize_in_single_class(class_idx)
       i = @method_name_starts.length - 1
       while i >= 0
         if @method_class_idx[i] == class_idx &&
@@ -1921,14 +1957,41 @@ module Setsunaruby
       find_method_in_class(-1, name_packed)
     end
 
-    # Stage 3d.1: 指定 class に属する method を後ろから走査 (= 最後の定義を採る)。
-    # class_idx = -1 ならトップレベル method を検索。
+    # Stage 3d.1/3d.4: 指定 class に属する method を後ろから走査。class_idx の class 自身に
+    # 見つからなければ Stage 3d.4 で導入された @class_parent_idx を辿って親クラスを検索。
+    # class_idx = -1 ならトップレベル method を検索 (parent chain は辿らない)。
+    # 末尾再帰は spinel の whole-program 推論で揺れる可能性があるため while ループで実装する
+    # (`find_or_declare_ivar_slot` / `total_ivar_count` と同じイテレーションスタイル)。
     def find_method_in_class(class_idx, name_packed)
       pkg_start = name_packed >> 16
       pkg_len   = name_packed & 0xffff
       if pkg_len == 0
         return -1
       end
+      find_method_in_chain(class_idx, pkg_start, pkg_len)
+    end
+
+    def find_method_in_chain(class_idx, pkg_start, pkg_len)
+      cur = class_idx
+      while cur >= -1
+        result = find_method_in_single_class(cur, pkg_start, pkg_len)
+        if result >= 0
+          return result
+        end
+        # cur=-1 (トップレベル) はここで打ち切り (親 chain には進まない)。
+        if cur < 0
+          return -1
+        end
+        cur = @class_parent_idx[cur]
+        # 親 chain の終端 (= -1) を踏んだらトップレベル method には fall through せず終了。
+        if cur < 0
+          return -1
+        end
+      end
+      -1
+    end
+
+    def find_method_in_single_class(class_idx, pkg_start, pkg_len)
       i = @method_name_starts.length - 1
       while i >= 0
         if @method_class_idx[i] == class_idx &&
@@ -1953,7 +2016,20 @@ module Setsunaruby
         raise "Compile error: line #{@cur_token.line}: ネストしたクラス定義はできません"
       end
       name_packed = node.node_int_value
-      class_idx = declare_class(name_packed)
+      # Stage 3d.4: 親クラス参照を解決。:class_parent_ref があれば既存の class table から探す。
+      parent_idx = -1
+      parent_ref = node.node_right
+      if parent_ref != nil
+        parent_packed = parent_ref.node_int_value
+        parent_idx = find_class_by_packed(parent_packed)
+        if parent_idx < 0
+          raise "Compile error: line #{@cur_token.line}: 親クラスが未定義です (1-pass コンパイラのため、親は先に定義する必要があります)"
+        end
+        if parent_idx < BUILTIN_CLASS_COUNT
+          raise "Compile error: line #{@cur_token.line}: builtin クラスを親にすることはできません (Stage 3d.4 スコープ外)"
+        end
+      end
+      class_idx = declare_class(name_packed, parent_idx)
       saved_class = @cur_class
       @cur_class = class_idx
       compile_class_body_seq(node.node_left)
@@ -2019,12 +2095,10 @@ module Setsunaruby
     def register_builtin_classes_and_methods
       i = 0
       while i < BUILTIN_CLASS_COUNT
-        @class_name_starts.push(0)
-        @class_name_lens.push(0)
-        @class_method_starts.push(@method_name_starts.length)
-        @class_method_counts.push(0)
-        @class_ivar_starts.push(@class_ivar_name_starts.length)
-        @class_ivar_counts.push(0)
+        # builtin は匿名 (name=(0,0))、親なし。declare_class の重複チェックは
+        # find_in_table が pkg_len==0 で即 -1 を返す保護があるため通過する (3 個 pre-register
+        # しても問題ない)。これで 7 並列 IntArray の push は declare_class に集約される。
+        declare_class(0, -1)
         i += 1
       end
 
@@ -2057,7 +2131,8 @@ module Setsunaruby
     end
 
     # 同名クラスの再定義は禁止 (Stage 3d.1 はシンプルに保つ)。
-    def declare_class(name_packed)
+    # Stage 3d.4: parent_idx は親クラス idx (-1 = 親なし)。
+    def declare_class(name_packed, parent_idx)
       pkg_start = name_packed >> 16
       pkg_len   = name_packed & 0xffff
       i = find_class_by_packed(name_packed)
@@ -2070,6 +2145,7 @@ module Setsunaruby
       @class_method_counts.push(0)
       @class_ivar_starts.push(@class_ivar_name_starts.length)
       @class_ivar_counts.push(0)
+      @class_parent_idx.push(parent_idx)
       @class_name_starts.length - 1
     end
 
@@ -2118,27 +2194,55 @@ module Setsunaruby
       nil
     end
 
-    # 現在の class の ivar table から name_packed の slot idx を返す。未登録なら append。
-    # 戻り値は class 相対 slot idx (0..count-1)。LOAD_IVAR / STORE_IVAR が直接使う。
+    # 現在の class および親 chain の ivar table から name_packed の slot idx を返す。
+    # 未登録なら自分の class の末尾に append。Stage 3d.4 で継承対応:
+    # - 親で宣言済みの ivar はそのまま親の slot idx を返す (= instance 上の絶対 slot)
+    # - 自分で初出現する ivar は ancestor_count + own_count 位置の slot に登録
+    # 戻り値は instance ivar pool 上の絶対 slot idx (LOAD_IVAR / STORE_IVAR がそのまま使う)。
     def find_or_declare_ivar_slot(class_idx, name_packed)
       pkg_start = name_packed >> 16
       pkg_len   = name_packed & 0xffff
-      base = @class_ivar_starts[class_idx]
-      n    = @class_ivar_counts[class_idx]
-      i = 0
-      while i < n
-        if @class_ivar_name_lens[base + i] == pkg_len &&
-           bytes_eq(@class_ivar_name_starts[base + i], pkg_start, pkg_len)
-          return i
+      # 親 chain を含めて探す
+      cur = class_idx
+      while cur >= 0
+        base = @class_ivar_starts[cur]
+        n    = @class_ivar_counts[cur]
+        i = 0
+        while i < n
+          if @class_ivar_name_lens[base + i] == pkg_len &&
+             bytes_eq(@class_ivar_name_starts[base + i], pkg_start, pkg_len)
+            return ivar_slot_offset_for_class(cur) + i
+          end
+          i += 1
         end
-        i += 1
+        cur = @class_parent_idx[cur]
       end
-      # 末尾に append。@class_ivar_starts は固定 (= base) なのでここに追加することで
-      # 後続クラスの ivar とも干渉しない (まだそのクラスは登録されていない前提)。
+      # どこにもなければ自 class に登録 (絶対 slot は ancestor_count + 既存 own_count)。
+      # ivar_slot_offset_for_class(class_idx) は親 chain の合計 (= total_ivar_count(parent)) で
+      # 自クラスの count は含まないので、own (= インクリメント前の値) を加算するだけで新 slot の
+      # 絶対 idx になる。この「自分の count を含まない offset」という前提が壊れると off-by-own。
       @class_ivar_name_starts.push(pkg_start)
       @class_ivar_name_lens.push(pkg_len)
-      @class_ivar_counts[class_idx] = n + 1
-      n
+      own = @class_ivar_counts[class_idx]
+      @class_ivar_counts[class_idx] = own + 1
+      ivar_slot_offset_for_class(class_idx) + own
+    end
+
+    # Stage 3d.4: 当該 class の ivar slot の起点 (= 全祖先の ivar 数の合計、自分は含まない)。
+    # parent が -1 のとき total_ivar_count(-1) は while cur >= 0 が即偽になり 0 を返すので両用で安全。
+    def ivar_slot_offset_for_class(class_idx)
+      total_ivar_count(@class_parent_idx[class_idx])
+    end
+
+    # Stage 3d.4: class_idx および全祖先の ivar 数の合計 (= instance の slot 数)。
+    def total_ivar_count(class_idx)
+      result = 0
+      cur = class_idx
+      while cur >= 0
+        result += @class_ivar_counts[cur]
+        cur = @class_parent_idx[cur]
+      end
+      result
     end
 
     def compile_ivar_ref(node)
@@ -2995,12 +3099,12 @@ module Setsunaruby
       nil
     end
 
-    # Stage 3d.1: ClassName.new — class_idx に対応するインスタンスを 1 つ確保する。
-    # ivar slot を全 NIL_VAL で初期化し、obj_id を push。
-    # Stage 3d.2 では INSTANCE_NEW 自体は確保のみ、initialize は compile-time 展開が呼び出す。
+    # Stage 3d.1/3d.4: ClassName.new — class_idx に対応するインスタンスを 1 つ確保する。
+    # ivar slot を全 NIL_VAL で初期化し、obj_id を push。Stage 3d.4 から ivar 数は
+    # total_ivar_count (= 親祖先 + 自分) を使うことで継承された ivar の slot も確保される。
     def exec_instance_new
       class_idx = decode_signed
-      ivar_count = @class_ivar_counts[class_idx]
+      ivar_count = total_ivar_count(class_idx)
       ivar_start = @instance_ivar_pool.length
       i = 0
       while i < ivar_count
@@ -3016,6 +3120,7 @@ module Setsunaruby
       name_packed = decode_signed
       argc        = decode_signed
       exec_dispatch_method(name_packed, argc, -1, 0)
+      nil
     end
 
     # Stage 3d.1: obj.method(args) do |x| ... end の動的ディスパッチ + block 付き。
@@ -3025,6 +3130,7 @@ module Setsunaruby
       block_pc    = decode_signed
       block_arity = decode_signed
       exec_dispatch_method(name_packed, argc, block_pc, block_arity)
+      nil
     end
 
     # CALL_METHOD / CALL_METHOD_WITH_BLOCK の共通ディスパッチ。
