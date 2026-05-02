@@ -26,6 +26,7 @@ test-cruby:
 	ruby test/test_stage3c3.rb
 	ruby test/test_stage3d1.rb
 	ruby test/test_stage3d2.rb
+	ruby test/test_stage3d3.rb
 	ruby test/test_stage_jit.rb
 
 test-aot: build

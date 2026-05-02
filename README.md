@@ -7,7 +7,7 @@ Ruby 文法を持つ、スタックマシン型プログラミング言語の処
 「刹那」(10⁻¹⁸) から命名。mruby / nanoruby / picoruby に続く、
 さらに小さな Ruby 系列という位置付け。
 
-## 現状: Stage 0 / 0.5 / 1 / 2 / 3a / 3b / 3c.1 / 3c.2 / 3c.3 / 3d.1 / 3d.2 / JIT-1 / JIT-2 / JIT-3a / JIT-3b1 / JIT-3b2 / JIT-3b3 / JIT-3c / JIT-4 (案 A) 完了
+## 現状: Stage 0 / 0.5 / 1 / 2 / 3a / 3b / 3c.1 / 3c.2 / 3c.3 / 3d.1 / 3d.2 / 3d.3 / JIT-1 / JIT-2 / JIT-3a / JIT-3b1 / JIT-3b2 / JIT-3b3 / JIT-3c / JIT-4 (案 A) 完了
 
 スタックマシン上で **再帰 `fib(20)` / アッカーマン / tarai が CRuby + spinel AOT 両方で動作**。
 
@@ -53,6 +53,8 @@ Ruby 文法を持つ、スタックマシン型プログラミング言語の処
 - **`obj.method(args)` 動的ディスパッチ** (受信者の class を runtime で解決)
 - **`@var` インスタンス変数** (read/write、未代入は nil)
 - **`self` キーワード** (現フレームの receiver を返す)
+- **builtin class (Integer / Array / String) の class table 登録** (Stage 3d.3 で導入)
+- **`Array#length` を一般 method dispatch 経由で解決** (ユーザクラスの `length` method と class_idx で区別、共存可能)
 
 ## クイックスタート
 
@@ -72,7 +74,7 @@ make test-aot
 make test-all
 ```
 
-(テスト件数は `make test-cruby` 出力で確認できる。Stage 3a +38 件、3b +42 件、3c.1 +24 件、3c.2 +15 件、3c.3 +24 件、3d.1 +22 件、3d.2 +15 件。)
+(テスト件数は `make test-cruby` 出力で確認できる。Stage 3a +38 件、3b +42 件、3c.1 +24 件、3c.2 +15 件、3c.3 +24 件、3d.1 +22 件、3d.2 +15 件、3d.3 +17 件。)
 
 ## ベンチマーク
 
@@ -234,7 +236,8 @@ Symbol/sp_sym を経由すると spinel の Token フィールド型推論が崩
 | 3c.3 | `block_given?` / `Array#map` / `{ \| \| }` 中括弧構文 / 識別子末尾 `?`/`!` | ✅ 完了 |
 | 3d.1 | クラス + インスタンスメソッド + `@var` + `self` + `.new` (引数なし) | ✅ 完了 |
 | 3d.2 | `initialize` + 引数付き `.new(args)` | ✅ 完了 |
-| 3d.3〜3e | 一般 method dispatch / 継承 / 例外 | 未着手 |
+| 3d.3 | 一般 method dispatch (Array#length を builtin class table 経由に) | ✅ 完了 |
+| 3d.4〜3e | each/times/map の class table 化 / 継承 / 例外 | 未着手 |
 | ∞ | 自己ホスト (setsunaruby を setsunaruby で動かす) | 究極目標 |
 
 ## ディレクトリ構成
@@ -275,6 +278,7 @@ Symbol/sp_sym を経由すると spinel の Token フィールド型推論が崩
 │   ├── test_stage3c3.rb      # CRuby Stage 3c.3 テスト (24件)
 │   ├── test_stage3d1.rb      # CRuby Stage 3d.1 テスト (22件)
 │   ├── test_stage3d2.rb      # CRuby Stage 3d.2 テスト (15件)
+│   ├── test_stage3d3.rb      # CRuby Stage 3d.3 テスト (17件)
 │   ├── test_stage_jit.rb     # CRuby JIT-1/2/3a/3b1/3b2/3b3/3c/4 テスト (108件)
 │   └── test_aot.rb           # AOT テスト (Stage 0/1/2/3a/3b/3c + JIT)
 ├── setsunaruby               # spinel ビルド成果物 (gitignore)
