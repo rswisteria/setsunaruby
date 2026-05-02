@@ -268,6 +268,30 @@ assert_output(File.read(File.expand_path('../examples/class.rb', __dir__)),
               "3\n1\n3\n12\n24\n15\n2\n4\n6\n",
               "examples/class.rb")
 
+# ---- Stage 3d.2: initialize / .new(args) ----
+assert_output(<<~RUBY, "12\n", "INIT: 2 引数 initialize")
+  class R
+    def initialize(w, h)
+      @w = w
+      @h = h
+    end
+    def area
+      @w * @h
+    end
+  end
+  puts R.new(3, 4).area
+RUBY
+assert_fails(<<~RUBY, "INIT: argc mismatch エラー")
+  class C
+    def initialize(x)
+    end
+  end
+  C.new
+RUBY
+assert_output(File.read(File.expand_path('../examples/initialize.rb', __dir__)),
+              "25\n3\n4\n1\n2\n6\n24\n120\n3\na\nb\nc\n",
+              "examples/initialize.rb")
+
 # ---- エラー系 ----
 assert_fails(%(puts "a" + 1\n),  "STR: + 型エラー")
 assert_fails(%(puts 1 << 1\n),   "STR: << は (string|array) のみ (Fixnum 不可)")

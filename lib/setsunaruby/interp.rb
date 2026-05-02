@@ -84,6 +84,7 @@ module Setsunaruby
     KW_CLASS_BYTES  = [99, 108, 97, 115, 115].freeze          # "class" (Stage 3d.1)
     KW_SELF_BYTES   = [115, 101, 108, 102].freeze             # "self" (Stage 3d.1)
     KW_NEW_BYTES    = [110, 101, 119].freeze                  # "new" (Stage 3d.1: ClassName.new 専用認識)
+    KW_INITIALIZE_BYTES = [105, 110, 105, 116, 105, 97, 108, 105, 122, 101].freeze   # "initialize" (Stage 3d.2)
     # Stage 3b/3c: ドット method 名 (現状 length / each / times / map をサポート)。
     # 将来 method_name_is_*? を増やすときも同じ場所に追加する。
     KW_LENGTH_BYTES = [108, 101, 110, 103, 116, 104].freeze   # "length"
@@ -1472,15 +1473,16 @@ module Setsunaruby
         return nil
       end
 
-      # Stage 3d.1: `ClassName.new` (引数なし) はインスタンス確保に展開。
+      # Stage 3d.1/3d.2: `ClassName.new(args)` はインスタンス確保 + initialize 自動呼び出しに展開。
       # 受信者は :var_ref で、その名前がクラステーブルにあるかで判別する。
-      if argc == 0 && method_name_is_new?(name_packed) &&
-         node.node_left.node_kind == :var_ref
+      if method_name_is_new?(name_packed) && node.node_left.node_kind == :var_ref
         cls_packed = node.node_left.node_int_value
         cls_idx = find_class_by_packed(cls_packed)
         if cls_idx >= 0
-          @bytecode.push(Op::INSTANCE_NEW)
-          encode_signed(cls_idx)
+          if block != nil
+            raise "Compile error: line #{@cur_token.line}: .new にブロックは渡せません (Stage 3d.2)"
+          end
+          compile_class_new(cls_idx, node, argc)
           return nil
         end
       end
@@ -1707,6 +1709,23 @@ module Setsunaruby
 
     def method_name_is_new?(packed)
       method_name_match?(packed, KW_NEW_BYTES)
+    end
+
+    # Stage 3d.2: クラスの initialize method を検索。見つからなければ -1。
+    # @bytes 上に "initialize" 文字列が常に含まれる保証はない (ユーザコードに登場しない場合)。
+    # よって find_method_in_class (packed name 比較) は使えず、KW_INITIALIZE_BYTES との
+    # バイト比較で線形走査する。
+    def find_initialize_in_class(class_idx)
+      i = @method_name_starts.length - 1
+      while i >= 0
+        if @method_class_idx[i] == class_idx &&
+           @method_name_lens[i] == KW_INITIALIZE_BYTES.length &&
+           match_bytes(@method_name_starts[i], KW_INITIALIZE_BYTES.length, KW_INITIALIZE_BYTES)
+          return i
+        end
+        i -= 1
+      end
+      -1
     end
 
     def method_name_match?(packed, kw_bytes)
@@ -1975,6 +1994,47 @@ module Setsunaruby
 
     def find_class_by_packed(name_packed)
       find_in_table(@class_name_starts, @class_name_lens, 0, name_packed)
+    end
+
+    # Stage 3d.2: ClassName.new(args) を compile する。
+    # initialize が定義されていれば INSTANCE_NEW + DUP + args + CALL_METHOD initialize + POP
+    # の形に展開して new instance をスタックに残す。未定義なら argc==0 を要求し INSTANCE_NEW のみ。
+    # method_call_on の node 全体を受け取り、内部で node.node_operand から args chain を辿る。
+    # (args chain を別パラメータで受けると spinel の whole-program 推論が混乱する。)
+    def compile_class_new(cls_idx, call_node, argc)
+      init_idx = find_initialize_in_class(cls_idx)
+      if init_idx < 0
+        if argc != 0
+          raise "Compile error: line #{@cur_token.line}: クラスに initialize が未定義のため引数を渡せません"
+        end
+        @bytecode.push(Op::INSTANCE_NEW)
+        encode_signed(cls_idx)
+        return nil
+      end
+      expected = @method_arities[init_idx]
+      if expected != argc
+        raise "Compile error: line #{@cur_token.line}: initialize の引数数が一致しません (期待 #{expected}, 実際 #{argc})"
+      end
+      # INSTANCE_NEW で確保した instance をスタック top と receiver の双方に使うため DUP。
+      # CALL_METHOD は受信者の class から find_method_in_class(class_idx, name_packed) で
+      # 解決するため、name_packed は @bytes 上の "initialize" バイト列を指していれば良い。
+      # find_initialize_in_class が既に該当 entry の m_idx を返しているので、そこから直接
+      # packed を組み立てる (別途同じ走査をする synth helper は不要)。
+      init_packed = (@method_name_starts[init_idx] << 16) | @method_name_lens[init_idx]
+      @bytecode.push(Op::INSTANCE_NEW)
+      encode_signed(cls_idx)
+      @bytecode.push(Op::DUP)
+      cur = call_node.node_operand
+      while cur != nil
+        compile_expr(cur.node_left)
+        cur = cur.node_operand
+      end
+      @bytecode.push(Op::CALL_METHOD)
+      encode_signed(init_packed)
+      encode_signed(argc)
+      # initialize の戻り値はスタック top に残るが、.new は instance を返すべきなので POP する。
+      @bytecode.push(Op::POP)
+      nil
     end
 
     # 現在の class の ivar table から name_packed の slot idx を返す。未登録なら append。
@@ -2276,6 +2336,8 @@ module Setsunaruby
           exec_block_given_p
         elsif op == Op::INSTANCE_NEW
           exec_instance_new
+        elsif op == Op::DUP
+          exec_dup
         elsif op == Op::CALL_METHOD
           exec_call_method
         elsif op == Op::CALL_METHOD_WITH_BLOCK
@@ -2846,8 +2908,15 @@ module Setsunaruby
       nil
     end
 
+    # Stage 3d.2: スタック top の値を 1 つ複製。Foo.new(args) の compile-time 展開で使う。
+    def exec_dup
+      @stack.push(@stack[@stack.length - 1])
+      nil
+    end
+
     # Stage 3d.1: ClassName.new — class_idx に対応するインスタンスを 1 つ確保する。
-    # ivar slot を全 NIL_VAL で初期化し、obj_id を push。Stage 3d.2 で initialize 連動を入れる。
+    # ivar slot を全 NIL_VAL で初期化し、obj_id を push。
+    # Stage 3d.2 では INSTANCE_NEW 自体は確保のみ、initialize は compile-time 展開が呼び出す。
     def exec_instance_new
       class_idx = decode_signed
       ivar_count = @class_ivar_counts[class_idx]

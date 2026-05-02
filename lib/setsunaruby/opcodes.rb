@@ -66,6 +66,10 @@ module Setsunaruby
     STORE_IVAR      = 0x50   # operand: SLEB128 ivar_slot
     CALL_METHOD_WITH_BLOCK = 0x51   # operands: name_packed, argc, block_pc, block_arity
 
+    # Stage 3d.2: スタック top を 1 つ複製。Foo.new(args) の compile-time 展開で
+    # INSTANCE_NEW 後の instance を残しつつ initialize 呼び出しの receiver にも使うため。
+    DUP = 0x52
+
     HALT = 0xFF
   end
 end
