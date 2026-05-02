@@ -292,6 +292,16 @@ assert_output(File.read(File.expand_path('../examples/initialize.rb', __dir__)),
               "25\n3\n4\n1\n2\n6\n24\n120\n3\na\nb\nc\n",
               "examples/initialize.rb")
 
+# ---- Stage 3d.4: 継承 ----
+assert_output("class A\n  def f\n    \"A\"\n  end\nend\nclass B < A\nend\nputs B.new.f\n",
+              "A\n", "INH: 親 method を子から呼ぶ")
+assert_output("class A\n  def f\n    \"A\"\n  end\nend\nclass B < A\n  def f\n    \"B\"\n  end\nend\nputs B.new.f\nputs A.new.f\n",
+              "B\nA\n", "INH: 子で override")
+assert_output(File.read(File.expand_path('../examples/inherit.rb', __dir__)),
+              "Generic says ...\nRex says Woof\nMia says Meow\nTiny says yip\n11\n",
+              "examples/inherit.rb")
+assert_fails("class B < Undef\nend\n", "INH: 未定義の親")
+
 # ---- エラー系 ----
 assert_fails(%(puts "a" + 1\n),  "STR: + 型エラー")
 assert_fails(%(puts 1 << 1\n),   "STR: << は (string|array) のみ (Fixnum 不可)")
