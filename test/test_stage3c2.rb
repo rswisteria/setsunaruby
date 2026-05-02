@@ -136,8 +136,9 @@ assert_raises(<<~RUBY, "block なしで yield → LocalJumpError")
   needs_block
 RUBY
 
-# ---- yield argc / block param 数の不一致は ArgumentError ----
-assert_raises(<<~RUBY, "yield 1 + ブロック param 0 → ArgumentError")
+# ---- yield argc / block param 数の不一致は Ruby と同様 lenient (Stage 3d.5) ----
+# 余剰引数は捨て、不足分は nil で埋める。エラーにならない。
+assert_output(<<~RUBY, "no param\n", "yield 1 + ブロック param 0 → 引数を捨てる")
   def emit
     yield 42
   end
@@ -145,7 +146,7 @@ assert_raises(<<~RUBY, "yield 1 + ブロック param 0 → ArgumentError")
     puts "no param"
   end
 RUBY
-assert_raises(<<~RUBY, "yield 0 + ブロック param 1 → ArgumentError")
+assert_output(<<~RUBY, "\n", "yield 0 + ブロック param 1 → param は nil")
   def emit
     yield
   end

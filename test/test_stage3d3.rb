@@ -120,9 +120,9 @@ assert_output("3.times do |i|\n  puts i\nend\n",            "0\n1\n2\n",   "Inte
 assert_output("[1, 2, 3].each do |x|\n  puts x\nend\n",     "1\n2\n3\n",   "Array#each は引き続き special form")
 assert_output("puts [1, 2, 3].map do |x|\n  x * 10\nend\n", "10\n20\n30\n", "Array#map は引き続き special form")
 
-# ---- ユーザ class が times/each/map を定義しても special form が優先される (Stage 3d.3 制約) ----
-# 制約の確認: `each` という名前のユーザ method は special form が割り込み、
-# compile_each_block が ARRAY_LEN を emit するので receiver が user instance だと runtime error。
+# ---- ユーザ class の each も Stage 3d.5 から class table dispatch が効いて正しく呼ばれる ----
+# Stage 3d.3 では special form が割り込んで runtime error だったが、3d.5 で each も builtin
+# method 化したことで一般 dispatch にフォールスルーする。
 shadowed = <<~RUBY
   class Strange
     def each
@@ -133,7 +133,7 @@ shadowed = <<~RUBY
     puts x
   end
 RUBY
-assert_raises(shadowed, "ユーザ class の each は special form に intercept されて runtime error (Stage 3d.4 で解決予定)")
+assert_output(shadowed, "1\n", "ユーザ class の each もユーザ method が呼ばれる (Stage 3d.5 で解決)")
 
 # ---- ただし each 以外の名前 (例: iter) ならユーザ method が CALL_METHOD_WITH_BLOCK で動く ----
 user_block_method = <<~RUBY

@@ -302,6 +302,18 @@ assert_output(File.read(File.expand_path('../examples/inherit.rb', __dir__)),
               "examples/inherit.rb")
 assert_fails("class B < Undef\nend\n", "INH: 未定義の親")
 
+# ---- Stage 3d.5: super + each/times/map class table 化 ----
+assert_output("class A\n  def f\n    \"A\"\n  end\nend\nclass B < A\n  def f\n    super + \"B\"\n  end\nend\nputs B.new.f\n",
+              "AB\n", "SUPER: bare super で親の同名 method")
+assert_output("class A\n  def f(x)\n    x + 1\n  end\nend\nclass B < A\n  def f(x)\n    super(x * 10)\n  end\nend\nputs B.new.f(2)\n",
+              "21\n", "SUPER: 明示 args")
+assert_output(File.read(File.expand_path('../examples/super.rb', __dir__)),
+              "Alice\n[VIP] Bob\nABC\n3\n4\n5\n6\n2\n4\n6\n3\n1\n4\n9\n16\n",
+              "examples/super.rb")
+assert_output("class S\n  def each\n    yield 99\n  end\nend\nS.new.each do |x|\n  puts x\nend\n",
+              "99\n", "EACH: ユーザ class の each も class table dispatch")
+assert_fails("super\n", "SUPER: top-level は compile error")
+
 # ---- Stage 3e: 例外処理 ----
 assert_output("begin\n  raise \"x\"\nrescue => e\n  puts e.message\nend\n",
               "x\n", "EXC: raise + rescue")

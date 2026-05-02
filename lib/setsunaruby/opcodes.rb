@@ -88,6 +88,12 @@ module Setsunaruby
     CHECK_EXCEPTION_CLASS = 0x58   # operand: SLEB128 class_idx (-1 = catch-all)
     RERAISE_OR_END        = 0x59
 
+    # Stage 3d.5: `super` 呼び出し。受信者は @cur_self、検索は現在 method の defining class の
+    # 親 chain から始まる (= 自分自身は skip)。
+    # operand: SLEB128 name_packed (= 現在 method の name)、SLEB128 argc。
+    # スタックには CALL_SUPER 命令直前に self → args の順で push 済みである必要がある。
+    CALL_SUPER            = 0x5A
+
     HALT = 0xFF
   end
 end
