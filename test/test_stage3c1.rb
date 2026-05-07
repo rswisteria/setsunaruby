@@ -173,14 +173,15 @@ assert_output(in_method_times, "120\n", "メソッド内 times (factorial)")
 
 # ---- ブロックパラメータと外部変数の同名衝突 ----
 # Stage 3c.1 は flat scope なので、|i| はブロック後も残る (Ruby 1.9+ とは divergence)。
-# `i = i + 1` 後に check するループ展開なので、終了時 i = n (= 3)。
+# Stage 3d.5 で each/times/map が class table 経由になり、block prologue が yield 値を
+# slot に書く形に変わったため、終了時 i は最後に yield された値 (= n-1 = 2)。
 shadow = <<~RUBY
   i = 99
   3.times do |i|
   end
   puts i
 RUBY
-assert_output(shadow, "3\n", "param と外部変数同名 (Stage 3c.1: flat scope、終了時 i=n)")
+assert_output(shadow, "2\n", "param と外部変数同名 (Stage 3c.1: flat scope、終了時 i=n-1)")
 
 # ---- エラー系 ----
 assert_raises("3.times do |i, j|\nend\n",                      "多パラメータブロックは未対応")

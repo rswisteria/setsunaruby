@@ -83,7 +83,7 @@ RUBY
 THRESHOLD.times { src_hot << "f\n" }
 src_hot << "puts 0\n"
 out, err = run_capture(src_hot)
-expected_log = "ZJIT: hot method detected (idx=3)\n"   # Stage 3d.3: idx=0 は builtin Array#length が占有
+expected_log = "ZJIT: hot method detected (idx=6)\n"   # Stage 3d.3: idx=0 は builtin Array#length が占有
 assert_eq(out, "0\n",        "閾値ちょうど: 出力は変わらない")
 assert_eq(err, expected_log, "閾値ちょうど: hot ログが 1 回だけ")
 
@@ -113,7 +113,7 @@ fib_src = <<~RUBY
 RUBY
 out, err = run_capture(fib_src)
 assert_eq(out, "55\n",       "fib(10) 結果は不変")
-assert_eq(err, expected_log, "fib(10) で fib (idx=3) が hot 検出")
+assert_eq(err, expected_log, "fib(10) で fib (idx=6) が hot 検出")
 
 # ---- 複数メソッドが個別に hot 検出される ----
 src_multi = <<~RUBY
@@ -128,7 +128,7 @@ THRESHOLD.times { src_multi << "f\n" }
 THRESHOLD.times { src_multi << "g\n" }
 src_multi << "puts 0\n"
 out, err = run_capture(src_multi)
-expected_multi = "ZJIT: hot method detected (idx=3)\nZJIT: hot method detected (idx=4)\n"   # Stage 3d.3: builtin Array#length が idx=0 を占有
+expected_multi = "ZJIT: hot method detected (idx=6)\nZJIT: hot method detected (idx=7)\n"   # Stage 3d.3: builtin Array#length が idx=0 を占有
 assert_eq(out, "0\n",          "複数メソッド: 出力は変わらない")
 assert_eq(err, expected_multi, "複数メソッド: 各 idx で hot 検出が 1 回ずつ")
 
@@ -150,7 +150,7 @@ fib_src = <<~RUBY
 RUBY
 out, err = run_capture(fib_src)
 assert_eq(out, "55\n",                                 "JIT-2 OFF: fib(10) 結果")
-assert_eq(err, "ZJIT: hot method detected (idx=3)\n",  "JIT-2 OFF: HIR ダンプなし (Stage 3d.3 で idx=3)")
+assert_eq(err, "ZJIT: hot method detected (idx=6)\n",  "JIT-2 OFF: HIR ダンプなし (Stage 3d.3 で idx=6)")
 
 # ---- ENV=1: HIR ダンプが STDERR に出る ----
 ENV["SETSUNARUBY_DUMP_HIR"] = "1"
@@ -160,14 +160,14 @@ ensure
   ENV.delete("SETSUNARUBY_DUMP_HIR")
 end
 assert_eq(out, "55\n", "JIT-2 ON: fib(10) 結果は不変")
-assert_includes(err, "ZJIT: hot method detected (idx=3)", "JIT-2 ON: hot 検出ログ")
-assert_includes(err, "ZJIT HIR (raw) for method idx=3:",        "JIT-2 ON: HIR ヘッダ")
+assert_includes(err, "ZJIT: hot method detected (idx=6)", "JIT-2 ON: hot 検出ログ")
+assert_includes(err, "ZJIT HIR (raw) for method idx=6:",        "JIT-2 ON: HIR ヘッダ")
 assert_includes(err, "LoadLocal slot=0",                  "JIT-2 ON: 引数 n の load")
 assert_includes(err, "LoadConst 2",                       "JIT-2 ON: 定数 2")
 assert_includes(err, "Lt ",                               "JIT-2 ON: < 比較")
 assert_includes(err, "JumpIfFalse ",                      "JIT-2 ON: 条件分岐")
 assert_includes(err, "Sub ",                              "JIT-2 ON: n - 1 / n - 2 の減算")
-assert_includes(err, "Call m3(",                          "JIT-2 ON: 再帰呼び出し (Stage 3d.3 で fib は m1)")
+assert_includes(err, "Call m6(",                          "JIT-2 ON: 再帰呼び出し (Stage 3d.3 で fib は m1)")
 assert_includes(err, "Add ",                              "JIT-2 ON: fib(n-1) + fib(n-2)")
 assert_includes(err, "Return ",                           "JIT-2 ON: 戻り命令")
 
@@ -189,9 +189,9 @@ ensure
   ENV.delete("SETSUNARUBY_DUMP_HIR")
 end
 assert_eq(out, "6\n", "JIT-2 ON: tarai 結果は不変")
-assert_includes(err, "ZJIT HIR (raw) for method idx=3:", "JIT-2 ON: tarai HIR ヘッダ")
+assert_includes(err, "ZJIT HIR (raw) for method idx=6:", "JIT-2 ON: tarai HIR ヘッダ")
 assert_includes(err, "Le ",                        "JIT-2 ON: tarai の <= 比較")
-# 3 引数 CALL は "Call m2(vA, vB, vC)" 形式
+# 3 引数 CALL は "Call m5(vA, vB, vC)" 形式
 assert_includes(err, ", ",                         "JIT-2 ON: 引数区切り (多引数 CALL)")
 
 # ---- 早期 return + 中間 if (jump target が POP/末尾境界を指すケース): patch アサート確認 ----
@@ -423,7 +423,7 @@ ensure
 end
 cfg_section = split_cfg_section(err)
 assert_eq(out, "55\n", "JIT-3b2: fib(10) 結果不変")
-assert_includes(cfg_section, "ZJIT CFG analysis for method idx=3:", "JIT-3b2: 分析ヘッダ")
+assert_includes(cfg_section, "ZJIT CFG analysis for method idx=6:", "JIT-3b2: 分析ヘッダ")
 # fib は entry → (then|else) → merge の標準 diamond CFG
 assert_includes(cfg_section, "BB0: idom=BB0, DF={}",     "JIT-3b2: entry の idom は自分、DF 空")
 assert_includes(cfg_section, "BB1: idom=BB0, DF={BB3}",  "JIT-3b2: then 節の DF は merge")
@@ -664,7 +664,7 @@ ensure
 end
 lir = split_lir_section(err)
 assert_eq(out, "55\n", "JIT-4: fib(10) 結果不変")
-assert_includes(lir, "ZJIT LIR for method idx=3:", "JIT-4: LIR ヘッダ")
+assert_includes(lir, "ZJIT LIR for method idx=6:", "JIT-4: LIR ヘッダ")
 # arm64 主要命令が出る
 assert_includes(lir, "mov x",      "JIT-4: mov 命令")
 assert_includes(lir, "sub x",      "JIT-4: sub 命令")
@@ -672,7 +672,7 @@ assert_includes(lir, "add x",      "JIT-4: add 命令")
 assert_includes(lir, "cmp x",      "JIT-4: cmp 命令")
 assert_includes(lir, "b.ge BB",    "JIT-4: FixnumLt の偽分岐は B_GE")
 assert_includes(lir, "b BB",       "JIT-4: 無条件 jump")
-assert_includes(lir, "bl m3",      "JIT-4: 再帰呼び出し (Stage 3d.3 で fib は m1)")
+assert_includes(lir, "bl m6",      "JIT-4: 再帰呼び出し (Stage 3d.3 で fib は m1)")
 assert_includes(lir, "ret",        "JIT-4: return")
 assert_includes(lir, "tbz x",      "JIT-4: GuardFixnum (TBZ)")
 # 機械語 hex が併記される

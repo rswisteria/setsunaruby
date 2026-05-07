@@ -87,7 +87,10 @@ module Setsunaruby
     PREFIX_STDERR_OFFSET   = PREFIX_LENGTH_OFFSET + 6                         # "StandardError"
     PREFIX_MESSAGE_OFFSET  = PREFIX_STDERR_OFFSET + 13                        # "message"
     PREFIX_INIT_OFFSET     = PREFIX_MESSAGE_OFFSET + 7                        # "initialize"
-    PREFIX_TOTAL_LEN       = PREFIX_INIT_OFFSET + 10
+    PREFIX_EACH_OFFSET     = PREFIX_INIT_OFFSET + 10                          # "each" (Stage 3d.5)
+    PREFIX_MAP_OFFSET      = PREFIX_EACH_OFFSET + 4                           # "map"
+    PREFIX_TIMES_OFFSET    = PREFIX_MAP_OFFSET + 3                            # "times"
+    PREFIX_TOTAL_LEN       = PREFIX_TIMES_OFFSET + 5
 
     # キーワードバイト列。spinel の sp_String / const char* 不整合を避けるため
     # 文字列ではなくバイト配列で直接比較する。
@@ -122,6 +125,7 @@ module Setsunaruby
     KW_RESCUE_BYTES  = [114, 101, 115, 99, 117, 101].freeze       # "rescue"
     KW_ENSURE_BYTES  = [101, 110, 115, 117, 114, 101].freeze      # "ensure"
     KW_RAISE_BYTES   = [114, 97, 105, 115, 101].freeze            # "raise"
+    KW_SUPER_BYTES   = [115, 117, 112, 101, 114].freeze           # "super" (Stage 3d.5)
     KW_MESSAGE_BYTES = [109, 101, 115, 115, 97, 103, 101].freeze  # "message"
     KW_STDERR_BYTES  = [83, 116, 97, 110, 100, 97, 114, 100, 69, 114, 114, 111, 114].freeze   # "StandardError"
 
@@ -213,6 +217,13 @@ module Setsunaruby
       # locals の縮小は @cur_base で行うので length 自体は記録しない。
       @cfp_pcs   = []   # IntArray (戻り PC)
       @cfp_bases = []   # IntArray (戻り後の @cur_base)
+      # Stage 3d.5: 各 cfp フレームが呼ばれた時点で active だった lexical method の cfp idx を退避。
+      # YIELD でブロックに入ったとき、そのブロックの lexical method は「呼び出し元の lexical method」
+      # = この値。yield 時に @yield_target_idx に積み上げる用。-1 は top-level (method 外)。
+      @cfp_caller_lexical_method = []
+      # Stage 3d.5: 現在実行中の method の m_idx (super で defining class を取るため)。
+      # 並列 IntArray の 1 つ。-1 は top-level (method 外、super 不可)。
+      @cfp_method_idx = []
       @cur_base  = 0    # 現在実行中の locals base
       # Stage 3c.2: コールフレームに紐付くブロック PC (-1 = ブロックなし)。
       # YIELD は @cfp_block_pcs.last を読んでブロックへ飛ぶ。
@@ -224,6 +235,12 @@ module Setsunaruby
       # @cfp_* と独立: 1 つの method 呼び出しの間に複数回 yield する想定。
       @yield_pcs   = []
       @yield_bases = []
+      # Stage 3d.5: 「現在の lexical method の cfp idx」スタック。push_call_frame と YIELD の
+      # 両方で push し、pop_call_frame と BLOCK_RETURN で pop する。yield は top の値を見て
+      # cfp_block_pcs[idx] を target とする (cfp.last ではない)。これにより
+      # `def collect; arr.each do; yield; end; end` の yield が arr.each ではなく collect の
+      # ブロックを呼べる。-1 は top-level (method 外で yield → LocalJumpError)。
+      @yield_target_idx = []
       # Stage 3a/3b: ヒープオブジェクト。obj_id = (idx << 3) | HEAP_TAG。
       # @heap_kind が 1=String, 2=Array を区別する (HEAP_KIND_STRING / HEAP_KIND_ARRAY)。
       # @heap_starts/lens の解釈は kind に依存:
@@ -348,6 +365,9 @@ module Setsunaruby
       @cfp_block_arities = []
       @yield_pcs         = []
       @yield_bases       = []
+      @cfp_caller_lexical_method = []
+      @cfp_method_idx    = []
+      @yield_target_idx  = []
       # Stage 3a/3b: ヒープ状態のリセット。
       @heap_kind     = []
       @heap_starts   = []
@@ -610,6 +630,8 @@ module Setsunaruby
         result = TokenKind::KW_ENSURE
       elsif match_bytes(start, len, KW_RAISE_BYTES)
         result = TokenKind::KW_RAISE
+      elsif match_bytes(start, len, KW_SUPER_BYTES)
+        result = TokenKind::KW_SUPER
       end
       result
     end
@@ -1353,9 +1375,29 @@ module Setsunaruby
         parse_begin_rescue
       elsif k == TokenKind::KW_RAISE
         parse_raise
+      elsif k == TokenKind::KW_SUPER
+        parse_super
       else
         raise "Parse error: line #{@cur_token.line}: 式が必要です"
       end
+    end
+
+    # Stage 3d.5: `super` / `super(args)` / `super()`。
+    # AST `:super_call`:
+    #   node_left  = :arg_cons チェーン (`super(args)`) または nil (引数省略 = 現メソッドの args をそのまま転送)
+    #   node_bool_value = `super()` のように明示的に空 args を書いた場合 true (= 引数なし)、
+    #                     bare `super` または `super(args)` の場合は false。
+    def parse_super
+      @cur_token = next_token   # consume `super`
+      explicit_args = false
+      args = nil
+      if @cur_token.kind == TokenKind::LPAREN
+        explicit_args = true
+        @cur_token = next_token
+        args = parse_arg_list   # 0 個以上 (`super()` も OK)
+        expect(TokenKind::RPAREN)
+      end
+      ASTNode.new(:super_call, 0, explicit_args, :nop, args, nil, nil)
     end
 
     # Stage 3e: `begin BODY [rescue ...]+ [ensure ...] end`。
@@ -1550,9 +1592,52 @@ module Setsunaruby
         compile_begin_rescue(node)
       elsif k == :raise
         compile_raise(node)
+      elsif k == :super_call
+        compile_super(node)
       else
         raise "Compiler bug: unknown expression kind #{k}"
       end
+      nil
+    end
+
+    # Stage 3d.5: `super` を CALL_SUPER に展開。
+    # - bare `super` (node_left == nil, bool_value == false) → 現 method の全パラメータを LOAD_LOCAL で転送。
+    # - `super()` (node_left == nil, bool_value == true)     → 0 引数で呼ぶ。
+    # - `super(args)` (node_left != nil)                      → args を順に評価して push。
+    # - 受信者は @cur_self (CALL_SUPER 内で参照する) なので明示的 LOAD_SELF は不要。
+    # - 現在 method の name は @cur_method_name_packed_for_super に compile_method_def が保持。
+    # - method 外で super はパースまでは通るが compile 時にエラー。
+    def compile_super(node)
+      if @cur_method_idx_for_jit < 0
+        raise "Compile error: line #{@cur_token.line}: super は method 内でのみ使えます"
+      end
+      mark_current_method_jit_unsafe   # CALL_SUPER は HIR/LIR 未対応のため
+      m_idx = @cur_method_idx_for_jit
+      name_packed = (@method_name_starts[m_idx] << 16) | @method_name_lens[m_idx]
+      argc = 0
+      if node.node_left != nil
+        # 明示的 args
+        cur = node.node_left
+        while cur != nil
+          compile_expr(cur.node_left)
+          cur = cur.node_operand
+        end
+        argc = count_arg_chain(node.node_left)
+      elsif node.node_bool_value
+        # `super()` — 明示的に 0 args
+        argc = 0
+      else
+        # bare `super` — 現 method のパラメータを slot 0..arity-1 から転送。
+        argc = @method_arities[m_idx]
+        i = 0
+        while i < argc
+          @bytecode.push(Op::LOAD_LOCAL); encode_signed(i)
+          i += 1
+        end
+      end
+      @bytecode.push(Op::CALL_SUPER)
+      encode_signed(name_packed)
+      encode_signed(argc)
       nil
     end
 
@@ -1719,25 +1804,11 @@ module Setsunaruby
       block       = node.node_right
       argc        = count_arg_chain(node.node_operand)
 
-      # Stage 3c.1/3c.3: ブロック付き呼び出しは特殊形式 (each / times / map) 限定でインライン展開。
-      # Stage 3d.1: 上記以外でも user-defined method なら CALL_METHOD_WITH_BLOCK で受ける。
+      # Stage 3d.5: ブロック付き呼び出しは each / times / map も含めてすべて
+      # 一般 dispatch (CALL_METHOD_WITH_BLOCK) で扱う。each/map/times は
+      # register_builtin_classes_and_methods が Array/Integer の builtin method として
+      # 登録する (実装は YIELD opcode を使うループ)。
       if block != nil
-        if method_name_is_each?(name_packed) || method_name_is_times?(name_packed) ||
-           method_name_is_map?(name_packed)
-          if argc != 0
-            raise "Compile error: line #{@cur_token.line}: each/times/map にブロック付き引数は使えません"
-          end
-          if method_name_is_each?(name_packed)
-            compile_each_block(node.node_left, block)
-          elsif method_name_is_times?(name_packed)
-            compile_times_block(node.node_left, block)
-          else
-            compile_map_block(node.node_left, block)
-          end
-          return nil
-        end
-        # 一般ユーザ method 呼び出しにブロックを渡す。compile_method_call と同形の
-        # skip-jump パターンでブロックを inline 配置し、CALL_METHOD_WITH_BLOCK で呼ぶ。
         block_pc = compile_inline_block(block)
         block_arity = 0
         if block.node_int_value != 0
@@ -1787,206 +1858,8 @@ module Setsunaruby
       nil
     end
 
-    # 式を評価して slot に格納し、スタック上を空にする (`x = expr` 相当)。
-    # STORE_LOCAL は値を残すので POP で消費。
-    def emit_store_to_slot(expr_node, slot)
-      compile_expr(expr_node)
-      @bytecode.push(Op::STORE_LOCAL)
-      encode_signed(slot)
-      @bytecode.push(Op::POP)
-      nil
-    end
-
-    # counter slot を 0 で初期化。
-    def emit_init_counter(slot)
-      @bytecode.push(Op::PUSH_INT)
-      encode_signed(0)
-      @bytecode.push(Op::STORE_LOCAL)
-      encode_signed(slot)
-      @bytecode.push(Op::POP)
-      nil
-    end
-
-    # counter slot を +1 (LOAD / PUSH 1 / ADD / STORE / POP)。
-    def emit_increment_slot(slot)
-      @bytecode.push(Op::LOAD_LOCAL)
-      encode_signed(slot)
-      @bytecode.push(Op::PUSH_INT)
-      encode_signed(1)
-      @bytecode.push(Op::ADD)
-      @bytecode.push(Op::STORE_LOCAL)
-      encode_signed(slot)
-      @bytecode.push(Op::POP)
-      nil
-    end
-
-    # `arr.each do |x| body end` → while ループに展開する。
-    # 受信者と index は無名 local に保存し、param x はブロック内 var_ref できるよう
-    # 名前付き local として宣言。compile_stmt の不変条件 (1 値スタックに残す) を満たすため
-    # 末尾で受信者を再 push する (Ruby Array#each は self を返す)。
-    def compile_each_block(recv_node, block_node)
-      recv_slot = declare_anonymous_local
-      idx_slot  = declare_anonymous_local
-      param_packed = block_node.node_int_value
-      param_slot = -1
-      if param_packed != 0
-        param_slot = declare_local(param_packed)
-      end
-
-      emit_store_to_slot(recv_node, recv_slot)
-      emit_init_counter(idx_slot)
-
-      # while _i < _recv.length
-      # 注: Stage 3d.3 から `.length` は CALL_METHOD 経由だが、each/map の inline 展開は
-      # perf-critical なため receiver=Array 前提で ARRAY_LEN を直接 emit する
-      # (Stage 3d.4 で each/map も class table 経由にするとこの carve-out も解消予定)。
-      loop_start = @bytecode.length
-      @bytecode.push(Op::LOAD_LOCAL); encode_signed(idx_slot)
-      @bytecode.push(Op::LOAD_LOCAL); encode_signed(recv_slot)
-      @bytecode.push(Op::ARRAY_LEN)
-      @bytecode.push(Op::LT)
-      jexit = emit_jump(Op::JUMP_IF_FALSE)
-
-      # x = _recv[_i] (param が指定された場合のみ)
-      if param_slot >= 0
-        @bytecode.push(Op::LOAD_LOCAL); encode_signed(recv_slot)
-        @bytecode.push(Op::LOAD_LOCAL); encode_signed(idx_slot)
-        @bytecode.push(Op::ARRAY_GET)
-        @bytecode.push(Op::STORE_LOCAL); encode_signed(param_slot)
-        @bytecode.push(Op::POP)
-      end
-
-      compile_block(block_node.node_left)
-      @bytecode.push(Op::POP)
-
-      emit_increment_slot(idx_slot)
-
-      back = emit_jump(Op::JUMP)
-      patch_jump(back, loop_start)
-      patch_jump(jexit, @bytecode.length)
-
-      # each は receiver (self) を返す。
-      @bytecode.push(Op::LOAD_LOCAL); encode_signed(recv_slot)
-      nil
-    end
-
-    # `n.times do |i| body end` → counter ループ。param `|i|` 自体が counter 兼用。
-    # param が省略されたら無名 counter を使う。Ruby Integer#times は self (= n) を返す。
-    def compile_times_block(recv_node, block_node)
-      n_slot       = declare_anonymous_local
-      param_packed = block_node.node_int_value
-      counter_slot = -1
-      if param_packed != 0
-        counter_slot = declare_local(param_packed)
-      else
-        counter_slot = declare_anonymous_local
-      end
-
-      emit_store_to_slot(recv_node, n_slot)
-      emit_init_counter(counter_slot)
-
-      # while i < _n
-      loop_start = @bytecode.length
-      @bytecode.push(Op::LOAD_LOCAL); encode_signed(counter_slot)
-      @bytecode.push(Op::LOAD_LOCAL); encode_signed(n_slot)
-      @bytecode.push(Op::LT)
-      jexit = emit_jump(Op::JUMP_IF_FALSE)
-
-      compile_block(block_node.node_left)
-      @bytecode.push(Op::POP)
-
-      emit_increment_slot(counter_slot)
-
-      back = emit_jump(Op::JUMP)
-      patch_jump(back, loop_start)
-      patch_jump(jexit, @bytecode.length)
-
-      # times は self (= n) を返す。
-      @bytecode.push(Op::LOAD_LOCAL); encode_signed(n_slot)
-      nil
-    end
-
-    # `arr.map do |x| body end` → while ループ + 出力配列構築に展開する。
-    # 形は compile_each_block と同じだが、毎反復で body の戻り値を出力配列に push し、
-    # 最後に出力配列を結果として残す (Ruby Array#map と一致)。
-    def compile_map_block(recv_node, block_node)
-      recv_slot = declare_anonymous_local
-      idx_slot  = declare_anonymous_local
-      out_slot  = declare_anonymous_local
-      param_packed = block_node.node_int_value
-      param_slot = -1
-      if param_packed != 0
-        param_slot = declare_local(param_packed)
-      end
-
-      emit_store_to_slot(recv_node, recv_slot)
-      emit_init_counter(idx_slot)
-
-      # _out = []
-      @bytecode.push(Op::ARRAY_NEW); encode_signed(0)
-      @bytecode.push(Op::STORE_LOCAL); encode_signed(out_slot)
-      @bytecode.push(Op::POP)
-
-      # while _i < _recv.length
-      # 注: Stage 3d.3 から `.length` は CALL_METHOD 経由だが、each/map の inline 展開は
-      # perf-critical なため receiver=Array 前提で ARRAY_LEN を直接 emit する
-      # (Stage 3d.4 で each/map も class table 経由にするとこの carve-out も解消予定)。
-      loop_start = @bytecode.length
-      @bytecode.push(Op::LOAD_LOCAL); encode_signed(idx_slot)
-      @bytecode.push(Op::LOAD_LOCAL); encode_signed(recv_slot)
-      @bytecode.push(Op::ARRAY_LEN)
-      @bytecode.push(Op::LT)
-      jexit = emit_jump(Op::JUMP_IF_FALSE)
-
-      # x = _recv[_i] (param 指定時のみ)
-      if param_slot >= 0
-        @bytecode.push(Op::LOAD_LOCAL); encode_signed(recv_slot)
-        @bytecode.push(Op::LOAD_LOCAL); encode_signed(idx_slot)
-        @bytecode.push(Op::ARRAY_GET)
-        @bytecode.push(Op::STORE_LOCAL); encode_signed(param_slot)
-        @bytecode.push(Op::POP)
-      end
-
-      # _out << body
-      @bytecode.push(Op::LOAD_LOCAL); encode_signed(out_slot)
-      compile_block(block_node.node_left)
-      @bytecode.push(Op::LSHIFT)
-      @bytecode.push(Op::POP)
-
-      emit_increment_slot(idx_slot)
-
-      back = emit_jump(Op::JUMP)
-      patch_jump(back, loop_start)
-      patch_jump(jexit, @bytecode.length)
-
-      # map は構築した出力配列を返す。
-      @bytecode.push(Op::LOAD_LOCAL); encode_signed(out_slot)
-      nil
-    end
-
-    # 名前を持たない無名 local slot を 1 つ確保する。len=0 を埋めることで find_local の
-    # bytes_eq マッチから永久に外す (= ユーザコードからは参照不可)。
-    # コンパイラはここで返る slot idx を STORE_LOCAL/LOAD_LOCAL で直接使う。
-    def declare_anonymous_local
-      @local_starts.push(0)
-      @local_lens.push(0)
-      @local_starts.length - 1 - @scope_base
-    end
-
-    # ローカル変数表と同様の packed (start<<16)|len 比較で "length" / "each" / "times" 判定。
+    # ローカル変数表と同様の packed (start<<16)|len 比較で予約 method 名を判定。
     # KW_*_BYTES の定義はクラス先頭の KW_*_BYTES ブロックにある。
-    def method_name_is_each?(packed)
-      method_name_match?(packed, KW_EACH_BYTES)
-    end
-
-    def method_name_is_times?(packed)
-      method_name_match?(packed, KW_TIMES_BYTES)
-    end
-
-    def method_name_is_map?(packed)
-      method_name_match?(packed, KW_MAP_BYTES)
-    end
-
     def method_name_is_block_given?(packed)
       method_name_match?(packed, KW_BLOCK_GIVEN_BYTES)
     end
@@ -2334,6 +2207,9 @@ module Setsunaruby
       append_bytes(KW_STDERR_BYTES)
       append_bytes(KW_MESSAGE_BYTES)
       append_bytes(KW_INITIALIZE_BYTES)
+      append_bytes(KW_EACH_BYTES)
+      append_bytes(KW_MAP_BYTES)
+      append_bytes(KW_TIMES_BYTES)
       src_bytes = src.bytes
       i = 0
       while i < src_bytes.length
@@ -2394,6 +2270,17 @@ module Setsunaruby
       message_packed = pack_prefix_name(PREFIX_MESSAGE_OFFSET, KW_MESSAGE_BYTES.length)
       register_builtin_method_stderr_message(stderr_idx, message_packed)
 
+      # Stage 3d.5: each / map / times を builtin method として登録。Stage 3c までは
+      # コンパイラが call site にループを inline 展開していたが、3d.5 から user-defined
+      # method と同じ CALL_METHOD_WITH_BLOCK + YIELD 経路で扱うことで、ASTNode/コンパイラの
+      # 特殊化を消す。
+      each_packed  = pack_prefix_name(PREFIX_EACH_OFFSET,  KW_EACH_BYTES.length)
+      map_packed   = pack_prefix_name(PREFIX_MAP_OFFSET,   KW_MAP_BYTES.length)
+      times_packed = pack_prefix_name(PREFIX_TIMES_OFFSET, KW_TIMES_BYTES.length)
+      register_builtin_method_array_each(each_packed)
+      register_builtin_method_array_map(map_packed)
+      register_builtin_method_integer_times(times_packed)
+
       @cur_class = saved_class
       patch_jump(skip, @bytecode.length)
       nil
@@ -2432,6 +2319,114 @@ module Setsunaruby
       @bytecode.push(Op::LOAD_IVAR); encode_signed(0)   # @message slot 0
       @bytecode.push(Op::RETURN)
       finalize_builtin_method(m_idx, stderr_idx, 0)
+      nil
+    end
+
+    # Array#each: arity=0, block 1引数で各要素を yield。最後に self を返す。
+    # block 不在時は最初の YIELD で LocalJumpError (exec_yield 内)。block arity と
+    # yield argc がずれても exec_yield (Stage 3d.5 で lenient) が pad/truncate するため
+    # `arr.each do; ...; end` (block param 省略) でも動く。
+    def register_builtin_method_array_each(name_packed)
+      @cur_class = BUILTIN_CLASS_ARRAY
+      method_pc = @bytecode.length
+      m_idx = declare_method(name_packed, method_pc, 0)
+      emit_iter_init_counter             # i=0 を slot 0 にセット
+      loop_start = @bytecode.length
+      emit_iter_loop_guard_array         # i < self.length なら継続
+      jexit = emit_jump(Op::JUMP_IF_FALSE)
+      @bytecode.push(Op::LOAD_SELF)
+      @bytecode.push(Op::LOAD_LOCAL); encode_signed(0)
+      @bytecode.push(Op::ARRAY_GET)      # self[i]
+      @bytecode.push(Op::YIELD); encode_signed(1)
+      @bytecode.push(Op::POP)
+      emit_iter_increment_counter
+      back = emit_jump(Op::JUMP)
+      patch_jump(back, loop_start)
+      patch_jump(jexit, @bytecode.length)
+      @bytecode.push(Op::LOAD_SELF)
+      @bytecode.push(Op::RETURN)
+      finalize_builtin_method(m_idx, BUILTIN_CLASS_ARRAY, 1)
+      nil
+    end
+
+    # Array#map: arity=0, block の戻り値を新しい配列に集めて返す。
+    # locals: slot 0 = i, slot 1 = out (output array)。
+    def register_builtin_method_array_map(name_packed)
+      @cur_class = BUILTIN_CLASS_ARRAY
+      method_pc = @bytecode.length
+      m_idx = declare_method(name_packed, method_pc, 0)
+      emit_iter_init_counter
+      @bytecode.push(Op::ARRAY_NEW); encode_signed(0)
+      @bytecode.push(Op::STORE_LOCAL); encode_signed(1)
+      @bytecode.push(Op::POP)
+      loop_start = @bytecode.length
+      emit_iter_loop_guard_array
+      jexit = emit_jump(Op::JUMP_IF_FALSE)
+      @bytecode.push(Op::LOAD_LOCAL); encode_signed(1)   # out
+      @bytecode.push(Op::LOAD_SELF)
+      @bytecode.push(Op::LOAD_LOCAL); encode_signed(0)
+      @bytecode.push(Op::ARRAY_GET)
+      @bytecode.push(Op::YIELD); encode_signed(1)
+      @bytecode.push(Op::LSHIFT)                          # out << yielded
+      @bytecode.push(Op::POP)
+      emit_iter_increment_counter
+      back = emit_jump(Op::JUMP)
+      patch_jump(back, loop_start)
+      patch_jump(jexit, @bytecode.length)
+      @bytecode.push(Op::LOAD_LOCAL); encode_signed(1)
+      @bytecode.push(Op::RETURN)
+      finalize_builtin_method(m_idx, BUILTIN_CLASS_ARRAY, 2)
+      nil
+    end
+
+    # Integer#times: arity=0, 0..self-1 まで yield。最後に self を返す。
+    def register_builtin_method_integer_times(name_packed)
+      @cur_class = BUILTIN_CLASS_INTEGER
+      method_pc = @bytecode.length
+      m_idx = declare_method(name_packed, method_pc, 0)
+      emit_iter_init_counter
+      loop_start = @bytecode.length
+      @bytecode.push(Op::LOAD_LOCAL); encode_signed(0)
+      @bytecode.push(Op::LOAD_SELF)
+      @bytecode.push(Op::LT)
+      jexit = emit_jump(Op::JUMP_IF_FALSE)
+      @bytecode.push(Op::LOAD_LOCAL); encode_signed(0)   # i を yield
+      @bytecode.push(Op::YIELD); encode_signed(1)
+      @bytecode.push(Op::POP)
+      emit_iter_increment_counter
+      back = emit_jump(Op::JUMP)
+      patch_jump(back, loop_start)
+      patch_jump(jexit, @bytecode.length)
+      @bytecode.push(Op::LOAD_SELF)
+      @bytecode.push(Op::RETURN)
+      finalize_builtin_method(m_idx, BUILTIN_CLASS_INTEGER, 1)
+      nil
+    end
+
+    # Stage 3d.5 builtin iter ヘルパ: slot 0 を 0 で初期化 (i = 0)。
+    def emit_iter_init_counter
+      @bytecode.push(Op::PUSH_INT); encode_signed(0)
+      @bytecode.push(Op::STORE_LOCAL); encode_signed(0)
+      @bytecode.push(Op::POP)
+      nil
+    end
+
+    # i < self.length を bool として stack 上に残す (Array#each / Array#map 用)。
+    def emit_iter_loop_guard_array
+      @bytecode.push(Op::LOAD_LOCAL); encode_signed(0)
+      @bytecode.push(Op::LOAD_SELF)
+      @bytecode.push(Op::ARRAY_LEN)
+      @bytecode.push(Op::LT)
+      nil
+    end
+
+    # i += 1 (slot 0)。
+    def emit_iter_increment_counter
+      @bytecode.push(Op::LOAD_LOCAL); encode_signed(0)
+      @bytecode.push(Op::PUSH_INT); encode_signed(1)
+      @bytecode.push(Op::ADD)
+      @bytecode.push(Op::STORE_LOCAL); encode_signed(0)
+      @bytecode.push(Op::POP)
       nil
     end
 
@@ -2864,6 +2859,8 @@ module Setsunaruby
           exec_check_exception_class
         elsif op == Op::RERAISE_OR_END
           exec_reraise_or_end
+        elsif op == Op::CALL_SUPER
+          exec_call_super
         elsif op == Op::HALT
           return nil
         else
@@ -3354,7 +3351,7 @@ module Setsunaruby
         i -= 1
       end
 
-      push_call_frame(@pc, @cur_base, block_pc, block_arity)
+      push_call_frame(@pc, @cur_base, m_idx, block_pc, block_arity)
       @cur_base = new_base
       @pc = @method_pcs[m_idx]
       nil
@@ -3363,48 +3360,81 @@ module Setsunaruby
     # コールフレームの並列 IntArray を 1 操作に集約する。フィールド追加時に
     # exec_call_common と exec_return の 2 箇所を同期する手間 (= ドリフト由来のバグ) を防ぐ。
     # Stage 3d.1: @cur_self も同フレームに紐付けて保存する。
-    def push_call_frame(pc, base, block_pc, block_arity)
+    # Stage 3d.5: 「呼び出し元の lexical method」を退避 (yield 時に lexical chain を再現するため)、
+    # @yield_target_idx に新フレーム idx を push (このフレームの method 本体実行中の lexical method)。
+    # m_idx は super 用 (現フレームの defining class を @method_class_idx から逆引きする)。
+    def push_call_frame(pc, base, m_idx, block_pc, block_arity)
+      caller_lexical = -1
+      if @yield_target_idx.length > 0
+        caller_lexical = @yield_target_idx[@yield_target_idx.length - 1]
+      end
+      @cfp_caller_lexical_method.push(caller_lexical)
       @cfp_pcs.push(pc)
       @cfp_bases.push(base)
       @cfp_block_pcs.push(block_pc)
       @cfp_block_arities.push(block_arity)
       @cfp_selfs.push(@cur_self)
+      @cfp_method_idx.push(m_idx)
+      @yield_target_idx.push(@cfp_block_pcs.length - 1)
       nil
     end
 
     # 並列 IntArray を pop し @pc / @cur_base / @cur_self に復元。block 情報は破棄。
     # 複数戻り値で渡すと spinel の poly 推論を誘発しがちなので ivar を直接書き換える。
     def pop_call_frame
+      @yield_target_idx.pop
+      @cfp_method_idx.pop
       @cfp_block_arities.pop
       @cfp_block_pcs.pop
       @cur_self = @cfp_selfs.pop
       @cur_base = @cfp_bases.pop
       @pc       = @cfp_pcs.pop
+      @cfp_caller_lexical_method.pop
       nil
     end
 
-    # Stage 3c.2: yield。現在のフレームの block_pc に飛び、@cur_base を caller のものに切り替える。
+    # Stage 3c.2: yield。現在の lexical method の block_pc に飛び、@cur_base を caller のものに切り替える。
     # @yield_pcs / @yield_bases に method 側の状態を退避し、BLOCK_RETURN で復元する。
     # 引数は YIELD 直前にスタック上に積まれており、ブロックのプロローグが消費する。
+    # Stage 3d.5: 「現在の lexical method」は @yield_target_idx.last (cfp.last ではない)。
+    # ブロック内 yield (def collect; arr.each do; yield; end; end の collect の yield) が
+    # 内側の builtin 呼び出しのフレームを飛び越えて collect のブロックを呼べるようにする。
     def exec_yield
       argc = decode_signed
-      top  = @cfp_block_pcs.length - 1
-      if top < 0 || @cfp_block_pcs[top] < 0
+      target = -1
+      if @yield_target_idx.length > 0
+        target = @yield_target_idx[@yield_target_idx.length - 1]
+      end
+      if target < 0 || @cfp_block_pcs[target] < 0
         raise "LocalJumpError: no block given (yield)"
       end
-      expected_arity = @cfp_block_arities[top]
-      if argc != expected_arity
-        raise "ArgumentError: yield arity mismatch (block expects #{expected_arity}, got #{argc})"
+      expected_arity = @cfp_block_arities[target]
+      # Ruby 互換: argc と block param 数が違っても error にしない (Stage 3d.5)。
+      # argc > expected: 余剰を pop して捨てる。argc < expected: 不足分を nil で埋める。
+      # 各 builtin (each/times/map) は arity 1 で yield するが、ユーザの do ... end (arity 0) でも
+      # 正常に動作する。
+      while argc > expected_arity
+        @stack.pop
+        argc -= 1
+      end
+      while argc < expected_arity
+        @stack.push(ObjectVal::NIL_VAL)
+        argc += 1
       end
       @yield_pcs.push(@pc)
       @yield_bases.push(@cur_base)
-      @cur_base = @cfp_bases[top]
-      @pc       = @cfp_block_pcs[top]
+      @cur_base = @cfp_bases[target]
+      @pc       = @cfp_block_pcs[target]
+      # block を実行する間の lexical method は「block 提供元 frame の caller の lexical method」。
+      # = @cfp_caller_lexical_method[target]。
+      @yield_target_idx.push(@cfp_caller_lexical_method[target])
       nil
     end
 
     # Stage 3c.2: ブロック本体終端。スタック top はブロックの戻り値 (保持)。
+    # Stage 3d.5: yield_target を 1 つ pop して lexical method context を巻き戻す。
     def exec_block_return
+      @yield_target_idx.pop
       @pc       = @yield_pcs.pop
       @cur_base = @yield_bases.pop
       nil
@@ -3413,8 +3443,12 @@ module Setsunaruby
     # Stage 3c.3: 現在のフレームが block を受け取って呼ばれていれば true、そうでなければ false。
     # トップレベル (フレームなし) は false を返す (Ruby と同様: トップレベル yield は LocalJumpError)。
     def exec_block_given_p
-      top = @cfp_block_pcs.length - 1
-      if top < 0 || @cfp_block_pcs[top] < 0
+      # Stage 3d.5: block_given? も yield と同じく lexical method の block を見る。
+      target = -1
+      if @yield_target_idx.length > 0
+        target = @yield_target_idx[@yield_target_idx.length - 1]
+      end
+      if target < 0 || @cfp_block_pcs[target] < 0
         @stack.push(ObjectVal::FALSE_VAL)
       else
         @stack.push(ObjectVal::TRUE_VAL)
@@ -3449,6 +3483,38 @@ module Setsunaruby
         i += 1
       end
       alloc_heap_slot(HEAP_KIND_INSTANCE, ivar_start, ivar_count, class_idx)
+    end
+
+    # Stage 3d.5: super 呼び出し。受信者は @cur_self、検索開始 class は現フレームの method の
+    # defining class の親 (= 自分自身は skip)。引数は CALL_SUPER 直前に push 済み。
+    def exec_call_super
+      name_packed = decode_signed
+      argc        = decode_signed
+      if @cfp_method_idx.length == 0
+        raise "RuntimeError: super はトップレベルでは呼べません"
+      end
+      cur_m_idx = @cfp_method_idx[@cfp_method_idx.length - 1]
+      cur_class = @method_class_idx[cur_m_idx]
+      if cur_class < 0
+        raise "RuntimeError: super: 現在の method がクラスに属していません"
+      end
+      parent_class = @class_parent_idx[cur_class]
+      if parent_class < 0
+        raise "NoMethodError: super: 親クラスがありません"
+      end
+      m_idx = find_method_in_class(parent_class, name_packed)
+      if m_idx < 0
+        raise "NoMethodError: super: 親クラス chain に該当 method がありません"
+      end
+      expected = @method_arities[m_idx]
+      if expected != argc
+        raise "ArgumentError: super: arity mismatch (expected #{expected}, got #{argc})"
+      end
+      # 受信者は呼び出し元と同じ self を使い回す (新フレームの @cur_self)。
+      receiver = @cur_self
+      exec_call_common(m_idx, -1, 0)
+      @cur_self = receiver
+      nil
     end
 
     # Stage 3d.1: obj.method(args) の動的ディスパッチ。
@@ -3629,6 +3695,8 @@ module Setsunaruby
       while @yield_pcs.length > yield_depth
         @yield_bases.pop
         @yield_pcs.pop
+        # Stage 3d.5: 各 YIELD は @yield_target_idx を 1 push しているので、巻き戻しも同期。
+        @yield_target_idx.pop
       end
       while @stack.length > stack_depth
         @stack.pop
