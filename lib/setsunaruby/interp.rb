@@ -435,7 +435,7 @@ module Setsunaruby
       # するため、compile_raise / compile_begin_rescue がこの idx を見て jit_call_counts を
       # 即 threshold に上げる。
       @cur_method_idx_for_jit = -1
-      # Stage 4b: break / next の jump 解決スタック (並列 IntArray、spinel ルール 3)。
+      # break / next の jump 解決スタック (並列 IntArray、spinel ルール 3)。
       # @loop_start_pcs の末尾 = 最内側 loop の cond 再評価位置 (next の jump target)。
       # @break_patch_starts の末尾 = 最内側 loop の break 用 placeholder の開始 idx (in @break_patch_pcs)。
       # @break_patch_pcs はすべての loop の break placeholder PC を flat に並べ、loop 退出時に
@@ -2214,8 +2214,9 @@ module Setsunaruby
       # Stage 3e: raise/begin が出てきたら現在の method を JIT skip にするため、現 m_idx を退避。
       saved_method_idx_for_jit = @cur_method_idx_for_jit
       @cur_method_idx_for_jit = m_idx
-      # Stage 4b: break/next のスコープを method 境界で切る (外側 loop へ漏らさない)。
-      @loop_scope_barriers.push(@loop_start_pcs.length)
+      # break/next のスコープを method 境界で切る (外側 loop へ漏らさないため、
+      # 現在の loop 深度を barrier として積む。compile_break/next が in_loop_scope? で参照する)。
+      push_loop_scope_barrier
 
       # パラメータを slot 0..argc-1 に登録。declare_local は @scope_base 相対の
       # slot idx (= 0..argc-1) を返す。
@@ -2238,7 +2239,7 @@ module Setsunaruby
       @scope_base = saved_scope_base
       @in_method = false
       @cur_method_idx_for_jit = saved_method_idx_for_jit
-      @loop_scope_barriers.pop
+      pop_loop_scope_barrier
 
       patch_jump(skip_jump_pos, @bytecode.length)
       # def 文自体の値は nil (compile_stmt の不変条件「1 値残す」を維持)。
@@ -2309,14 +2310,13 @@ module Setsunaruby
         encode_signed(param_slot)
         @bytecode.push(Op::POP)
       end
-      # Stage 4b: ブロック境界で break/next スコープを切る (#40 のスコープ外: ブロックから
-      # 外側 loop への break/next は不可)。barrier に現在の loop 深度を積んでおき、
-      # in_loop_scope? が「barrier より深い loop」のみ可視と判定する。
-      @loop_scope_barriers.push(@loop_start_pcs.length)
+      # ブロック境界で break/next スコープを切る (#40 ではブロックから外側 loop への
+      # break/next は対象外)。in_loop_scope? が「barrier より深い loop」のみ可視と判定。
+      push_loop_scope_barrier
       # body は最後にスタックへ 1 値を残す不変条件 (compile_block の前提)。
       compile_block(block_node.node_left)
       @bytecode.push(Op::BLOCK_RETURN)
-      @loop_scope_barriers.pop
+      pop_loop_scope_barrier
       patch_jump(skip, @bytecode.length)
       block_pc
     end
@@ -2890,8 +2890,8 @@ module Setsunaruby
 
     def compile_while(node)
       loop_start = @bytecode.length
-      # Stage 4b: break/next の jump 解決スタックに進入を記録。`next` は loop_start に
-      # 飛び、`break` は body 末尾以降の PC (= post-jexit の PUSH_NIL の位置) に飛ぶ。
+      # break/next の jump 解決スタックに進入を記録。`next` は loop_start (cond 再評価位置)、
+      # `break` は body 末尾以降 (= post-jexit の PUSH_NIL の位置) を target とする。
       @loop_start_pcs.push(loop_start)
       @break_patch_starts.push(@break_patch_pcs.length)
 
@@ -2921,17 +2921,21 @@ module Setsunaruby
       nil
     end
 
-    # Stage 4b: `break` / `next` を JUMP に展開。
-    # break は loop 末尾 (jexit と同位置) への前方ジャンプで、target は loop body 終了後に
-    # patch up される (compile_while → patch_break_targets)。
-    # next は loop 先頭 (cond 再評価位置) への後方ジャンプで、target は既知のため即 patch。
-    # 両者とも JUMP のみで値を push しないが、JUMP 直後のコードは到達不能になるため
-    # compile_block の「stmt は 1 値残す」不変条件は壊れる。HIR builder は静的に
-    # 不整合を検出するので、break/next を含む method は JIT skip にする。
-    # 「現在のスコープで見える」最内側 loop が存在するかを判定する。
-    # @loop_scope_barriers の末尾が、現在の compile スコープから見える最小の loop_start_pcs
-    # 深度 (= ブロック/メソッド境界で 0 にリセットされる)。break/next は barrier より深い
-    # 位置の loop のみを target にできる。
+    # method / block 進入時に現在の loop 深度を barrier として積み、退出時に pop する。
+    # in_loop_scope? は「barrier より深い loop」のみを可視と判定するため、ブロック / メソッド
+    # 境界をまたいで break/next が外側 loop を target にすることを防ぐ。
+    def push_loop_scope_barrier
+      @loop_scope_barriers.push(@loop_start_pcs.length)
+      nil
+    end
+
+    def pop_loop_scope_barrier
+      @loop_scope_barriers.pop
+      nil
+    end
+
+    # 現在の compile スコープから見える最内側 loop が存在するか。barrier より深い位置の loop
+    # のみを target にできる (= ブロック / メソッド境界をまたぐ break/next は禁止)。
     def in_loop_scope?
       barrier = 0
       if @loop_scope_barriers.length > 0
@@ -2940,6 +2944,9 @@ module Setsunaruby
       @loop_start_pcs.length > barrier
     end
 
+    # `break` / `next` を JUMP に展開する。両者とも JUMP のみで値を push しないが、
+    # JUMP 直後のコードは到達不能になるため compile_block の「stmt は 1 値残す」不変条件は
+    # 静的には壊れる。HIR builder が踏まないよう mark_current_method_jit_unsafe で除外する。
     def compile_break
       if !in_loop_scope?
         raise "Compile error: line #{@cur_token.line}: break は loop / while の中でのみ使えます"
