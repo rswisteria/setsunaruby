@@ -36,6 +36,10 @@ setsunaruby (Ruby サブセットを実装するスタックマシン型処理�
   - [jit/status.md](jit/status.md) — 案 A (ダンプまで) と案 C (実機実行) の差分、
     spinel 拡張で必要な機能
 
+- **GC (ガベージコレクタ)**
+  - [gc/overview.md](gc/overview.md) — Stage GC-1 (Mark-Sweep) のヒープモデル、
+    ルートセット、アロケーション経路、spinel 互換の工夫
+
 ## 設計上の前提
 
 setsunaruby のすべてのレイヤに通底する制約は **「spinel の whole-program 型推論を

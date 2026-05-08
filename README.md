@@ -7,7 +7,7 @@ Ruby 文法を持つ、スタックマシン型プログラミング言語の処
 「刹那」(10⁻¹⁸) から命名。mruby / nanoruby / picoruby に続く、
 さらに小さな Ruby 系列という位置付け。
 
-## 現状: Stage 0 / 0.5 / 1 / 2 / 3a / 3b / 3c.1 / 3c.2 / 3c.3 / 3d.1 / 3d.2 / 3d.3 / 3d.4 / 3d.5 / 3e / JIT-1 / JIT-2 / JIT-3a / JIT-3b1 / JIT-3b2 / JIT-3b3 / JIT-3c / JIT-4 (案 A) 完了
+## 現状: Stage 0 / 0.5 / 1 / 2 / 3a / 3b / 3c.1 / 3c.2 / 3c.3 / 3d.1 / 3d.2 / 3d.3 / 3d.4 / 3d.5 / 3e / GC-1 / JIT-1 / JIT-2 / JIT-3a / JIT-3b1 / JIT-3b2 / JIT-3b3 / JIT-3c / JIT-4 (案 A) 完了
 
 スタックマシン上で **再帰 `fib(20)` / アッカーマン / tarai が CRuby + spinel AOT 両方で動作**。
 
@@ -241,6 +241,8 @@ Symbol/sp_sym を経由すると spinel の Token フィールド型推論が崩
 | 3d.4 | 継承 (`class B < A`、method/ivar/initialize 継承) | ✅ 完了 |
 | 3d.5 | each/times/map を builtin method 化 + `super` | ✅ 完了 |
 | 3e | 例外処理 (`begin/rescue/ensure`、`raise`、StandardError builtin) | ✅ 完了 |
+| GC-1 | STW Mark-Sweep による heap slot 回収 (free list 再利用) | ✅ 完了 |
+| GC-2 | pool 圧縮 (`@str_pool` / `@heap_arr_pool` / `@instance_ivar_pool`) | 未着手 |
 | ∞ | 自己ホスト (setsunaruby を setsunaruby で動かす) | 究極目標 |
 
 ## ディレクトリ構成
