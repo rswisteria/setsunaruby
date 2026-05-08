@@ -3040,6 +3040,9 @@ module Setsunaruby
     # 自然に得る (== は値比較として別実装)。
     # GC-2: literal バイトは @strlit_pool 上にあるので strlit_to_str_pool 経由で copy する。
     def heap_str_alloc_from_lit(lit_idx)
+      # pool 操作の前に GC check。literal バイトはルートに含まれない (@strlit_pool は
+      # GC 対象外) ので退避不要。
+      gc_check_threshold
       new_start = @str_pool.length
       src_len   = @strlit_lens[lit_idx]
       strlit_to_str_pool(@strlit_starts[lit_idx], src_len)
@@ -3048,6 +3051,14 @@ module Setsunaruby
 
     # `+`: 新しいヒープ String を確保し、lhs/rhs のバイトを順に append する。
     def heap_str_concat(lhs_id, rhs_id)
+      # lhs/rhs は呼び出し側 (exec_arith) で @stack から pop された後の引数。
+      # GC 中ルート保護のため一旦 @stack に押し戻して GC を走らせ、その後 pop する。
+      # GC 後は @heap_starts[lhs/rhs_idx] が new pool 上の新 offset に更新済み。
+      @stack.push(lhs_id)
+      @stack.push(rhs_id)
+      gc_check_threshold
+      @stack.pop
+      @stack.pop
       lhs_idx = unbox_heap(lhs_id)
       rhs_idx = unbox_heap(rhs_id)
       ll = @heap_lens[lhs_idx]
@@ -3245,14 +3256,12 @@ module Setsunaruby
     # @heap_instance_class / @heap_marked の 5 並列 IntArray を 1 操作で更新し、
     # 新 obj_id を返す。非インスタンス (string/array) は class_idx = -1 で push する。
     #
-    # Stage GC-1: live slot 数が @gc_threshold を超えたら gc_collect を起動し、
-    # freelist に idx があれば再利用する (kind/start/len/class_idx を上書き)。
+    # GC は呼び出し側 (各 alloc ヘルパ) が事前に gc_check_threshold で起動する。
+    # ここでは slot 登録のみに専念する。理由: alloc_heap_slot 内で GC を起動すると、
+    # 引数 start が呼び出し元で確定済みの「GC 前の pool length」となり、GC-2 の pool
+    # 圧縮で pool が縮んだ後に新 slot に書き込まれて範囲外を指すバグになる。
     # spinel rule 6 に従い、戻り値は中間変数 result を経由して返す。
     def alloc_heap_slot(kind, start, len, class_idx)
-      live_count = @heap_kind.length - @heap_freelist.length
-      if live_count >= @gc_threshold
-        gc_collect
-      end
       result = 0
       if @heap_freelist.length > 0
         idx = @heap_freelist.pop
@@ -3271,6 +3280,16 @@ module Setsunaruby
         result = box_heap(@heap_kind.length - 1)
       end
       result
+    end
+
+    # alloc サイトから明示的に呼ばれる GC トリガ。pool 操作 (push) を始める **前** に
+    # 呼ぶ必要がある。pool 書き込み後に呼ぶと、書き込んだバイトが live slot に紐付く
+    # 前に GC が走り、pool 圧縮で書き込みが消える。
+    def gc_check_threshold
+      live_count = @heap_kind.length - @heap_freelist.length
+      if live_count >= @gc_threshold
+        gc_collect
+      end
     end
 
     # `<<`: lhs slot の start/len を「新しい末尾位置 + 連結後の長さ」に書き換える
@@ -3325,6 +3344,10 @@ module Setsunaruby
     # `[i] = v` はその場で `@heap_arr_pool[start + i] = v`。
 
     def heap_array_alloc(size)
+      # スタックから pop する前に GC check。pop 後の reversed ローカル変数は GC ルートに
+      # 含まれないので、pop 後に GC を起動すると要素 (heap obj) が unreachable 扱いになり
+      # sweep で消えてしまう。pop 前なら @stack 上の要素はルート保護される。
+      gc_check_threshold
       # スタックからの pop はトップから逆順なので、一旦ローカル IntArray に逆順で退避してから
       # @heap_arr_pool に正順で push する。
       reversed = []
@@ -3720,6 +3743,8 @@ module Setsunaruby
     # ivar slot は total_ivar_count (親 chain 込み) ぶんを NIL_VAL で初期化する。
     # exec_instance_new と Stage 3e の wrap_str_in_stderr (raise "string" の暗黙ラップ) で共有する。
     def alloc_instance(class_idx)
+      # pool 操作 (NIL_VAL push) の前に GC check。NIL_VAL は即値なので GC でも消えない。
+      gc_check_threshold
       ivar_count = total_ivar_count(class_idx)
       ivar_start = @instance_ivar_pool.length
       i = 0
