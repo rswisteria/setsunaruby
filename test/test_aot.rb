@@ -328,6 +328,23 @@ assert_fails("raise \"unhandled\"\n", "EXC: 未捕捉 raise はプロセスを a
 assert_fails("begin\n  raise \"x\"\nrescue Undef\n  nil\nend\n", "EXC: 未定義クラスを rescue")
 assert_fails("begin\n  1\nend\n", "EXC: rescue/ensure なしの begin はパースエラー")
 
+# ---- Stage 4a: ビット/論理演算 ----
+assert_output("puts 1 << 3\n", "8\n", "BIT: 整数左シフト")
+assert_output("puts 8 >> 2\n", "2\n", "BIT: 整数右シフト")
+assert_output("puts 12 & 10\n", "8\n", "BIT: AND")
+assert_output("puts 12 | 10\n", "14\n", "BIT: OR")
+assert_output("puts 12 ^ 10\n", "6\n", "BIT: XOR")
+assert_output("puts ~0\n", "-1\n", "BIT: NOT")
+assert_output("puts 1 != 2\n", "true\n", "LOG: !=")
+assert_output("puts !true\n", "false\n", "LOG: !")
+assert_output("puts true && false\n", "false\n", "LOG: &&")
+assert_output("puts nil || 7\n", "7\n", "LOG: || rhs を返す")
+assert_output("puts 1 + 2 << 1\n", "6\n", "PRI: + > <<")
+assert_output("puts 1 << 2 | 1\n", "5\n", "PRI: << > | (Ruby 互換)")
+assert_output(File.read(File.expand_path('../examples/bitops.rb', __dir__)),
+              "8\n2\n8\n14\n6\n-1\n14\n15\nfalse\ntrue\ntrue\nfalse\ntrue\nfalse\ntrue\n7\n0\n6\n5\ntrue\n327683\n",
+              "examples/bitops.rb")
+
 # ---- Stage GC-1: GC 動作下での examples 不変 ----
 assert_output(File.read(File.expand_path('../examples/gc.rb', __dir__)),
               "done: xy\nxy\nxy\n",
@@ -335,7 +352,9 @@ assert_output(File.read(File.expand_path('../examples/gc.rb', __dir__)),
 
 # ---- エラー系 ----
 assert_fails(%(puts "a" + 1\n),  "STR: + 型エラー")
-assert_fails(%(puts 1 << 1\n),   "STR: << は (string|array) のみ (Fixnum 不可)")
+# Stage 4a 以降は `Fixnum << Fixnum` が整数左シフトに dispatch される。
+# 残るは混合型のエラーのみ。
+assert_fails(%(puts "a" << 1\n), "STR: String << Fixnum は依然エラー")
 assert_fails("a = [1, 2]\nputs a[-1]\n",  "ARR: 負 index は Stage 3b スコープ外")
 assert_fails("puts 1.length\n",            "ARR: Fixnum.length は不可")
 assert_fails("puts 1 / 0\n",     "ゼロ除算")

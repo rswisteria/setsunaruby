@@ -131,7 +131,8 @@ assert_raises("puts 1.length\n",                              "Fixnum.length は
 assert_raises("puts \"abc\".length\n",                        "String.length は Stage 3b 未対応")
 assert_raises("a = 1\nputs a[0]\n",                           "Fixnum[0] は不可")
 assert_raises("a = [1, 2]\nputs a[\"x\"]\n",                  "index に Integer 以外")
-assert_raises("puts 1 << 1\n",                                "Fixnum << Fixnum はエラー (Stage 3a と同じ)")
+# Stage 4a 以降は `Fixnum << Fixnum` が整数左シフトに dispatch される。残るは混合型のエラーのみ。
+assert_raises("a = [1]\nputs 1 << a\n",                       "Fixnum << Array はエラー")
 assert_raises("puts [1, 2\n",                                  "閉じ ] なし")
 # 末尾カンマは Ruby と同じく許容 (`[1, 2,]` は `[1, 2]` と等価)
 assert_output("a = [1, 2,]\nputs a.length\n", "2\n",          "末尾カンマは許容")

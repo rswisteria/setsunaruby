@@ -30,6 +30,7 @@ test-cruby:
 	ruby test/test_stage3d4.rb
 	ruby test/test_stage3d5.rb
 	ruby test/test_stage3e.rb
+	ruby test/test_stage4a.rb
 	ruby test/test_stage_jit.rb
 	ruby test/test_gc.rb
 

@@ -259,6 +259,7 @@ Symbol/sp_sym を経由すると spinel の Token フィールド型推論が崩
 | 3d.4 | 継承 (`class B < A`、method/ivar/initialize 継承) | ✅ 完了 |
 | 3d.5 | each/times/map を builtin method 化 + `super` | ✅ 完了 |
 | 3e | 例外処理 (`begin/rescue/ensure`、`raise`、StandardError builtin) | ✅ 完了 |
+| 4a | 整数のビット演算 (`<< >> & \| ^ ~`) と論理演算 (`&& \|\| ! !=`) | ✅ 完了 |
 | GC-1 | STW Mark-Sweep による heap slot 回収 (free list 再利用) | ✅ 完了 |
 | GC-2 | pool 圧縮 (`@str_pool` / `@heap_arr_pool` / `@instance_ivar_pool`) | ✅ 完了 |
 | ∞ | 自己ホスト (setsunaruby を setsunaruby で動かす) | 究極目標 |
@@ -292,7 +293,8 @@ Symbol/sp_sym を経由すると spinel の Token フィールド型推論が崩
 │   ├── initialize.rb         # Stage 3d.2: initialize + 引数付き .new のショーケース
 │   ├── inherit.rb            # Stage 3d.4: 継承 (class B < A) のショーケース
 │   ├── super.rb              # Stage 3d.5: super と builtin (each/map/times) のショーケース
-│   └── exception.rb          # Stage 3e: begin/rescue/ensure + raise のショーケース
+│   ├── exception.rb          # Stage 3e: begin/rescue/ensure + raise のショーケース
+│   └── bitops.rb             # Stage 4a: ビット演算 (`<< >> & \| ^ ~`) と論理演算 (`&& \|\| ! !=`) のショーケース
 ├── test/
 │   ├── test_stage0.rb        # CRuby Stage 0 テスト (38件)
 │   ├── test_stage1.rb        # CRuby Stage 1 テスト (28件)
@@ -308,8 +310,9 @@ Symbol/sp_sym を経由すると spinel の Token フィールド型推論が崩
 │   ├── test_stage3d4.rb      # CRuby Stage 3d.4 テスト (14件)
 │   ├── test_stage3d5.rb      # CRuby Stage 3d.5 テスト (17件)
 │   ├── test_stage3e.rb       # CRuby Stage 3e テスト (21件)
+│   ├── test_stage4a.rb       # CRuby Stage 4a テスト (ビット/論理演算、63件)
 │   ├── test_stage_jit.rb     # CRuby JIT-1/2/3a/3b1/3b2/3b3/3c/4 テスト (108件)
-│   └── test_aot.rb           # AOT テスト (Stage 0/1/2/3a/3b/3c/3d/3e + JIT)
+│   └── test_aot.rb           # AOT テスト (Stage 0/1/2/3a/3b/3c/3d/3e/4a + JIT)
 ├── setsunaruby               # spinel ビルド成果物 (gitignore)
 └── Makefile
 ```

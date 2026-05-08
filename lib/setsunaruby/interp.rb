@@ -37,9 +37,12 @@ module Setsunaruby
     RBRACK_B   = 93  # ']' (Stage 3b)
     LBRACE_B   = 123 # '{' (Stage 3c.3 中括弧ブロック)
     RBRACE_B   = 125 # '}'
-    PIPE_B     = 124 # '|' (Stage 3c.1 ブロックパラメータ)
+    PIPE_B     = 124 # '|' (Stage 3c.1 ブロックパラメータ、Stage 4a 整数 OR)
     Q_MARK_B   = 63  # '?' (Stage 3c.3 識別子末尾)
-    BANG_B     = 33  # '!' (Stage 3c.3 識別子末尾)
+    BANG_B     = 33  # '!' (Stage 3c.3 識別子末尾、Stage 4a 否定 / 不等価先頭)
+    AMP_B      = 38  # '&' (Stage 4a 整数 AND / `&&`)
+    CARET_B    = 94  # '^' (Stage 4a 整数 XOR)
+    TILDE_B    = 126 # '~' (Stage 4a 整数 NOT)
     AT_B       = 64  # '@' (Stage 3d.1 インスタンス変数)
     PCT   = 37
     EQ    = 61
@@ -722,8 +725,37 @@ module Setsunaruby
         @lex_pos += 1
         Token.new(TokenKind::DOT, 0, "", @line)
       elsif b == PIPE_B
+        if @lex_pos + 1 < @bytes.length && @bytes[@lex_pos + 1] == PIPE_B
+          @lex_pos += 2
+          Token.new(TokenKind::LOR, 0, "", @line)
+        else
+          @lex_pos += 1
+          Token.new(TokenKind::PIPE, 0, "", @line)
+        end
+      elsif b == AMP_B
+        if @lex_pos + 1 < @bytes.length && @bytes[@lex_pos + 1] == AMP_B
+          @lex_pos += 2
+          Token.new(TokenKind::LAND, 0, "", @line)
+        else
+          @lex_pos += 1
+          Token.new(TokenKind::BAND, 0, "", @line)
+        end
+      elsif b == CARET_B
         @lex_pos += 1
-        Token.new(TokenKind::PIPE, 0, "", @line)
+        Token.new(TokenKind::BXOR, 0, "", @line)
+      elsif b == TILDE_B
+        @lex_pos += 1
+        Token.new(TokenKind::BNOT, 0, "", @line)
+      elsif b == BANG_B
+        # 識別子末尾の `!` (`destructive!` 等) は read_ident_or_keyword で取り込み済み。
+        # ここに来るのは演算子文脈の単独 `!` または `!=`。
+        if @lex_pos + 1 < @bytes.length && @bytes[@lex_pos + 1] == EQ
+          @lex_pos += 2
+          Token.new(TokenKind::NEQ, 0, "", @line)
+        else
+          @lex_pos += 1
+          Token.new(TokenKind::NOT, 0, "", @line)
+        end
       elsif b == EQ
         if @lex_pos + 1 < @bytes.length && @bytes[@lex_pos + 1] == EQ
           @lex_pos += 2
@@ -751,6 +783,9 @@ module Setsunaruby
         if @lex_pos + 1 < @bytes.length && @bytes[@lex_pos + 1] == EQ
           @lex_pos += 2
           Token.new(TokenKind::GE, 0, "", @line)
+        elsif @lex_pos + 1 < @bytes.length && @bytes[@lex_pos + 1] == GT_BYTE
+          @lex_pos += 2
+          Token.new(TokenKind::SHR, 0, "", @line)
         else
           @lex_pos += 1
           Token.new(TokenKind::GT, 0, "", @line)
@@ -898,12 +933,18 @@ module Setsunaruby
 
     # 既に primary を 1 つ読み終えた状態から、続く演算子を取り込んで式を完成させる。
     # 最初に postfix (`[i]` / `.name`) を消費してから二項演算チェーンに入る。
+    # 高優先度から低優先度へ順に畳み込む (各 `_continue` は左結合で先頭ノードを更新)。
     def parse_expression_from(left, _line)
       left = parse_postfix_from(left)
       left = parse_multiplicative_from(left)
       left = parse_additive_continue(left)
       left = parse_shift_continue(left)
-      left = parse_comparison_continue(left)
+      left = parse_band_continue(left)
+      left = parse_bor_continue(left)
+      left = parse_rel_continue(left)
+      left = parse_eq_continue(left)
+      left = parse_and_continue(left)
+      left = parse_or_continue(left)
       left
     end
 
@@ -1023,23 +1064,64 @@ module Setsunaruby
       node
     end
 
-    # `<<` は加減と比較の間。Ruby の優先順位 (`<<` は加減より低く比較より高い) と同じ。
-    # 左結合: `a << b << c` → `(a << b) << c`。
-    def parse_shift_continue(node)
-      while @cur_token.kind == TokenKind::LSHIFT
+    # 整数 AND `&` (左結合)。Ruby precedence: `<< >>` より低く、`| ^` より高い。
+    def parse_band_continue(node)
+      while @cur_token.kind == TokenKind::BAND
         @cur_token = next_token
-        rhs = parse_additive
-        node = ASTNode.new(:bin_op, 0, false, :lshift, node, rhs, nil)
+        rhs = parse_shift_expr
+        node = ASTNode.new(:bin_op, 0, false, :band, node, rhs, nil)
       end
       node
     end
 
-    def parse_comparison_continue(left)
+    # 整数 OR `|` / XOR `^` (Ruby と同じく同一レベル、左結合)。
+    # ブロックパラメータ `do |x|` の `|` とは文脈が異なる (block_arg は do/{ 直後でしか
+    # parse されない) ため衝突しない。
+    def parse_bor_continue(node)
+      loop do
+        k = @cur_token.kind
+        if k == TokenKind::PIPE
+          @cur_token = next_token
+          rhs = parse_band_expr
+          node = ASTNode.new(:bin_op, 0, false, :bor, node, rhs, nil)
+        elsif k == TokenKind::BXOR
+          @cur_token = next_token
+          rhs = parse_band_expr
+          node = ASTNode.new(:bin_op, 0, false, :bxor, node, rhs, nil)
+        else
+          break
+        end
+      end
+      node
+    end
+
+    # `<<` `>>` は加減と `&` の間。Ruby の優先順位と同じ (左結合)。
+    # `a << b << c` → `(a << b) << c`、`a << b + c` → `a << (b + c)`、
+    # `1 << 2 | 1` → `(1 << 2) | 1` = 5。
+    def parse_shift_continue(node)
+      loop do
+        k = @cur_token.kind
+        if k == TokenKind::LSHIFT
+          @cur_token = next_token
+          rhs = parse_additive
+          node = ASTNode.new(:bin_op, 0, false, :lshift, node, rhs, nil)
+        elsif k == TokenKind::SHR
+          @cur_token = next_token
+          rhs = parse_additive
+          node = ASTNode.new(:bin_op, 0, false, :shr, node, rhs, nil)
+        else
+          break
+        end
+      end
+      node
+    end
+
+    # 関係演算 `< > <= >=` (連鎖禁止)。`<<` は parse_shift_continue 側で先に
+    # 食われるため、ここに到達する `<` は単独 LT。
+    def parse_rel_continue(left)
       tk = @cur_token.kind
       op = :nop
-      if tk == TokenKind::EQ_EQ
-        op = :eq
-      elsif tk == TokenKind::LT
+      if tk == TokenKind::LT
         op = :lt
       elsif tk == TokenKind::GT
         op = :gt
@@ -1050,16 +1132,59 @@ module Setsunaruby
       end
       if op != :nop
         @cur_token = next_token
-        right = parse_additive
+        right = parse_bor_expr
         tk2 = @cur_token.kind
-        if tk2 == TokenKind::EQ_EQ || tk2 == TokenKind::LT || tk2 == TokenKind::GT ||
-           tk2 == TokenKind::LE   || tk2 == TokenKind::GE
+        if tk2 == TokenKind::LT || tk2 == TokenKind::GT ||
+           tk2 == TokenKind::LE || tk2 == TokenKind::GE
           raise "Parse error: line #{@cur_token.line}: 比較演算子の連鎖は許可されていません"
         end
         ASTNode.new(:bin_op, 0, false, op, left, right, nil)
       else
         left
       end
+    end
+
+    # 等価演算 `== !=` (連鎖禁止、関係演算より低優先度)。
+    def parse_eq_continue(left)
+      tk = @cur_token.kind
+      op = :nop
+      if tk == TokenKind::EQ_EQ
+        op = :eq
+      elsif tk == TokenKind::NEQ
+        op = :neq
+      end
+      if op != :nop
+        @cur_token = next_token
+        right = parse_rel_expr
+        tk2 = @cur_token.kind
+        if tk2 == TokenKind::EQ_EQ || tk2 == TokenKind::NEQ
+          raise "Parse error: line #{@cur_token.line}: 等価演算子の連鎖は許可されていません"
+        end
+        ASTNode.new(:bin_op, 0, false, op, left, right, nil)
+      else
+        left
+      end
+    end
+
+    # 短絡 AND `&&` (左結合)。bool 中間ローカル変数を作らないため、
+    # bytecode は JUMP_IF_FALSE で展開する (compile_expr 側、CLAUDE.md ルール 12)。
+    def parse_and_continue(node)
+      while @cur_token.kind == TokenKind::LAND
+        @cur_token = next_token
+        rhs = parse_eq_expr
+        node = ASTNode.new(:bin_op, 0, false, :land, node, rhs, nil)
+      end
+      node
+    end
+
+    # 短絡 OR `||` (左結合)。bytecode は JUMP_IF_TRUE で展開する。
+    def parse_or_continue(node)
+      while @cur_token.kind == TokenKind::LOR
+        @cur_token = next_token
+        rhs = parse_and_expr
+        node = ASTNode.new(:bin_op, 0, false, :lor, node, rhs, nil)
+      end
+      node
     end
 
     def parse_if
@@ -1307,13 +1432,43 @@ module Setsunaruby
           return parse_expression_from(left_node, line)
         end
       end
-      parse_comparison
+      parse_or_expr
     end
 
-    def parse_comparison
-      left = parse_additive
-      left = parse_shift_continue(left)
-      parse_comparison_continue(left)
+    # ---- Stage 4a 演算子優先順位 (低→高) ----
+    # Ruby と一致 (`<< >>` は `& | ^` より高優先度)。
+    # parse_or_expr (||) → parse_and_expr (&&) → parse_eq_expr (== !=)
+    #   → parse_rel_expr (< > <= >=) → parse_bor_expr (| ^) → parse_band_expr (&)
+    #   → parse_shift_expr (<< >>) → parse_additive (+ -) → parse_multiplicative (* / %)
+    #   → parse_unary (- ~ !)
+    # 各 `_continue` は parse_expression_from から再利用する (IDENT/IVAR primary 経由)。
+    # `!` は Ruby と同じく単項高優先度 (parse_unary) に置く。
+    def parse_or_expr
+      parse_or_continue(parse_and_expr)
+    end
+
+    def parse_and_expr
+      parse_and_continue(parse_eq_expr)
+    end
+
+    def parse_eq_expr
+      parse_eq_continue(parse_rel_expr)
+    end
+
+    def parse_rel_expr
+      parse_rel_continue(parse_bor_expr)
+    end
+
+    def parse_bor_expr
+      parse_bor_continue(parse_band_expr)
+    end
+
+    def parse_band_expr
+      parse_band_continue(parse_shift_expr)
+    end
+
+    def parse_shift_expr
+      parse_shift_continue(parse_additive)
     end
 
     def parse_additive
@@ -1327,9 +1482,16 @@ module Setsunaruby
     end
 
     def parse_unary
-      if @cur_token.kind == TokenKind::MINUS
+      k = @cur_token.kind
+      if k == TokenKind::MINUS
         @cur_token = next_token
         ASTNode.new(:unary_minus, 0, false, :nop, nil, nil, parse_unary)
+      elsif k == TokenKind::BNOT
+        @cur_token = next_token
+        ASTNode.new(:unary_bnot, 0, false, :nop, nil, nil, parse_unary)
+      elsif k == TokenKind::NOT
+        @cur_token = next_token
+        ASTNode.new(:unary_not, 0, false, :nop, nil, nil, parse_unary)
       else
         # 非 IDENT primary (リテラル / 括弧式 / 配列リテラル / method_call) からの postfix
         # を消費する。IDENT 経路は parse_expression が parse_expression_from を経由して
@@ -1549,14 +1711,37 @@ module Setsunaruby
       elsif k == :nil_lit
         @bytecode.push(Op::PUSH_NIL)
       elsif k == :bin_op
-        compile_expr(node.node_left)
-        compile_expr(node.node_right)
-        @bytecode.push(binop_to_opcode(node.node_op))
+        op = node.node_op
+        if op == :land
+          compile_short_circuit(node, Op::JUMP_IF_FALSE)
+        elsif op == :lor
+          compile_short_circuit(node, Op::JUMP_IF_TRUE)
+        else
+          compile_expr(node.node_left)
+          compile_expr(node.node_right)
+          opcode = binop_to_opcode(op)
+          @bytecode.push(opcode)
+          # 新規 Stage 4a opcode は HIR/LIR 未対応のため JIT 不可。
+          # 既存 (LSHIFT 等) と区別するため opcode 値で判定する。
+          if opcode >= Op::SHL && opcode <= Op::BNOT
+            mark_current_method_jit_unsafe
+          elsif opcode == Op::NEQ
+            mark_current_method_jit_unsafe
+          end
+        end
       elsif k == :unary_minus
         @bytecode.push(Op::PUSH_INT)
         encode_signed(0)
         compile_expr(node.node_operand)
         @bytecode.push(Op::SUB)
+      elsif k == :unary_bnot
+        compile_expr(node.node_operand)
+        @bytecode.push(Op::BNOT)
+        mark_current_method_jit_unsafe
+      elsif k == :unary_not
+        compile_expr(node.node_operand)
+        @bytecode.push(Op::NOT)
+        mark_current_method_jit_unsafe
       elsif k == :var_ref
         pkt = node.node_int_value
         idx = find_local(pkt)
@@ -2682,10 +2867,41 @@ module Setsunaruby
         result = Op::GE
       elsif op == :lshift
         result = Op::LSHIFT
+      # Stage 4a 整数ビット演算 / 不等価。LSHIFT 以外は Fixnum 専用。
+      elsif op == :shr
+        result = Op::SHR
+      elsif op == :band
+        result = Op::BAND
+      elsif op == :bor
+        result = Op::BOR
+      elsif op == :bxor
+        result = Op::BXOR
+      elsif op == :neq
+        result = Op::NEQ
       else
         raise "Compiler bug: unknown binop #{op}"
       end
       result
+    end
+
+    # `&&` / `||` 共通の短絡展開:
+    #   <lhs>
+    #   DUP
+    #   <jump_op> end        ; && は JUMP_IF_FALSE、|| は JUMP_IF_TRUE
+    #   POP
+    #   <rhs>
+    # end:
+    # JUMP_IF_* は cond を pop するため、スキップ時に値を残せるよう DUP+POP で組み立てる。
+    # 戻り値は Ruby と同じく短絡時の lhs / 評価時の rhs。
+    def compile_short_circuit(node, jump_op)
+      compile_expr(node.node_left)
+      @bytecode.push(Op::DUP)
+      jend = emit_jump(jump_op)
+      @bytecode.push(Op::POP)
+      compile_expr(node.node_right)
+      patch_jump(jend, @bytecode.length)
+      mark_current_method_jit_unsafe   # DUP + JUMP_IF_* 経路は HIR 未対応
+      nil
     end
 
     # 可変長 SLEB128 (整数リテラル / STORE_LOCAL/LOAD_LOCAL の slot idx 用)
@@ -2809,6 +3025,12 @@ module Setsunaruby
           if !truthy?(v)
             @pc = @pc + rel
           end
+        elsif op == Op::JUMP_IF_TRUE
+          rel = decode_signed_3
+          v = @stack.pop
+          if truthy?(v)
+            @pc = @pc + rel
+          end
         elsif op == Op::ADD
           exec_arith(:add)
         elsif op == Op::SUB
@@ -2831,6 +3053,23 @@ module Setsunaruby
           exec_compare(:ge)
         elsif op == Op::LSHIFT
           exec_lshift
+        elsif op == Op::SHR
+          exec_int_binop(:shr)
+        elsif op == Op::BAND
+          exec_int_binop(:band)
+        elsif op == Op::BOR
+          exec_int_binop(:bor)
+        elsif op == Op::BXOR
+          exec_int_binop(:bxor)
+        elsif op == Op::BNOT
+          exec_int_bnot
+        elsif op == Op::NEQ
+          rhs = @stack.pop
+          lhs = @stack.pop
+          @stack.push(box_bool(!values_equal?(lhs, rhs)))
+        elsif op == Op::NOT
+          v = @stack.pop
+          @stack.push(box_bool(!truthy?(v)))
         elsif op == Op::ARRAY_NEW
           exec_array_new
         elsif op == Op::ARRAY_GET
@@ -3519,7 +3758,8 @@ module Setsunaruby
       nil
     end
 
-    # Stage 3a: String × String、Stage 3b: Array × any へ多相化。
+    # `<<` は Stage 3a で String × String、Stage 3b で Array × any、Stage 4a で
+    # Fixnum × Fixnum (整数左シフト) と多相化されている。
     def exec_lshift
       rhs = @stack.pop
       lhs = @stack.pop
@@ -3527,10 +3767,59 @@ module Setsunaruby
         @stack.push(heap_str_append_bang(lhs, rhs))
       elsif heap_array?(lhs)
         @stack.push(heap_array_push_bang(lhs, rhs))
+      elsif fixnum?(lhs) && fixnum?(rhs)
+        @stack.push(box_int(unbox_int(lhs) << unbox_int(rhs)))
       else
-        raise "TypeError: << は (String << String) または (Array << any) のみ"
+        raise "TypeError: << は (Integer << Integer) / (String << String) / (Array << any) のみ"
       end
       nil
+    end
+
+    # 整数限定の二項ビット演算 (`>> & | ^`)。Fixnum × Fixnum を要求。
+    def exec_int_binop(op)
+      rhs = @stack.pop
+      lhs = @stack.pop
+      if !fixnum?(lhs) || !fixnum?(rhs)
+        raise "TypeError: bitwise op requires Integer operands"
+      end
+      a = unbox_int(lhs)
+      b = unbox_int(rhs)
+      result = 0
+      if op == :shr
+        result = a >> b
+      elsif op == :band
+        result = a & b
+      elsif op == :bor
+        result = a | b
+      elsif op == :bxor
+        result = a ^ b
+      else
+        raise "VM bug: unknown int binop #{op}"
+      end
+      @stack.push(box_int(result))
+      nil
+    end
+
+    def exec_int_bnot
+      v = @stack.pop
+      if !fixnum?(v)
+        raise "TypeError: ~ requires Integer operand"
+      end
+      @stack.push(box_int(~unbox_int(v)))
+      nil
+    end
+
+    # `==` `!=` 共通の値比較。型違いは obj_id 同値、両辺 Fixnum / String なら値比較。
+    def values_equal?(lhs, rhs)
+      r = false
+      if fixnum?(lhs) && fixnum?(rhs)
+        r = lhs == rhs
+      elsif heap_str?(lhs) && heap_str?(rhs)
+        r = heap_str_eq(lhs, rhs)
+      else
+        r = lhs == rhs
+      end
+      r
     end
 
     def exec_array_new

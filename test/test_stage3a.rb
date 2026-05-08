@@ -156,7 +156,9 @@ assert_output(indep, "abX\nabX\nabX\n", "ループ毎にリテラルから新 St
 assert_raises(%(puts "a" + 1\n),      "+: String + Fixnum はエラー")
 assert_raises(%(puts 1 + "a"\n),      "+: Fixnum + String はエラー")
 assert_raises(%(puts "a" << 1\n),     "<<: String << Fixnum はエラー")
-assert_raises(%(puts 1 << 1\n),       "<<: Fixnum << Fixnum はエラー (Stage 3a スコープ外)")
+# Stage 4a 以降は `Fixnum << Fixnum` が整数左シフトに dispatch されるため、ここでは
+# Stage 3a の境界を保つ「混合型」のみエラー検証に残す。
+assert_raises(%(puts "a" << 1\n),     "<<: String << Fixnum は依然エラー")
 
 # ---- 終端なしリテラル ----
 assert_raises(%(puts "abc\n),          "終端なし \"")

@@ -10,6 +10,9 @@ module Setsunaruby
     LOAD_LOCAL     = 0x07   # operand: SLEB128 idx (variable-length)
     JUMP           = 0x08   # operand: 3-byte fixed-width SLEB128 offset
     JUMP_IF_FALSE  = 0x09   # operand: 3-byte fixed-width SLEB128 offset
+    # Stage 4a: `||` 短絡用に「stack-top が真ならジャンプ」。JUMP_IF_FALSE と対称、
+    # cond は pop する (JUMP_IF_FALSE と同じ仕様)。
+    JUMP_IF_TRUE   = 0x0A   # operand: 3-byte fixed-width SLEB128 offset
 
     ADD = 0x10
     SUB = 0x11
@@ -17,11 +20,24 @@ module Setsunaruby
     DIV = 0x13
     MOD = 0x14
 
+    # Stage 4a: 整数のビット演算 (Fixnum × Fixnum を要求)。
+    # SHL は LSHIFT (0x43) と区別される「整数限定」のシフト。compiler は `<<` ソースに対して
+    # 多態の LSHIFT を emit するため SHL は現状未使用 (将来の JIT 特化用に予約)。
+    SHL  = 0x15
+    SHR  = 0x16
+    BAND = 0x17
+    BOR  = 0x18
+    BXOR = 0x19
+    BNOT = 0x1A   # 単項
+
     EQ = 0x20
     LT = 0x21
     GT = 0x22
     LE = 0x23
     GE = 0x24
+    # Stage 4a: EQ / 真偽の補完。NEQ は EQ の反転 (型違い OK)、NOT は truthy 値の反転。
+    NEQ = 0x25
+    NOT = 0x26    # 単項
 
     PUTS = 0x30
 

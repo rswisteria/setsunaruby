@@ -75,11 +75,19 @@ spinel が配列を扱いやすくするための工夫。
 
 | `node_kind` | フィールド |
 |---|---|
-| `:bin_op` | `node_op` ∈ {`:add`,`:sub`,`:mul`,`:div`,`:mod`,`:lshift`,`:eq`,`:lt`,`:gt`,`:le`,`:ge`}、`node_left` = lhs、`node_right` = rhs |
+| `:bin_op` | `node_op` ∈ {`:add`,`:sub`,`:mul`,`:div`,`:mod`,`:lshift`,`:shr`,`:band`,`:bor`,`:bxor`,`:eq`,`:neq`,`:lt`,`:gt`,`:le`,`:ge`,`:land`,`:lor`}、`node_left` = lhs、`node_right` = rhs |
+| `:unary_minus` | `node_operand` = expr。compiler は `0 - operand` で展開 |
+| `:unary_bnot` | `~x` 整数ビット反転 (Stage 4a)、`node_operand` = expr |
+| `:unary_not` | `!x` 真偽反転 (Stage 4a)、`node_operand` = expr |
 
 単項マイナスは `bin_op(:sub, int_lit(0), x)` 等価ではなく、parser が `int_lit` の
 時は値を直接負にして埋め込む (`int_lit(-x)`)。それ以外は `bin_op(:sub, 0, x)`
 パターンで生成する。
+
+`:land` (`&&`) と `:lor` (`||`) は **短絡評価**のため compiler が `JUMP_IF_FALSE` /
+`JUMP_IF_TRUE` で展開する (Stage 4a、`compile_short_circuit_and` /
+`compile_short_circuit_or`)。中間 bool ローカル変数を作らないため spinel ルール 12
+に違反しない。
 
 ### 関数呼び出し・ブロック
 
