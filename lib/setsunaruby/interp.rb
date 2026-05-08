@@ -61,9 +61,13 @@ module Setsunaruby
     # ヒープオブジェクト obj_id の下位 3 bit タグ。Stage 0 で予約した (idx<<3)|0b110。
     HEAP_TAG = 6
     # ヒープオブジェクトの kind (= @heap_kind の値)。Stage 3b 以降は要素を増やしていく。
-    HEAP_KIND_STRING   = 1
-    HEAP_KIND_ARRAY    = 2
-    HEAP_KIND_INSTANCE = 3   # Stage 3d.1: ユーザ定義クラスのインスタンス
+    # 0 は GC-1 の tombstone (sweep で free list 化された slot のマーカ)。
+    # alloc_heap_slot は必ず 1..3 のいずれかを書き込むので、@heap_kind[idx] == 0 が
+    # 「GC が解放した slot」を弁別する条件になる。
+    HEAP_KIND_TOMBSTONE = 0   # GC-1: sweep で tombstone 化された slot
+    HEAP_KIND_STRING    = 1
+    HEAP_KIND_ARRAY     = 2
+    HEAP_KIND_INSTANCE  = 3   # Stage 3d.1: ユーザ定義クラスのインスタンス
 
     # Stage 3d.3: builtin class を class table の先頭 3 スロットに pre-register する。
     # Fixnum / Array / String が `obj.method(args)` でメソッドディスパッチを受けるとき、
@@ -296,6 +300,17 @@ module Setsunaruby
       @handler_stack_depths = []
       @handler_cfp_depths   = []
       @handler_yield_depths = []
+      # Stage GC-1: STW Mark-Sweep の状態。
+      # @heap_marked    : @heap_kind と並列の mark bit (0=未 mark / 1=live)
+      # @heap_freelist  : sweep で tombstone 化された slot idx を貯めるスタック
+      # @gc_mark_stack  : mark phase の explicit stack (再帰回避、深さは heap 全 slot 分)
+      # @gc_threshold   : 次回 GC を起動する live slot 数閾値。GC 後に live * 2 で更新
+      # @dump_gc        : SETSUNARUBY_DUMP_GC=1 で各 GC 実行時に STDERR へ統計を吐く
+      @heap_marked    = []
+      @heap_freelist  = []
+      @gc_mark_stack  = []
+      @gc_threshold   = 1024
+      @dump_gc        = ENV["SETSUNARUBY_DUMP_GC"] == "1"
     end
 
     def run_file(path)
@@ -397,6 +412,12 @@ module Setsunaruby
       @handler_stack_depths = []
       @handler_cfp_depths   = []
       @handler_yield_depths = []
+      # Stage GC-1: GC 状態のリセット。
+      @heap_marked    = []
+      @heap_freelist  = []
+      @gc_mark_stack  = []
+      @gc_threshold   = 1024
+      @dump_gc        = ENV["SETSUNARUBY_DUMP_GC"] == "1"
       # コンパイル中の method idx (-1 = method 外)。raise/begin を含む method を JIT skip 扱いに
       # するため、compile_raise / compile_begin_rescue がこの idx を見て jit_call_counts を
       # 即 threshold に上げる。
@@ -3017,15 +3038,157 @@ module Setsunaruby
       alloc_heap_slot(HEAP_KIND_STRING, new_start, ll + rl, -1)
     end
 
+    # ============================================================
+    # Garbage Collector (Stage GC-1: STW Mark-Sweep)
+    # ============================================================
+    # heap slot (@heap_kind / @heap_starts / @heap_lens / @heap_instance_class /
+    # @heap_marked の 5 並列) を回収し、freelist に返す。pool 系
+    # (@str_pool / @heap_arr_pool / @instance_ivar_pool) は触らない (Stage GC-2 担当)。
+    #
+    # ルートセット:
+    #   - @stack / @locals (VM スタックとローカル変数)
+    #   - @cfp_selfs / @cur_self (各フレームの receiver)
+    #   - @exception (伝播中の例外オブジェクト)
+    #
+    # `@strlit_starts` / `@strlit_lens` は @str_pool への直接 offset であり
+    # heap slot ではないので GC 対象外。GC-1 では pool を一切触らないため
+    # literal バイト領域も影響を受けない。
+    #
+    # spinel 互換 (CLAUDE.md ルール) のため:
+    #   - 再帰なし: explicit stack (@gc_mark_stack) で BFS
+    #   - bool ローカル変数を分岐に使わない: 条件式直接判定 / Integer カウンタ
+    #   - kind タグは Integer 定数 (HEAP_KIND_*)
+    def gc_collect
+      # 0. mark stack のリセット。drain ループの自然終端では必ず空になる invariant
+      # だが、強制呼び出しなど例外パスで残留する可能性に備えた防御的クリア。
+      while @gc_mark_stack.length > 0
+        @gc_mark_stack.pop
+      end
+
+      # 1. mark phase の準備: @heap_marked を 0 リセット (slot 数分)
+      i = 0
+      while i < @heap_marked.length
+        @heap_marked[i] = 0
+        i = i + 1
+      end
+
+      # 2. ルート 5 種を mark stack に積む
+      gc_push_root(@cur_self)
+      gc_push_root(@exception)
+      i = 0
+      while i < @stack.length
+        gc_push_root(@stack[i])
+        i = i + 1
+      end
+      i = 0
+      while i < @locals.length
+        gc_push_root(@locals[i])
+        i = i + 1
+      end
+      i = 0
+      while i < @cfp_selfs.length
+        gc_push_root(@cfp_selfs[i])
+        i = i + 1
+      end
+
+      # 3. mark stack を空になるまで pop して child を辿る
+      gc_drain_mark_stack
+
+      # 4. sweep phase: 未 mark の live slot を tombstone 化して freelist に返す
+      freed = 0
+      i = 0
+      while i < @heap_kind.length
+        if @heap_kind[i] != HEAP_KIND_TOMBSTONE && @heap_marked[i] == 0
+          @heap_kind[i] = HEAP_KIND_TOMBSTONE
+          @heap_freelist.push(i)
+          freed = freed + 1
+        end
+        i = i + 1
+      end
+
+      # 5. 閾値更新 (live * 2、最低 1024 を維持)
+      live = @heap_kind.length - @heap_freelist.length
+      new_threshold = live * 2
+      if new_threshold < 1024
+        new_threshold = 1024
+      end
+      @gc_threshold = new_threshold
+
+      if @dump_gc
+        # total = @heap_kind の物理長 (tombstone 含む)、live = GC 後の生存 slot 数、
+        # freed = 今回 sweep で新たに tombstone 化した数。
+        STDERR.puts "[gc] total=#{@heap_kind.length} live=#{live} freed=#{freed} threshold=#{@gc_threshold}"
+      end
+    end
+
+    # ヒープオブジェクト 1 個を mark stack に push する。即値や mark 済みは無視。
+    def gc_push_root(v)
+      if (v & 7) == HEAP_TAG
+        idx = v >> 3
+        if @heap_marked[idx] == 0
+          @heap_marked[idx] = 1
+          @gc_mark_stack.push(idx)
+        end
+      end
+    end
+
+    # mark stack が空になるまで pop して child を mark する。
+    # Array は要素 (obj_id) を、Instance は ivar (obj_id) を辿る。String は終端
+    # (バイトのみで obj_id を含まない)。tombstone は出現しない (live のみが mark される)。
+    def gc_drain_mark_stack
+      while @gc_mark_stack.length > 0
+        idx = @gc_mark_stack.pop
+        k = @heap_kind[idx]
+        if k == HEAP_KIND_ARRAY
+          s = @heap_starts[idx]
+          l = @heap_lens[idx]
+          j = 0
+          while j < l
+            gc_push_root(@heap_arr_pool[s + j])
+            j = j + 1
+          end
+        elsif k == HEAP_KIND_INSTANCE
+          s = @heap_starts[idx]
+          l = @heap_lens[idx]
+          j = 0
+          while j < l
+            gc_push_root(@instance_ivar_pool[s + j])
+            j = j + 1
+          end
+        end
+      end
+    end
+
     # Stage 3d.1: ヒープ slot 確保ヘルパ。@heap_kind / @heap_starts / @heap_lens /
-    # @heap_instance_class の 4 並列 IntArray を 1 操作で push し、新 obj_id を返す。
-    # 非インスタンス (string/array) は class_idx = -1 で push する。
+    # @heap_instance_class / @heap_marked の 5 並列 IntArray を 1 操作で更新し、
+    # 新 obj_id を返す。非インスタンス (string/array) は class_idx = -1 で push する。
+    #
+    # Stage GC-1: live slot 数が @gc_threshold を超えたら gc_collect を起動し、
+    # freelist に idx があれば再利用する (kind/start/len/class_idx を上書き)。
+    # spinel rule 6 に従い、戻り値は中間変数 result を経由して返す。
     def alloc_heap_slot(kind, start, len, class_idx)
-      @heap_kind.push(kind)
-      @heap_starts.push(start)
-      @heap_lens.push(len)
-      @heap_instance_class.push(class_idx)
-      box_heap(@heap_kind.length - 1)
+      live_count = @heap_kind.length - @heap_freelist.length
+      if live_count >= @gc_threshold
+        gc_collect
+      end
+      result = 0
+      if @heap_freelist.length > 0
+        idx = @heap_freelist.pop
+        @heap_kind[idx]           = kind
+        @heap_starts[idx]         = start
+        @heap_lens[idx]           = len
+        @heap_instance_class[idx] = class_idx
+        @heap_marked[idx]         = 0
+        result = box_heap(idx)
+      else
+        @heap_kind.push(kind)
+        @heap_starts.push(start)
+        @heap_lens.push(len)
+        @heap_instance_class.push(class_idx)
+        @heap_marked.push(0)
+        result = box_heap(@heap_kind.length - 1)
+      end
+      result
     end
 
     # `<<`: lhs slot の start/len を「新しい末尾位置 + 連結後の長さ」に書き換える
