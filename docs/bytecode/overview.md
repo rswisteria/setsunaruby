@@ -32,23 +32,31 @@ opcode 一覧は [opcodes.md](opcodes.md)。
 
 | ivar | 内容 |
 |---|---|
-| `@heap_kind[idx]` | 1=String, 2=Array, 3=Instance |
+| `@heap_kind[idx]` | 0=tombstone (GC-1), 1=String, 2=Array, 3=Instance |
 | `@heap_starts[idx]` | kind 別 pool への offset |
 | `@heap_lens[idx]` | バイト数 (String) / 要素数 (Array) / ivar 個数 (Instance) |
 | `@heap_instance_class[idx]` | class_idx (-1 = 非インスタンス) |
+| `@heap_marked[idx]` | GC-1 の mark 用ビット (0=未 mark, 1=live) |
 
 ### kind 別ストレージ
 
 | kind | pool | 1 要素 |
 |---|---|---|
-| 1 = String | `@str_pool` | バイト (Integer 0..255) |
-| 2 = Array | `@heap_arr_pool` | 任意の obj_id |
-| 3 = Instance | `@instance_ivar_pool` | ivar 値 (任意の obj_id) |
+| 1 = String | `@str_pool` | バイト (Integer 0..255)。GC-2 で圧縮対象 |
+| 2 = Array | `@heap_arr_pool` | 任意の obj_id。GC-2 で圧縮対象 |
+| 3 = Instance | `@instance_ivar_pool` | ivar 値 (任意の obj_id)。GC-2 で圧縮対象 |
+
+文字列リテラルのバイトは `@strlit_pool` (lex 時に確定する不変領域) に格納され、
+heap String の `@str_pool` とは独立に管理される。`@strlit_pool` は GC 対象外なので、
+`@strlit_starts` / `@strlit_lens` の offset は GC を跨いで安定する。
 
 ### 確保ヘルパ
 
-`alloc_heap_slot(kind, start, len, class_idx)` が 4 並列 IntArray の push を
-1 操作にまとめる。String / Array / Instance すべて同じ経路で確保される。
+`alloc_heap_slot(kind, start, len, class_idx)` が `@heap_kind` / `@heap_starts` /
+`@heap_lens` / `@heap_instance_class` / `@heap_marked` の 5 並列 IntArray の更新を
+1 操作にまとめる。GC-1 以降は live slot 数が `@gc_threshold` を超えたらこの中で
+`gc_collect` を起動し、`@heap_freelist` に idx があれば再利用する。詳細は
+[gc/overview.md](../gc/overview.md)。
 
 ## VM の実行状態
 
