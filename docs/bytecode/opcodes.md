@@ -68,6 +68,14 @@
 - Stage: 1
 - top を pop し、`cond == NIL_VAL || cond == FALSE_VAL` なら `@pc += offset`
 
+### `JUMP_IF_TRUE` (0x0A)
+
+- Operand: 3-byte 固定 SLEB128 offset
+- Stack: `[..., cond]` → `[...]`
+- Stage: 4a
+- top を pop し、truthy (NIL/FALSE 以外) なら `@pc += offset`。`||` の短絡展開で使う
+  (`compile_short_circuit_or`)
+
 ---
 
 ## 算術 (二項)
@@ -82,9 +90,26 @@
 確保して push。型不一致は TypeError を raise。`DIV` / `MOD` は b == 0 で
 ZeroDivisionError。
 
+### `SHL` (0x15) / `SHR` (0x16) / `BAND` (0x17) / `BOR` (0x18) / `BXOR` (0x19)
+
+- Operand: なし
+- Stack: `[..., a, b]` → `[..., box_int(r)]`
+- Stage: 4a
+- 両辺 Fixnum 必須。型違いは TypeError。
+- `SHL` は `LSHIFT` (0x43) と区別される **整数限定の左シフト**。compiler は `<<`
+  ソースに対して多態 `LSHIFT` を emit するため `SHL` は現状未使用 (将来の JIT 特化用)。
+- `SHR` / `BAND` / `BOR` / `BXOR` は compiler が `>> & | ^` ソースに対して emit する。
+
+### `BNOT` (0x1A)
+
+- Operand: なし
+- Stack: `[..., a]` → `[..., box_int(~a)]` (単項)
+- Stage: 4a
+- a が Fixnum でなければ TypeError
+
 ---
 
-## 比較
+## 比較・等価・否定
 
 ### `EQ` (0x20) / `LT` (0x21) / `GT` (0x22) / `LE` (0x23) / `GE` (0x24)
 
@@ -93,6 +118,20 @@ ZeroDivisionError。
 - Stage: 0
 - `EQ` のみ両辺 String を値比較に多相化 (Stage 3a)。それ以外は obj_id 同値比較
 - 順序比較は両辺 Fixnum 必須
+
+### `NEQ` (0x25)
+
+- Operand: なし
+- Stack: `[..., a, b]` → `[..., bool]`
+- Stage: 4a
+- `EQ` と同じ多相 (Fixnum / String / 任意の obj_id) を反転した結果を push
+
+### `NOT` (0x26)
+
+- Operand: なし
+- Stack: `[..., a]` → `[..., bool]` (単項)
+- Stage: 4a
+- `truthy?(a)` の反転を push (NIL/FALSE → TRUE、それ以外 → FALSE)
 
 ---
 
@@ -154,14 +193,17 @@ ZeroDivisionError。
 ### `LSHIFT` (0x43)
 
 - Operand: なし
-- Stack: `[..., lhs, rhs]` → `[..., lhs]`
-- Stage: 3a (String) / 3b (Array へ多相化)
-- 多相 dispatch (heap_kind による):
+- Stack: `[..., lhs, rhs]` → `[..., r]`
+- Stage: 3a (String) / 3b (Array) / 4a (Fixnum へ多相化)
+- 多相 dispatch (heap_kind / fixnum tag による):
   - **String × String**: lhs slot を relocate-and-grow で `(start, len)` を
     `(@str_pool.length - (len_l+len_r), len_l+len_r)` に書き換え。
-    旧領域は abandon (no-GC)。同 obj_id 共有先からも更新が見える Ruby 互換動作
-  - **Array × any**: `@heap_arr_pool` 末尾に rhs を push、`@heap_lens[lhs_idx] += 1`
-- 戻り値は lhs (Ruby 互換)
+    旧領域は abandon (no-GC)。同 obj_id 共有先からも更新が見える Ruby 互換動作。
+    結果は lhs (Ruby 互換)
+  - **Array × any**: `@heap_arr_pool` 末尾に rhs を push、`@heap_lens[lhs_idx] += 1`。
+    結果は lhs (Ruby 互換)
+  - **Fixnum × Fixnum**: 整数左シフト `box_int(unbox(lhs) << unbox(rhs))` を push (Stage 4a)
+- いずれの組み合わせにも該当しない場合は TypeError
 
 ---
 

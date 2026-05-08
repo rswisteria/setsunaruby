@@ -37,7 +37,15 @@ module Setsunaruby
     GT       = :gt
     LE       = :le
     GE       = :ge
-    LSHIFT   = :lshift     # `<<` (Stage 3a で文字列追加)
+    LSHIFT   = :lshift     # `<<` (Stage 3a で文字列追加。Stage 4a で Fixnum<<Fixnum も dispatch)
+    SHR      = :shr        # `>>` (Stage 4a 整数右シフト)
+    BAND     = :band       # `&`  (Stage 4a 整数 AND)
+    BXOR     = :bxor       # `^`  (Stage 4a 整数 XOR)
+    BNOT     = :bnot       # `~`  (Stage 4a 整数 NOT、単項)
+    LAND     = :land       # `&&` (Stage 4a 短絡 AND)
+    LOR      = :lor        # `||` (Stage 4a 短絡 OR)
+    NOT      = :not        # `!`  (Stage 4a 否定、単項)
+    NEQ      = :neq        # `!=` (Stage 4a 不等価)
     LPAREN   = :lparen
     RPAREN   = :rparen
     LBRACK   = :lbrack     # `[` (Stage 3b 配列リテラル/index アクセス)

@@ -68,12 +68,18 @@ end
 | `PLUS` `MINUS` `STAR` `SLASH` `PERCENT` | `+ - * / %` | 算術 |
 | `EQ` | `=` | 代入 |
 | `EQ_EQ` `LT` `GT` `LE` `GE` | `== \< \> \<= \>=` | 比較 |
-| `LSHIFT` | `\<\<` | 文字列追加・配列 push |
+| `NEQ` | `!=` | 不等価 (Stage 4a) |
+| `LSHIFT` | `\<\<` | 整数左シフト・文字列追加・配列 push (多態) |
+| `SHR` | `\>\>` | 整数右シフト (Stage 4a) |
+| `BAND` `BXOR` | `& ^` | 整数 AND / XOR (Stage 4a)。`PIPE` (`\|`) は OR と兼用 |
+| `BNOT` | `~` | 整数 NOT (単項、Stage 4a) |
+| `LAND` `LOR` | `&& \|\|` | 短絡 AND / OR (Stage 4a) |
+| `NOT` | `!` | 否定 (単項、Stage 4a)。識別子末尾の `!` は別途 IDENT 内で処理 |
 | `LPAREN` `RPAREN` | `( )` | グルーピング・引数リスト |
 | `LBRACK` `RBRACK` | `[ ]` | 配列リテラル・index |
 | `LBRACE` `RBRACE` | `{ }` | 中括弧ブロック |
 | `DOT` | `.` | メソッド呼び出し |
-| `PIPE` | `\|` | ブロックパラメータ区切り |
+| `PIPE` | `\|` | ブロックパラメータ区切り / 整数 OR (Stage 4a。文脈で判別) |
 | `COMMA` | `,` | 引数・要素区切り |
 | `HASH_ROCKET` | `=>` | `rescue Class => e` 用 |
 
@@ -119,9 +125,24 @@ int_value = (start \<\< 16) | len
 
 ### 演算子の 2 文字対応
 
-`read_punct` 内で `=` の次が `=` か `>`、`<` の次が `=` か `<`、`>` の次が `=`
-だった場合は 2 バイト消費して合成トークン (`EQ_EQ` `HASH_ROCKET` `LE` `LSHIFT` `GE`)
-を返す。それ以外は 1 文字トークン。
+`read_punct` 内で先頭バイトと次バイトを 2 文字 lookahead して合成トークンを生成する:
+
+| 先頭 | 次バイト | 結果 | Stage |
+|---|---|---|---|
+| `=` | `=` | `EQ_EQ` | Stage 0 |
+| `=` | `>` | `HASH_ROCKET` | Stage 3e |
+| `<` | `=` | `LE` | Stage 0 |
+| `<` | `<` | `LSHIFT` | Stage 3a |
+| `>` | `=` | `GE` | Stage 0 |
+| `>` | `>` | `SHR` | Stage 4a |
+| `&` | `&` | `LAND` | Stage 4a |
+| `&` | (他) | `BAND` | Stage 4a |
+| `\|` | `\|` | `LOR` | Stage 4a |
+| `\|` | (他) | `PIPE` | Stage 3c.1 |
+| `!` | `=` | `NEQ` | Stage 4a |
+| `!` | (他) | `NOT` | Stage 4a |
+| `^` | — | `BXOR` | Stage 4a |
+| `~` | — | `BNOT` | Stage 4a |
 
 ## ストリーミング消費
 
