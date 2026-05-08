@@ -246,6 +246,35 @@ strlit_len_after = interp.instance_variable_get(:@strlit_pool).length
 assert_eq(strlit_len_after, strlit_len_before, "T10c: GC で @strlit_pool は変化しない (literal は不変領域)")
 
 # ============================================================
+# T11: alloc_heap_slot pool offset 整合性 (GC-2 regression)
+# ============================================================
+
+# heap_str_concat と == を 5000 反復繰り返す。pool 操作中に GC が起動した場合、
+# 修正前は new_start が古い pool length のまま新 slot に書かれ、結果文字列が壊れて
+# 比較が false になっていた。修正後は alloc 系ヘルパが pool 操作の前に
+# gc_check_threshold を呼び、pool 操作後の new_start が GC 後の正しい length を
+# 指すようになっている。
+src = <<~'RUBY'
+  def count_match(n)
+    count = 0
+    i = 0
+    while i < n
+      s = "abc" + "def"
+      if s == "abcdef"
+        count = count + 1
+      end
+      i = i + 1
+    end
+    count
+  end
+  puts count_match(5000)
+RUBY
+
+interp, out = run_with_interp(src)
+assert_eq(out, "5000\n",
+          "T11: GC が走るタイミングでも heap_str_concat の結果バイト列が壊れない")
+
+# ============================================================
 # サマリ
 # ============================================================
 puts ""
