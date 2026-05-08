@@ -254,8 +254,13 @@ module Setsunaruby
       @heap_kind   = []
       @heap_starts = []
       @heap_lens   = []
-      # Stage 3a: 文字列バイトプール (リテラルと実行時生成の共有アリーナ)。
+      # Stage 3a / GC-2: 文字列バイトプールを 2 系統に分離。
+      # @str_pool は heap String slot 専用 (GC で前詰めされる)。
+      # @strlit_pool は lex 時に確定する不変リテラル領域で GC 対象外。
+      # @strlit_starts / @strlit_lens は @strlit_pool 上の offset / length を保持し、
+      # @str_pool 圧縮の影響を受けない。
       @str_pool      = []
+      @strlit_pool   = []
       @strlit_starts = []
       @strlit_lens   = []
       # Stage 3b: 配列要素プール (要素は obj_id = tagged value)。
@@ -388,6 +393,7 @@ module Setsunaruby
       @heap_starts   = []
       @heap_lens     = []
       @str_pool      = []
+      @strlit_pool   = []
       @strlit_starts = []
       @strlit_lens   = []
       @heap_arr_pool = []
@@ -494,12 +500,14 @@ module Setsunaruby
     end
 
     # 文字列リテラル `"..."` を読む。
-    # `\n \t \r \\ \" \0` のみ escape 対応。escape 解決後のバイト列を @str_pool に
-    # 直接追記し、@strlit_starts/@strlit_lens に新規エントリを追加する。
+    # `\n \t \r \\ \" \0` のみ escape 対応。escape 解決後のバイト列を @strlit_pool に
+    # 追記し、@strlit_starts/@strlit_lens に新規エントリを追加する。
     # Token の int_value にはそのリテラル idx を入れる。
+    # GC-2: literal 領域は @str_pool ではなく @strlit_pool に格納し、heap String の
+    # 圧縮 (`gc_compact_pools`) の影響を受けないようにする。
     def read_string
       @lex_pos += 1   # consume opening "
-      pool_start = @str_pool.length
+      pool_start = @strlit_pool.length
       while @lex_pos < @bytes.length && @bytes[@lex_pos] != DQUOTE_B
         b = @bytes[@lex_pos]
         if b == BSLASH_B
@@ -523,14 +531,14 @@ module Setsunaruby
           else
             raise "Lexer error: line #{@line}: 未対応の escape (バイト #{nb})"
           end
-          @str_pool.push(decoded)
+          @strlit_pool.push(decoded)
           @lex_pos += 2
         else
           # 改行を含むそのままの byte (Ruby と異なり、生改行入り文字列リテラルも許容)。
           if b == NL
             @line += 1
           end
-          @str_pool.push(b)
+          @strlit_pool.push(b)
           @lex_pos += 1
         end
       end
@@ -540,7 +548,7 @@ module Setsunaruby
       @lex_pos += 1   # consume closing "
       lit_idx = @strlit_starts.length
       @strlit_starts.push(pool_start)
-      @strlit_lens.push(@str_pool.length - pool_start)
+      @strlit_lens.push(@strlit_pool.length - pool_start)
       Token.new(TokenKind::STR, lit_idx, "", @line)
     end
 
@@ -3016,13 +3024,25 @@ module Setsunaruby
       nil
     end
 
+    # GC-2: リテラル領域 (@strlit_pool) から heap String 用の @str_pool 末尾に
+    # バイトを append する。@strlit_pool は不変なので read-only コピー。
+    def strlit_to_str_pool(src, len)
+      i = 0
+      while i < len
+        @str_pool.push(@strlit_pool[src + i])
+        i += 1
+      end
+      nil
+    end
+
     # リテラル idx から新しいヒープ String を確保する。実行のたびに新スロットを
     # 確保することで、Ruby のリテラル独立性 (`a = "x"; b = "x"; a.equal?(b) == false`) を
     # 自然に得る (== は値比較として別実装)。
+    # GC-2: literal バイトは @strlit_pool 上にあるので strlit_to_str_pool 経由で copy する。
     def heap_str_alloc_from_lit(lit_idx)
       new_start = @str_pool.length
       src_len   = @strlit_lens[lit_idx]
-      str_pool_copy(@strlit_starts[lit_idx], src_len)
+      strlit_to_str_pool(@strlit_starts[lit_idx], src_len)
       alloc_heap_slot(HEAP_KIND_STRING, new_start, src_len, -1)
     end
 
@@ -3094,6 +3114,10 @@ module Setsunaruby
       # 3. mark stack を空になるまで pop して child を辿る
       gc_drain_mark_stack
 
+      # 3.5. (Stage GC-2) live slot の中身を pool に前詰め。
+      # mark 済み slot のみ走査するので、sweep より先に行う方が効率的。
+      gc_compact_pools
+
       # 4. sweep phase: 未 mark の live slot を tombstone 化して freelist に返す
       freed = 0
       i = 0
@@ -3117,7 +3141,10 @@ module Setsunaruby
       if @dump_gc
         # total = @heap_kind の物理長 (tombstone 含む)、live = GC 後の生存 slot 数、
         # freed = 今回 sweep で新たに tombstone 化した数。
-        STDERR.puts "[gc] total=#{@heap_kind.length} live=#{live} freed=#{freed} threshold=#{@gc_threshold}"
+        # str/arr/ivar = 圧縮後の各 pool の長さ (Stage GC-2)。
+        STDERR.puts "[gc] total=#{@heap_kind.length} live=#{live} freed=#{freed} " \
+                    "str=#{@str_pool.length} arr=#{@heap_arr_pool.length} " \
+                    "ivar=#{@instance_ivar_pool.length} threshold=#{@gc_threshold}"
       end
     end
 
@@ -3157,6 +3184,61 @@ module Setsunaruby
           end
         end
       end
+    end
+
+    # Stage GC-2: live slot の中身を 3 つの flat pool (@str_pool / @heap_arr_pool /
+    # @instance_ivar_pool) に前詰めする。relocate-and-grow で積もった abandoned 領域
+    # (heap_str_concat / heap_str_append_bang / heap_array_push_bang の旧領域) を回収。
+    #
+    # 呼び出しタイミングは mark phase 直後・sweep phase 直前。理由:
+    #   - mark 済みなら live 確定なので走査対象が絞れる
+    #   - sweep 後だと tombstone (kind=0) が残っており分岐が増える
+    #
+    # slot idx は不変 (slot compaction は GC-3 で対応)。@heap_arr_pool / @instance_ivar_pool
+    # 内の obj_id は idx 参照なので「中身を新 pool にコピー」しても書き換え不要。
+    # @strlit_pool は GC 対象外 (lex 時に確定する不変領域) なので触らない。
+    def gc_compact_pools
+      new_str_pool       = []
+      new_heap_arr_pool  = []
+      new_ivar_pool      = []
+      i = 0
+      while i < @heap_kind.length
+        if @heap_marked[i] == 1
+          k         = @heap_kind[i]
+          old_start = @heap_starts[i]
+          l         = @heap_lens[i]
+          if k == HEAP_KIND_STRING
+            new_start = new_str_pool.length
+            j = 0
+            while j < l
+              new_str_pool.push(@str_pool[old_start + j])
+              j = j + 1
+            end
+            @heap_starts[i] = new_start
+          elsif k == HEAP_KIND_ARRAY
+            new_start = new_heap_arr_pool.length
+            j = 0
+            while j < l
+              new_heap_arr_pool.push(@heap_arr_pool[old_start + j])
+              j = j + 1
+            end
+            @heap_starts[i] = new_start
+          elsif k == HEAP_KIND_INSTANCE
+            new_start = new_ivar_pool.length
+            j = 0
+            while j < l
+              new_ivar_pool.push(@instance_ivar_pool[old_start + j])
+              j = j + 1
+            end
+            @heap_starts[i] = new_start
+          end
+        end
+        i = i + 1
+      end
+      @str_pool           = new_str_pool
+      @heap_arr_pool      = new_heap_arr_pool
+      @instance_ivar_pool = new_ivar_pool
+      nil
     end
 
     # Stage 3d.1: ヒープ slot 確保ヘルパ。@heap_kind / @heap_starts / @heap_lens /

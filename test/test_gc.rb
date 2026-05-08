@@ -153,6 +153,99 @@ $pass += 1
 puts "ok   T6: gc_collect は終了後の任意のタイミングで安全に呼び出せる"
 
 # ============================================================
+# T7: Stage GC-2 - 文字列 << ループで @str_pool が頭打ち
+# ============================================================
+
+# `s << "x"` を繰り返すと relocate-and-grow で @str_pool 末尾に再配置され、
+# 旧領域は abandon される。GC-2 圧縮なしだと @str_pool.length は 1+2+...+N ≒ N²/2 で
+# 膨らむ。圧縮ありだと GC ごとに live byte だけが残り、最終的に s.length 程度に収まる。
+src = <<~'RUBY'
+  s = ""
+  i = 0
+  while i < 2000
+    s << "x"
+    i = i + 1
+  end
+  puts "done"
+RUBY
+
+interp, out = run_with_interp(src)
+assert_eq(out, "done\n", "T7a: 大量 << 後の完走 (String#length は未実装なので結果は内部状態で検査)")
+# GC-2 なしなら ≒ 200万バイト。圧縮ありなら 2000 + α (現役 s + 直近の旧領域)。
+# 強制 GC で「真の live byte」だけに絞る。
+interp.send(:gc_collect)
+str_pool_len = interp.instance_variable_get(:@str_pool).length
+assert(str_pool_len < 3000,
+       "T7b: 強制 GC 後の @str_pool.length が live (= 2000) 程度に圧縮される (str=#{str_pool_len})")
+
+# ============================================================
+# T8: Stage GC-2 - Array << ループで @heap_arr_pool が頭打ち
+# ============================================================
+
+src = <<~'RUBY'
+  a = []
+  i = 0
+  while i < 2000
+    a << i
+    i = i + 1
+  end
+  puts a.length
+RUBY
+
+interp, out = run_with_interp(src)
+assert_eq(out, "2000\n", "T8a: 大量 << 後の最終 a.length")
+interp.send(:gc_collect)
+arr_pool_len = interp.instance_variable_get(:@heap_arr_pool).length
+assert(arr_pool_len < 3000,
+       "T8b: 強制 GC 後の @heap_arr_pool.length が live (= 2000) 程度に圧縮される (arr=#{arr_pool_len})")
+
+# ============================================================
+# T9: Stage GC-2 - 短命 instance の大量生成で @instance_ivar_pool が圧縮される
+# ============================================================
+
+src = <<~'RUBY'
+  class Box
+    def initialize(s)
+      @s = s
+    end
+  end
+  i = 0
+  while i < 2000
+    b = Box.new("hi")
+    i = i + 1
+  end
+  puts "done"
+RUBY
+
+interp, out = run_with_interp(src)
+assert_eq(out, "done\n", "T9a: 大量 instance 生成後の完走")
+interp.send(:gc_collect)
+ivar_pool_len = interp.instance_variable_get(:@instance_ivar_pool).length
+# 最終的に live な instance は b 1 個 (ivar 1 個)。
+assert(ivar_pool_len < 50,
+       "T9b: 強制 GC 後の @instance_ivar_pool.length が live instance 分のみ (ivar=#{ivar_pool_len})")
+
+# ============================================================
+# T10: Stage GC-2 - @strlit_pool は GC 対象外 (lex 確定の不変領域)
+# ============================================================
+
+src = <<~'RUBY'
+  s = "hello"
+  t = "world"
+  puts s
+  puts t
+RUBY
+
+interp, out = run_with_interp(src)
+assert_eq(out, "hello\nworld\n", "T10a: literal を含むプログラムが正しく動作")
+strlit_len_before = interp.instance_variable_get(:@strlit_pool).length
+# literal "hello" + "world" = 10 バイトが少なくとも含まれる。
+assert(strlit_len_before >= 10, "T10b: @strlit_pool に literal バイトが格納される (len=#{strlit_len_before})")
+interp.send(:gc_collect)
+strlit_len_after = interp.instance_variable_get(:@strlit_pool).length
+assert_eq(strlit_len_after, strlit_len_before, "T10c: GC で @strlit_pool は変化しない (literal は不変領域)")
+
+# ============================================================
 # サマリ
 # ============================================================
 puts ""
