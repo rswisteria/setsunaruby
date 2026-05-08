@@ -114,6 +114,24 @@ spinel の whole-program 型推論は厳しい。以下を破ると AOT ビル�
 CRuby だけ pass で AOT が崩れるパターンは spinel 制約違反 (上記の強制ルール) が
 ほぼ確実な原因。CRuby 動作だけで完了報告しないこと。
 
+## ドキュメント更新
+
+新しい Token kind / AST kind / opcode / HirOp / LirOp を追加したとき、または
+Lexer/Parser/Compiler/VM/JIT のいずれかの公開挙動を変えたときは、対応する
+`docs/` 配下のファイルも **同じ PR で更新する**。レイヤとファイルの対応表は
+`docs/README.md` (= 目次) を参照。
+
+| 変更内容 | 更新するファイル |
+|---|---|
+| Token kind 追加・字句規則変更 | `docs/lexer/tokens.md` |
+| AST kind / 構文追加 | `docs/parser/ast-nodes.md`、必要なら `docs/parser/compile.md` |
+| opcode / VM 動作変更 | `docs/bytecode/opcodes.md`、必要なら `docs/bytecode/overview.md` |
+| HirOp / LIR / JIT パス変更 | `docs/jit/{hir,lir,overview,status}.md` |
+
+実装と仕様書がドリフトすると将来の Stage 追加時に推論を誤る (例: ある opcode の
+stack effect を仕様書から信じて読んで、実装側で違うことが起きるとデバッグが長引く)。
+「実装側だけ動けば OK」では完了報告しない。
+
 ## ファイル構成 (要点)
 
 - `bin/setsunaruby.rb`: エントリ。spinel ビルド対象。
