@@ -133,6 +133,10 @@ module Setsunaruby
     KW_ENSURE_BYTES  = [101, 110, 115, 117, 114, 101].freeze      # "ensure"
     KW_RAISE_BYTES   = [114, 97, 105, 115, 101].freeze            # "raise"
     KW_SUPER_BYTES   = [115, 117, 112, 101, 114].freeze           # "super" (Stage 3d.5)
+    # Stage 4b: 無限ループとループ制御。
+    KW_LOOP_BYTES    = [108, 111, 111, 112].freeze                # "loop"
+    KW_BREAK_BYTES   = [98, 114, 101, 97, 107].freeze             # "break"
+    KW_NEXT_BYTES    = [110, 101, 120, 116].freeze                # "next"
     KW_MESSAGE_BYTES = [109, 101, 115, 115, 97, 103, 101].freeze  # "message"
     KW_STDERR_BYTES  = [83, 116, 97, 110, 100, 97, 114, 100, 69, 114, 114, 111, 114].freeze   # "StandardError"
 
@@ -431,6 +435,17 @@ module Setsunaruby
       # するため、compile_raise / compile_begin_rescue がこの idx を見て jit_call_counts を
       # 即 threshold に上げる。
       @cur_method_idx_for_jit = -1
+      # Stage 4b: break / next の jump 解決スタック (並列 IntArray、spinel ルール 3)。
+      # @loop_start_pcs の末尾 = 最内側 loop の cond 再評価位置 (next の jump target)。
+      # @break_patch_starts の末尾 = 最内側 loop の break 用 placeholder の開始 idx (in @break_patch_pcs)。
+      # @break_patch_pcs はすべての loop の break placeholder PC を flat に並べ、loop 退出時に
+      # 当該レンジを current PC へ patch up する。
+      # @loop_scope_barriers は compile_inline_block / compile_method_def 進入時の @loop_start_pcs.length
+      # を退避し、ブロック / メソッド境界をまたいで break/next が外側 loop に漏れないようにする。
+      @loop_start_pcs       = []
+      @break_patch_starts   = []
+      @break_patch_pcs      = []
+      @loop_scope_barriers  = []
 
       register_builtin_classes_and_methods
 
@@ -664,6 +679,12 @@ module Setsunaruby
         result = TokenKind::KW_RAISE
       elsif match_bytes(start, len, KW_SUPER_BYTES)
         result = TokenKind::KW_SUPER
+      elsif match_bytes(start, len, KW_LOOP_BYTES)
+        result = TokenKind::KW_LOOP
+      elsif match_bytes(start, len, KW_BREAK_BYTES)
+        result = TokenKind::KW_BREAK
+      elsif match_bytes(start, len, KW_NEXT_BYTES)
+        result = TokenKind::KW_NEXT
       end
       result
     end
@@ -845,6 +866,14 @@ module Setsunaruby
         return parse_if
       elsif k == TokenKind::KW_WHILE
         return parse_while
+      elsif k == TokenKind::KW_LOOP
+        return parse_loop
+      elsif k == TokenKind::KW_BREAK
+        @cur_token = next_token
+        return ASTNode.new(:break_stmt, 0, false, :nop, nil, nil, nil)
+      elsif k == TokenKind::KW_NEXT
+        @cur_token = next_token
+        return ASTNode.new(:next_stmt, 0, false, :nop, nil, nil, nil)
       elsif k == TokenKind::KW_DEF
         return parse_def
       elsif k == TokenKind::KW_RETURN
@@ -1219,6 +1248,21 @@ module Setsunaruby
       ASTNode.new(:while_stmt, 0, false, :nop, cond, body, nil)
     end
 
+    # `loop do BODY end` を `while true; BODY; end` の構文糖として AST 化する。
+    # cond に bool_lit(true) を入れた :while_stmt を返すので compiler 側の特別扱い不要。
+    def parse_loop
+      @cur_token = next_token   # consume `loop`
+      if @cur_token.kind != TokenKind::KW_DO
+        raise "Parse error: line #{@cur_token.line}: loop の後に do が必要です"
+      end
+      @cur_token = next_token   # consume `do`
+      skip_newlines
+      body = parse_block
+      expect(TokenKind::KW_END)
+      cond = ASTNode.new(:bool_lit, 0, true, :nop, nil, nil, nil)
+      ASTNode.new(:while_stmt, 0, false, :nop, cond, body, nil)
+    end
+
     # def name [( param (, param)* )] body end
     # メソッド定義はトップレベル文。引数 0 個のときは括弧省略可。
     def parse_def
@@ -1560,6 +1604,8 @@ module Setsunaruby
         parse_if
       elsif k == TokenKind::KW_WHILE
         parse_while
+      elsif k == TokenKind::KW_LOOP
+        parse_loop
       elsif k == TokenKind::KW_YIELD
         parse_yield
       elsif k == TokenKind::KW_BEGIN
@@ -1676,6 +1722,10 @@ module Setsunaruby
         compile_class_def(node)
       elsif k == :return_stmt
         compile_return(node)
+      elsif k == :break_stmt
+        compile_break
+      elsif k == :next_stmt
+        compile_next
       else
         compile_expr(node)
       end
@@ -2164,6 +2214,8 @@ module Setsunaruby
       # Stage 3e: raise/begin が出てきたら現在の method を JIT skip にするため、現 m_idx を退避。
       saved_method_idx_for_jit = @cur_method_idx_for_jit
       @cur_method_idx_for_jit = m_idx
+      # Stage 4b: break/next のスコープを method 境界で切る (外側 loop へ漏らさない)。
+      @loop_scope_barriers.push(@loop_start_pcs.length)
 
       # パラメータを slot 0..argc-1 に登録。declare_local は @scope_base 相対の
       # slot idx (= 0..argc-1) を返す。
@@ -2186,6 +2238,7 @@ module Setsunaruby
       @scope_base = saved_scope_base
       @in_method = false
       @cur_method_idx_for_jit = saved_method_idx_for_jit
+      @loop_scope_barriers.pop
 
       patch_jump(skip_jump_pos, @bytecode.length)
       # def 文自体の値は nil (compile_stmt の不変条件「1 値残す」を維持)。
@@ -2256,9 +2309,14 @@ module Setsunaruby
         encode_signed(param_slot)
         @bytecode.push(Op::POP)
       end
+      # Stage 4b: ブロック境界で break/next スコープを切る (#40 のスコープ外: ブロックから
+      # 外側 loop への break/next は不可)。barrier に現在の loop 深度を積んでおき、
+      # in_loop_scope? が「barrier より深い loop」のみ可視と判定する。
+      @loop_scope_barriers.push(@loop_start_pcs.length)
       # body は最後にスタックへ 1 値を残す不変条件 (compile_block の前提)。
       compile_block(block_node.node_left)
       @bytecode.push(Op::BLOCK_RETURN)
+      @loop_scope_barriers.pop
       patch_jump(skip, @bytecode.length)
       block_pc
     end
@@ -2832,6 +2890,11 @@ module Setsunaruby
 
     def compile_while(node)
       loop_start = @bytecode.length
+      # Stage 4b: break/next の jump 解決スタックに進入を記録。`next` は loop_start に
+      # 飛び、`break` は body 末尾以降の PC (= post-jexit の PUSH_NIL の位置) に飛ぶ。
+      @loop_start_pcs.push(loop_start)
+      @break_patch_starts.push(@break_patch_pcs.length)
+
       compile_expr(node.node_left)
       jexit_pos = emit_jump(Op::JUMP_IF_FALSE)
       compile_block(node.node_right)
@@ -2839,7 +2902,62 @@ module Setsunaruby
       back_jump_pos = emit_jump(Op::JUMP)
       patch_jump(back_jump_pos, loop_start)
       patch_jump(jexit_pos, @bytecode.length)
+      # break で飛んでくる目印は jexit と同じ位置。PUSH_NIL の前に patch することで
+      # 「break 経由でも while 全体が nil を 1 値残す」不変条件を満たす。
+      patch_break_targets(@bytecode.length)
       @bytecode.push(Op::PUSH_NIL)        # while 全体の値は nil
+      @loop_start_pcs.pop
+      nil
+    end
+
+    # @break_patch_pcs の末尾 (現 loop の placeholder 群) を target_abs に patch up し、
+    # その分だけ pop する。compile_while 終了時に呼ぶ。
+    def patch_break_targets(target_abs)
+      start = @break_patch_starts.pop
+      while @break_patch_pcs.length > start
+        pos = @break_patch_pcs.pop
+        patch_jump(pos, target_abs)
+      end
+      nil
+    end
+
+    # Stage 4b: `break` / `next` を JUMP に展開。
+    # break は loop 末尾 (jexit と同位置) への前方ジャンプで、target は loop body 終了後に
+    # patch up される (compile_while → patch_break_targets)。
+    # next は loop 先頭 (cond 再評価位置) への後方ジャンプで、target は既知のため即 patch。
+    # 両者とも JUMP のみで値を push しないが、JUMP 直後のコードは到達不能になるため
+    # compile_block の「stmt は 1 値残す」不変条件は壊れる。HIR builder は静的に
+    # 不整合を検出するので、break/next を含む method は JIT skip にする。
+    # 「現在のスコープで見える」最内側 loop が存在するかを判定する。
+    # @loop_scope_barriers の末尾が、現在の compile スコープから見える最小の loop_start_pcs
+    # 深度 (= ブロック/メソッド境界で 0 にリセットされる)。break/next は barrier より深い
+    # 位置の loop のみを target にできる。
+    def in_loop_scope?
+      barrier = 0
+      if @loop_scope_barriers.length > 0
+        barrier = @loop_scope_barriers[@loop_scope_barriers.length - 1]
+      end
+      @loop_start_pcs.length > barrier
+    end
+
+    def compile_break
+      if !in_loop_scope?
+        raise "Compile error: line #{@cur_token.line}: break は loop / while の中でのみ使えます"
+      end
+      pos = emit_jump(Op::JUMP)
+      @break_patch_pcs.push(pos)
+      mark_current_method_jit_unsafe
+      nil
+    end
+
+    def compile_next
+      if !in_loop_scope?
+        raise "Compile error: line #{@cur_token.line}: next は loop / while の中でのみ使えます"
+      end
+      target = @loop_start_pcs[@loop_start_pcs.length - 1]
+      pos = emit_jump(Op::JUMP)
+      patch_jump(pos, target)
+      mark_current_method_jit_unsafe
       nil
     end
 

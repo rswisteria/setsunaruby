@@ -56,6 +56,7 @@ end
 | `KW_CLASS` `KW_SELF` | `class` `self` | Stage 3d.1 |
 | `KW_BEGIN` `KW_RESCUE` `KW_ENSURE` `KW_RAISE` | `begin` `rescue` `ensure` `raise` | Stage 3e |
 | `KW_SUPER` | `super` | Stage 3d.5 |
+| `KW_LOOP` `KW_BREAK` `KW_NEXT` | `loop` `break` `next` | Stage 4b |
 
 キーワードは `read_ident_or_keyword` の `match_keyword` で判定。識別子として
 読み込まれた `(start, len)` を `KW_*_BYTES` 定数のバイト列と `match_bytes` で
