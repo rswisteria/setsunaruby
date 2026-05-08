@@ -328,6 +328,11 @@ assert_fails("raise \"unhandled\"\n", "EXC: 未捕捉 raise はプロセスを a
 assert_fails("begin\n  raise \"x\"\nrescue Undef\n  nil\nend\n", "EXC: 未定義クラスを rescue")
 assert_fails("begin\n  1\nend\n", "EXC: rescue/ensure なしの begin はパースエラー")
 
+# ---- Stage GC-1: GC 動作下での examples 不変 ----
+assert_output(File.read(File.expand_path('../examples/gc.rb', __dir__)),
+              "done: xy\nxy\nxy\n",
+              "examples/gc.rb (GC-1: 大量 alloc + drop)")
+
 # ---- エラー系 ----
 assert_fails(%(puts "a" + 1\n),  "STR: + 型エラー")
 assert_fails(%(puts 1 << 1\n),   "STR: << は (string|array) のみ (Fixnum 不可)")
