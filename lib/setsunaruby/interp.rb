@@ -726,7 +726,6 @@ module Setsunaruby
         Token.new(TokenKind::DOT, 0, "", @line)
       elsif b == PIPE_B
         if @lex_pos + 1 < @bytes.length && @bytes[@lex_pos + 1] == PIPE_B
-          # Stage 4a: `||` 短絡 OR。
           @lex_pos += 2
           Token.new(TokenKind::LOR, 0, "", @line)
         else
@@ -734,7 +733,6 @@ module Setsunaruby
           Token.new(TokenKind::PIPE, 0, "", @line)
         end
       elsif b == AMP_B
-        # Stage 4a: `&&` 短絡 AND / `&` 整数 AND。
         if @lex_pos + 1 < @bytes.length && @bytes[@lex_pos + 1] == AMP_B
           @lex_pos += 2
           Token.new(TokenKind::LAND, 0, "", @line)
@@ -743,17 +741,14 @@ module Setsunaruby
           Token.new(TokenKind::BAND, 0, "", @line)
         end
       elsif b == CARET_B
-        # Stage 4a: `^` 整数 XOR。
         @lex_pos += 1
         Token.new(TokenKind::BXOR, 0, "", @line)
       elsif b == TILDE_B
-        # Stage 4a: `~` 整数 NOT (単項)。
         @lex_pos += 1
         Token.new(TokenKind::BNOT, 0, "", @line)
       elsif b == BANG_B
-        # Stage 4a: `!=` 不等価 / `!` 否定 (単項)。
-        # 識別子末尾の `!` は read_ident_or_keyword で処理済みなので、ここに来る `!` は
-        # 演算子文脈の単独 `!`。
+        # 識別子末尾の `!` (`destructive!` 等) は read_ident_or_keyword で取り込み済み。
+        # ここに来るのは演算子文脈の単独 `!` または `!=`。
         if @lex_pos + 1 < @bytes.length && @bytes[@lex_pos + 1] == EQ
           @lex_pos += 2
           Token.new(TokenKind::NEQ, 0, "", @line)
@@ -789,7 +784,6 @@ module Setsunaruby
           @lex_pos += 2
           Token.new(TokenKind::GE, 0, "", @line)
         elsif @lex_pos + 1 < @bytes.length && @bytes[@lex_pos + 1] == GT_BYTE
-          # Stage 4a: `>>` 整数右シフト。
           @lex_pos += 2
           Token.new(TokenKind::SHR, 0, "", @line)
         else
@@ -1070,7 +1064,7 @@ module Setsunaruby
       node
     end
 
-    # Stage 4a: 整数 AND `&` (左結合)。Ruby では `<< >>` より低く、`| ^` より高い。
+    # 整数 AND `&` (左結合)。Ruby precedence: `<< >>` より低く、`| ^` より高い。
     def parse_band_continue(node)
       while @cur_token.kind == TokenKind::BAND
         @cur_token = next_token
@@ -1080,7 +1074,7 @@ module Setsunaruby
       node
     end
 
-    # Stage 4a: 整数 OR `|` / XOR `^` (Ruby と同じく同一レベル、左結合)。
+    # 整数 OR `|` / XOR `^` (Ruby と同じく同一レベル、左結合)。
     # ブロックパラメータ `do |x|` の `|` とは文脈が異なる (block_arg は do/{ 直後でしか
     # parse されない) ため衝突しない。
     def parse_bor_continue(node)
@@ -1122,7 +1116,7 @@ module Setsunaruby
       node
     end
 
-    # Stage 4a: 関係演算 `< > <= >=` (連鎖禁止)。`<<` は parse_shift_continue 側で先に
+    # 関係演算 `< > <= >=` (連鎖禁止)。`<<` は parse_shift_continue 側で先に
     # 食われるため、ここに到達する `<` は単独 LT。
     def parse_rel_continue(left)
       tk = @cur_token.kind
@@ -1150,7 +1144,7 @@ module Setsunaruby
       end
     end
 
-    # Stage 4a: 等価演算 `== !=` (連鎖禁止、関係演算より低優先度)。
+    # 等価演算 `== !=` (連鎖禁止、関係演算より低優先度)。
     def parse_eq_continue(left)
       tk = @cur_token.kind
       op = :nop
@@ -1172,8 +1166,8 @@ module Setsunaruby
       end
     end
 
-    # Stage 4a: 短絡 AND `&&` (左結合)。bool 中間ローカル変数を作らないため、
-    # bytecode は JUMP_IF_FALSE で展開する (compile_expr 側)。
+    # 短絡 AND `&&` (左結合)。bool 中間ローカル変数を作らないため、
+    # bytecode は JUMP_IF_FALSE で展開する (compile_expr 側、CLAUDE.md ルール 12)。
     def parse_and_continue(node)
       while @cur_token.kind == TokenKind::LAND
         @cur_token = next_token
@@ -1183,7 +1177,7 @@ module Setsunaruby
       node
     end
 
-    # Stage 4a: 短絡 OR `||` (左結合)。bytecode は JUMP_IF_TRUE で展開する。
+    # 短絡 OR `||` (左結合)。bytecode は JUMP_IF_TRUE で展開する。
     def parse_or_continue(node)
       while @cur_token.kind == TokenKind::LOR
         @cur_token = next_token
@@ -1493,11 +1487,9 @@ module Setsunaruby
         @cur_token = next_token
         ASTNode.new(:unary_minus, 0, false, :nop, nil, nil, parse_unary)
       elsif k == TokenKind::BNOT
-        # Stage 4a: `~x` 整数ビット反転 (右結合)。
         @cur_token = next_token
         ASTNode.new(:unary_bnot, 0, false, :nop, nil, nil, parse_unary)
       elsif k == TokenKind::NOT
-        # Stage 4a: `!x` 真偽反転 (右結合)。
         @cur_token = next_token
         ASTNode.new(:unary_not, 0, false, :nop, nil, nil, parse_unary)
       else
@@ -1721,15 +1713,19 @@ module Setsunaruby
       elsif k == :bin_op
         op = node.node_op
         if op == :land
-          compile_short_circuit_and(node)
+          compile_short_circuit(node, Op::JUMP_IF_FALSE)
         elsif op == :lor
-          compile_short_circuit_or(node)
+          compile_short_circuit(node, Op::JUMP_IF_TRUE)
         else
           compile_expr(node.node_left)
           compile_expr(node.node_right)
-          @bytecode.push(binop_to_opcode(op))
-          # Stage 4a: 新規 opcode は HIR/LIR 未対応のため JIT 不可。
-          if op == :shr || op == :band || op == :bor || op == :bxor || op == :neq
+          opcode = binop_to_opcode(op)
+          @bytecode.push(opcode)
+          # 新規 Stage 4a opcode は HIR/LIR 未対応のため JIT 不可。
+          # 既存 (LSHIFT 等) と区別するため opcode 値で判定する。
+          if opcode >= Op::SHL && opcode <= Op::BNOT
+            mark_current_method_jit_unsafe
+          elsif opcode == Op::NEQ
             mark_current_method_jit_unsafe
           end
         end
@@ -1739,12 +1735,10 @@ module Setsunaruby
         compile_expr(node.node_operand)
         @bytecode.push(Op::SUB)
       elsif k == :unary_bnot
-        # Stage 4a: `~x` → BNOT (Fixnum 反転)。
         compile_expr(node.node_operand)
         @bytecode.push(Op::BNOT)
         mark_current_method_jit_unsafe
       elsif k == :unary_not
-        # Stage 4a: `!x` → NOT (truthy 反転、戻り値は true/false)。
         compile_expr(node.node_operand)
         @bytecode.push(Op::NOT)
         mark_current_method_jit_unsafe
@@ -2890,41 +2884,23 @@ module Setsunaruby
       result
     end
 
-    # Stage 4a: `lhs && rhs` の短絡展開。
+    # `&&` / `||` 共通の短絡展開:
     #   <lhs>
     #   DUP
-    #   JUMP_IF_FALSE end    ; false なら lhs を残してスキップ
-    #   POP                   ; 真なら lhs を捨てて
-    #   <rhs>                ; rhs を評価して残す
-    # end:
-    # JUMP_IF_FALSE は cond を pop するため、true 時に値を残せるよう DUP+POP で組み立てる。
-    # 戻り値は Ruby と同じく lhs (false/nil 時) または rhs。
-    def compile_short_circuit_and(node)
-      compile_expr(node.node_left)
-      @bytecode.push(Op::DUP)
-      jend = emit_jump(Op::JUMP_IF_FALSE)
-      @bytecode.push(Op::POP)
-      compile_expr(node.node_right)
-      patch_jump(jend, @bytecode.length)
-      mark_current_method_jit_unsafe   # JUMP_IF_TRUE/DUP+JUMP_IF_FALSE 経路は HIR 未対応
-      nil
-    end
-
-    # Stage 4a: `lhs || rhs` の短絡展開。
-    #   <lhs>
-    #   DUP
-    #   JUMP_IF_TRUE end     ; 真なら lhs を残してスキップ
-    #   POP                   ; 偽なら lhs を捨てて
+    #   <jump_op> end        ; && は JUMP_IF_FALSE、|| は JUMP_IF_TRUE
+    #   POP
     #   <rhs>
     # end:
-    def compile_short_circuit_or(node)
+    # JUMP_IF_* は cond を pop するため、スキップ時に値を残せるよう DUP+POP で組み立てる。
+    # 戻り値は Ruby と同じく短絡時の lhs / 評価時の rhs。
+    def compile_short_circuit(node, jump_op)
       compile_expr(node.node_left)
       @bytecode.push(Op::DUP)
-      jend = emit_jump(Op::JUMP_IF_TRUE)
+      jend = emit_jump(jump_op)
       @bytecode.push(Op::POP)
       compile_expr(node.node_right)
       patch_jump(jend, @bytecode.length)
-      mark_current_method_jit_unsafe
+      mark_current_method_jit_unsafe   # DUP + JUMP_IF_* 経路は HIR 未対応
       nil
     end
 
@@ -3077,20 +3053,20 @@ module Setsunaruby
           exec_compare(:ge)
         elsif op == Op::LSHIFT
           exec_lshift
-        elsif op == Op::SHL
-          exec_int_shift(:shl)
         elsif op == Op::SHR
-          exec_int_shift(:shr)
+          exec_int_binop(:shr)
         elsif op == Op::BAND
-          exec_int_bitop(:band)
+          exec_int_binop(:band)
         elsif op == Op::BOR
-          exec_int_bitop(:bor)
+          exec_int_binop(:bor)
         elsif op == Op::BXOR
-          exec_int_bitop(:bxor)
+          exec_int_binop(:bxor)
         elsif op == Op::BNOT
           exec_int_bnot
         elsif op == Op::NEQ
-          exec_neq
+          rhs = @stack.pop
+          lhs = @stack.pop
+          @stack.push(box_bool(!values_equal?(lhs, rhs)))
         elsif op == Op::NOT
           v = @stack.pop
           @stack.push(box_bool(!truthy?(v)))
@@ -3782,8 +3758,8 @@ module Setsunaruby
       nil
     end
 
-    # Stage 3a: String × String、Stage 3b: Array × any へ多相化。
-    # Stage 4a: Fixnum × Fixnum で整数左シフトに dispatch。
+    # `<<` は Stage 3a で String × String、Stage 3b で Array × any、Stage 4a で
+    # Fixnum × Fixnum (整数左シフト) と多相化されている。
     def exec_lshift
       rhs = @stack.pop
       lhs = @stack.pop
@@ -3792,37 +3768,15 @@ module Setsunaruby
       elsif heap_array?(lhs)
         @stack.push(heap_array_push_bang(lhs, rhs))
       elsif fixnum?(lhs) && fixnum?(rhs)
-        a = unbox_int(lhs)
-        b = unbox_int(rhs)
-        @stack.push(box_int(a << b))
+        @stack.push(box_int(unbox_int(lhs) << unbox_int(rhs)))
       else
         raise "TypeError: << は (Integer << Integer) / (String << String) / (Array << any) のみ"
       end
       nil
     end
 
-    # Stage 4a: 整数限定の二項ビット演算。Fixnum × Fixnum を要求。
-    def exec_int_shift(op)
-      rhs = @stack.pop
-      lhs = @stack.pop
-      if !fixnum?(lhs) || !fixnum?(rhs)
-        raise "TypeError: shift requires Integer operands"
-      end
-      a = unbox_int(lhs)
-      b = unbox_int(rhs)
-      result = 0
-      if op == :shl
-        result = a << b
-      elsif op == :shr
-        result = a >> b
-      else
-        raise "VM bug: unknown shift #{op}"
-      end
-      @stack.push(box_int(result))
-      nil
-    end
-
-    def exec_int_bitop(op)
+    # 整数限定の二項ビット演算 (`>> & | ^`)。Fixnum × Fixnum を要求。
+    def exec_int_binop(op)
       rhs = @stack.pop
       lhs = @stack.pop
       if !fixnum?(lhs) || !fixnum?(rhs)
@@ -3831,14 +3785,16 @@ module Setsunaruby
       a = unbox_int(lhs)
       b = unbox_int(rhs)
       result = 0
-      if op == :band
+      if op == :shr
+        result = a >> b
+      elsif op == :band
         result = a & b
       elsif op == :bor
         result = a | b
       elsif op == :bxor
         result = a ^ b
       else
-        raise "VM bug: unknown bitop #{op}"
+        raise "VM bug: unknown int binop #{op}"
       end
       @stack.push(box_int(result))
       nil
@@ -3853,20 +3809,17 @@ module Setsunaruby
       nil
     end
 
-    # Stage 4a: `!=` は `==` の反転。EQ と同じく型違いも許容 (両辺の値が異なれば true)。
-    def exec_neq
-      rhs = @stack.pop
-      lhs = @stack.pop
+    # `==` `!=` 共通の値比較。型違いは obj_id 同値、両辺 Fixnum / String なら値比較。
+    def values_equal?(lhs, rhs)
       r = false
       if fixnum?(lhs) && fixnum?(rhs)
-        r = lhs != rhs
+        r = lhs == rhs
       elsif heap_str?(lhs) && heap_str?(rhs)
-        r = !heap_str_eq(lhs, rhs)
+        r = heap_str_eq(lhs, rhs)
       else
-        r = lhs != rhs
+        r = lhs == rhs
       end
-      @stack.push(box_bool(r))
-      nil
+      r
     end
 
     def exec_array_new
