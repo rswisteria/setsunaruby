@@ -79,14 +79,32 @@ make test-all
 
 ## ベンチマーク
 
+`make bench` で 5 回計測の中央値を測定する。`benchmark/bench*.rb` の wildcard を順に
+CRuby 版 (`ruby bin/setsunaruby.rb`) と AOT 版 (`./setsunaruby`) で実行して比較。
+
+### Stage 0 系 (puts + 算術 + 比較)
+
 | ワークロード | CRuby | AOT | speedup |
 |---|---:|---:|---:|
-| hello.rb (最小) | ~55 ms | ~3 ms | 約 19x |
-| Stage 0 平均 (5種類 × 2000行) | ~80 ms | ~4 ms | 約 18x |
-| **FizzBuzz N=5000 (Stage 1 ループ)** | **73 ms** | **2.5 ms** | **約 29x** |
+| `bench1_many_puts` (2000 行 puts) | 58.2 ms | 2.9 ms | 20.07x |
+| `bench2_deep_arith` (20 項加算 × 2000 行) | 144.3 ms | 8.9 ms | 16.21x |
+| `bench3_large_int` (10 億超 × 2000 行) | 61.3 ms | 3.2 ms | 19.16x |
+| `bench4_compare` (== / < / > × 2000 行) | 66.6 ms | 3.3 ms | 20.18x |
+| `bench5_mixed` (単項 - + 括弧 + 乗算) | 73.2 ms | 3.8 ms | 19.26x |
 
-ループや分岐を含む実用的なワークロードで AOT 版は CRuby 比 約 30 倍高速。
-spinel の C コード生成 + GC 最適化 + ネイティブ実行の効果。`make bench` で再現可能。
+### Stage 2 以降の言語機能 + GC を活かしたアルゴリズミック系
+
+| ワークロード | カバー機能 | CRuby | AOT | speedup |
+|---|---|---:|---:|---:|
+| `bench6_fib` (fib(28)) | 再帰 (Stage 2) | **3733 ms** | **79 ms** | **47.26x** |
+| `bench7_sieve` (エラトステネス N=5000) | 配列 + 二重 while (Stage 3b) | 545.7 ms | 24.6 ms | 22.18x |
+| `bench8_nqueens` (N-queens N=10) | 再帰バックトラック + 配列 | **13624 ms** | **272 ms** | **50.07x** |
+| `bench9_linked_list` (1000 ノードの sum) | クラス + ivar + dispatch + GC | 66.6 ms | 3.1 ms | 21.48x |
+| `bench10_string_gc` (5000 短命文字列 + 比較) | Stage 3a + GC-1/GC-2 | 93.4 ms | 3.3 ms | 28.30x |
+
+ループ + 算術ヘビーなアルゴリズミック系で AOT は CRuby 比 **20〜50 倍**高速。
+特に再帰深度が大きい `fib` / `nqueens` で spinel の関数呼び出し最適化が効く。
+GC を多用する `string_gc` / `linked_list` でも 20x 以上の speedup を維持。
 
 ## アーキテクチャ
 
