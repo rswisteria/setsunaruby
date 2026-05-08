@@ -3297,6 +3297,9 @@ module Setsunaruby
     # ミューテーション。元の領域は abandon (no-GC)。
     # 自己 append (`s << s`) でも安全: ll/rl とソース start を先に確定してから append し、
     # 最後にスロットを更新するため、読み取り中にソースが書き換わることはない。
+    # GC-2 注意: この関数は `alloc_heap_slot` を呼ばないので GC は走らない (pool が
+    # 伸びるだけで pool 圧縮の影響は受けない)。よって gc_check_threshold は不要。
+    # abandoned 領域は次の alloc で GC が走った時に圧縮される。
     def heap_str_append_bang(lhs_id, rhs_id)
       lhs_idx = unbox_heap(lhs_id)
       rhs_idx = unbox_heap(rhs_id)
@@ -3398,6 +3401,8 @@ module Setsunaruby
 
     # `a << v` (push)。@heap_arr_pool 末尾に「現在の要素 + 新要素」を再配置し、
     # lhs スロットの start/len を更新。共有参照に変更が反映される Ruby 互換セマンティクス。
+    # GC-2 注意: heap_str_append_bang と同じく alloc_heap_slot を呼ばないので GC は
+    # 走らない。pool が伸びるだけで圧縮の影響は受けず、gc_check_threshold は不要。
     def heap_array_push_bang(arr_id, val)
       arr_idx = unbox_heap(arr_id)
       ll = @heap_lens[arr_idx]
