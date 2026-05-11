@@ -1,12 +1,21 @@
-SPINEL ?= $(HOME)/spinel/spinel
-ENTRY  := bin/setsunaruby.rb
+SPINEL      ?= $(HOME)/spinel/spinel
+SPINEL_HOME ?= $(HOME)/spinel
+ENTRY       := bin/setsunaruby.rb
 
-.PHONY: all build run-cruby clean test
+.PHONY: all build run-cruby clean test verify-spinel-jit
 
 all: build
 
+# spinel が setsunaruby-jit ブランチ (= JIT primitives 適用済み) かをチェック。
+# vendor/spinel-jit-primitives.patch を当て直して `cd ~/spinel && make` で復旧。
+verify-spinel-jit:
+	@grep -q 'sp_jit_alloc' $(SPINEL_HOME)/lib/sp_runtime.h \
+	  || { echo "ERROR: spinel に JIT primitives 未適用。"; \
+	       echo "  cd $(SPINEL_HOME) && git am < $(CURDIR)/vendor/spinel-jit-primitives.patch && make"; \
+	       exit 1; }
+
 # spinel で AOT ビルド
-build:
+build: verify-spinel-jit
 	$(SPINEL) $(ENTRY) -o setsunaruby
 
 # CRuby で開発時実行 (例: make run-cruby ARGS=examples/hello.rb)

@@ -1,9 +1,9 @@
 # JIT 概観
 
 setsunaruby の JIT は **ZJIT (Ruby 4.0)** を参考にした教科書的なパイプライン。
-bytecode → HIR → 最適化 → LIR → arm64 機械語までを実装している。
-**ダンプまでは完成済みだが、生成した機械語を CPU に実行させる経路は未着手**
-(spinel 拡張待ち)。詳細は [status.md](status.md)。
+bytecode → HIR → 最適化 → LIR → arm64 機械語 → 実機実行 までを実装している。
+実機実行経路 (案 C) は spinel フォーク `setsunaruby-jit` に依存する。詳細は
+[status.md](status.md)。
 
 ## パイプライン
 
@@ -50,7 +50,7 @@ bytecode → HIR → 最適化 → LIR → arm64 機械語までを実装して�
 | JIT-3b3 | phi 挿入 + variable renaming (本格 SSA) | [hir.md](hir.md#ssa) |
 | JIT-3c | 型プロファイル + GuardFixnum + Fixnum 特化 | [hir.md](hir.md#型特化) |
 | JIT-4 (案 A) | HIR → LIR + arm64 エンコード + ダンプ | [lir.md](lir.md) |
-| JIT-4 (案 C) | mmap + W^X 切替 + 関数ポインタ呼び出し + 実機実行 | **未実装** ([status.md](status.md)) |
+| JIT-4 (案 C) | mmap + W^X 切替 + 関数ポインタ呼び出し + 実機実行 | ✅ 経路完成、`SETSUNARUBY_JIT=1` + arm64 ホスト + spinel フォーク要 ([status.md](status.md)) |
 
 ## 起動条件
 
@@ -64,6 +64,10 @@ JIT_HOT_THRESHOLD = 100  # 値はコード参照 (例)
 
 `SETSUNARUBY_DUMP_HIR=1` 環境変数が立っていれば HIR/LIR/機械語ダンプを STDERR に
 出力する (CRuby 実行時のみ。AOT は `STDERR.puts` が no-op なので silent)。
+
+`SETSUNARUBY_JIT=1` を立てると AOT バイナリ + arm64 ホスト上では、ホット検出後の
+JIT パスでメソッドを実機実行する (詳細は [status.md](status.md))。CRuby / 非
+arm64 / 非 AOT では自動的にインタプリタにフォールバックする。
 
 ## JIT で扱わない機能
 
@@ -113,5 +117,13 @@ JIT が扱える代表例: `def fib(n); ...; end` のような Fixnum 算術 + �
 | `@lir_kind/op0/op1/op2` | 1 命令 = (kind, op0, op1, op2) |
 | `@lir_bb` | 各 lir_id の所属 BB |
 | `@lir_machine_code` | encode 済み 32bit 機械語 |
+
+### JIT 実機実行 (案 C)
+
+| ivar | 内容 |
+|---|---|
+| `@jit_fn_addrs` | `m_idx` → 実行可能ページの先頭アドレス (0=未試行, -1=skip 確定) |
+| `@jit_fn_sizes` | `m_idx` → 確保した buffer サイズ (free 用) |
+| `@jit_exec_enabled` | `SETSUNARUBY_JIT=1` && `defined?(JIT)` のとき true |
 
 詳細レイアウトは [hir.md](hir.md) / [lir.md](lir.md)。

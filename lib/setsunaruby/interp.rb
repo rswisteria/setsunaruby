@@ -167,6 +167,12 @@ module Setsunaruby
       @method_local_counts = []   # IntArray (パラメータ含むローカル変数の総数)
       @method_body_ends    = []   # IntArray (JIT-2: メソッド本体終了 PC、HIR 構築の範囲決定用)
       @jit_call_counts     = []   # IntArray (JIT-1: メソッド呼び出し回数)
+      # JIT-4c: 実機実行用に保持する関数ポインタとそのページサイズ。
+      # @jit_fn_addrs[m_idx] = 0  → 未試行、 -1 → 試したが install 失敗 (再試行しない)、
+      #                       > 0 → mmap 済みの実行可能 buffer 先頭アドレス。
+      # SETSUNARUBY_JIT=1 + (JIT::ARCH_ARM64 または ENV 経由の override) でのみ install。
+      @jit_fn_addrs        = []   # IntArray
+      @jit_fn_sizes        = []   # IntArray (free 時の munmap サイズ)
       # JIT-2: HIR (lite SSA) を SoA で保持。build_and_dump_hir が再構築する。
       @hir_kind      = []   # IntArray (HirOp 定数)
       @hir_op0       = []   # IntArray (kind ごとの 1 番目のオペランド)
@@ -220,6 +226,14 @@ module Setsunaruby
       @lir_machine_code = []
       # spinel AOT で ENV が解釈されない場合は常に false 相当 (HIR ダンプは CRuby のみ)。
       @dump_hir      = ENV["SETSUNARUBY_DUMP_HIR"] == "1"
+      # JIT-4c: 実機実行を有効化するゲート。SETSUNARUBY_JIT=1 で ON。デフォルト OFF
+      # の理由は、(1) 既存テストの観測挙動を変えないため、(2) x86_64 ホストで arm64
+      # 機械語を呼ぶと即 SIGSEGV する (現状 arm64 emitter しか持たないため) 防衛策。
+      # AOT バイナリで JIT::ARCH_ARM64 が false な環境では install を skip する。
+      # `defined?(JIT)` は spinel では常に "expression" (truthy) を返すので AOT では
+       # ENV だけが効く。CRuby は JIT module を持たないため nil/false 扱いになり、
+       # SETSUNARUBY_JIT=1 を設定しても自動的に install/dispatch がスキップされる。
+      @jit_exec_enabled = (ENV["SETSUNARUBY_JIT"] == "1") && (defined?(JIT) ? true : false)
       # VM のコールフレームスタック (並列 IntArray)。
       # locals の縮小は @cur_base で行うので length 自体は記録しない。
       @cfp_pcs   = []   # IntArray (戻り PC)
@@ -347,6 +361,8 @@ module Setsunaruby
       @method_local_counts = []
       @method_body_ends    = []
       @jit_call_counts     = []
+      @jit_fn_addrs        = []
+      @jit_fn_sizes        = []
       @hir_kind      = []
       @hir_op0       = []
       @hir_op1       = []
@@ -381,6 +397,10 @@ module Setsunaruby
       # @profile_fixnum_pc は bytecode コンパイル完了後に length 分一括確保するため、
       # 冒頭リセットには含めない (= run_string 後半で `[] + push` 経由で初期化)。
       @dump_hir      = ENV["SETSUNARUBY_DUMP_HIR"] == "1"
+      # `defined?(JIT)` は spinel では常に "expression" (truthy) を返すので AOT では
+       # ENV だけが効く。CRuby は JIT module を持たないため nil/false 扱いになり、
+       # SETSUNARUBY_JIT=1 を設定しても自動的に install/dispatch がスキップされる。
+      @jit_exec_enabled = (ENV["SETSUNARUBY_JIT"] == "1") && (defined?(JIT) ? true : false)
       @cfp_pcs   = []
       @cfp_bases = []
       @cur_base  = 0
@@ -2826,6 +2846,8 @@ module Setsunaruby
       @method_local_counts.push(0)
       @method_body_ends.push(-1)
       @jit_call_counts.push(0)
+      @jit_fn_addrs.push(0)
+      @jit_fn_sizes.push(0)
       @method_class_idx.push(@cur_class)
       @method_name_starts.length - 1
     end
@@ -3890,12 +3912,24 @@ module Setsunaruby
         @jit_call_counts[m_idx] = cnt
         if cnt == JIT_HOT_THRESHOLD
           STDERR.puts "ZJIT: hot method detected (idx=#{m_idx})"
-          if @dump_hir
+          # dump 用 / JIT install 用 (いずれも build_and_dump_hir の副作用を必要とする)。
+          # AOT 上の build_and_dump_hir には x86_64 ホストで実行すると無限ループ
+          # するパスが存在する (= 既存 AOT バグ、現状未調査)。JIT 実機実行が物理的に
+          # 不可能な arch では build_and_dump_hir 自体を呼ばないようにしておく。
+          if @dump_hir || (@jit_exec_enabled && jit_install_viable?)
             build_and_dump_hir(m_idx)
           end
         end
       end
       argc = @method_arities[m_idx]
+      # JIT-4c: install 済みなら直接 callN にディスパッチして bytecode を skip。
+      # 失敗マーク (-1) や 0 (未試行) は通常 frame push に流す。
+      fn_addr = @jit_fn_addrs[m_idx]
+      if fn_addr > 0
+        if dispatch_jit_call(m_idx, argc, fn_addr) == 1
+          return nil
+        end
+      end
       local_count = @method_local_counts[m_idx]
 
       # local_count 個のスロットを NIL_VAL で確保したあと、末尾 argc 個を
@@ -4672,17 +4706,28 @@ module Setsunaruby
       pass_build_cfg
       build_preds_table
       init_dom_scratch
-      dump_hir(m_idx, "raw")
+      if @dump_hir
+        dump_hir(m_idx, "raw")
+      end
       optimize_hir
       pass_build_dom_children
       pass_insert_phis(m_idx)
       pass_rename_vars(m_idx)
       pass_type_specialize
-      dump_hir(m_idx, "optimized")
-      dump_cfg_analysis(m_idx)
+      if @dump_hir
+        dump_hir(m_idx, "optimized")
+        dump_cfg_analysis(m_idx)
+      end
       pass_lower_to_lir
       pass_encode_arm64
-      dump_lir(m_idx)
+      if @dump_hir
+        dump_lir(m_idx)
+      end
+      # JIT-4c: arm64 機械語が encode できた直後に実機実行用バッファへインストール。
+      # 失敗時は @jit_fn_addrs[m_idx] = -1 でマークし、以降は dispatch をスキップする。
+      if @jit_exec_enabled
+        install_jit_for_method(m_idx)
+      end
       nil
     end
 
@@ -6217,6 +6262,149 @@ module Setsunaruby
         i += 1
       end
       nil
+    end
+
+    # JIT install できる物理的条件が揃っているか (アーキ・モジュール存在の両方)。
+    # CRuby は JIT 未定義のため defined?(JIT) で false 側、AOT 上 x86_64 ホストは
+    # JIT::ARCH_ARM64 で false 側に倒れる。両条件を満たすのは arm64 AOT のみ。
+    def jit_install_viable?
+      if defined?(JIT)
+        return JIT::ARCH_ARM64
+      end
+      false
+    end
+
+    # JIT-4c: encode 済みの @lir_machine_code を実機実行可能な buffer に書き込む。
+    # arm64 ホスト以外、arity > 8、空 LIR は install をスキップ (@jit_fn_addrs[m_idx]
+    # = -1 でマーク、以後再試行しない)。BL や分岐の target 解決は現状の encoder で
+    # 完結していないため、複数 BB を持つメソッドは crash する可能性が高い ── これは
+    # encoder 側の未解決 task。ここでは「install できる入力なら install する」のみ。
+    def install_jit_for_method(m_idx)
+      if JIT::ARCH_ARM64 == false
+        @jit_fn_addrs[m_idx] = -1
+        return nil
+      end
+      if @method_arities[m_idx] > 8
+        @jit_fn_addrs[m_idx] = -1
+        return nil
+      end
+      n_words = @lir_machine_code.length
+      if n_words == 0
+        @jit_fn_addrs[m_idx] = -1
+        return nil
+      end
+      bytes = n_words * 4
+      page = JIT.page_size
+      size = ((bytes + page - 1) / page) * page
+
+      addr = JIT.alloc(size, JIT::PROT_READ | JIT::PROT_WRITE | JIT::PROT_EXEC)
+      if addr == 0
+        @jit_fn_addrs[m_idx] = -1
+        return nil
+      end
+
+      if JIT::DARWIN_ARM64
+        # macOS arm64: MAP_JIT ページは pthread_jit_write_protect_np(0) で書き込み解禁
+        JIT.jit_write_protect(false)
+      end
+      JIT.write_words(addr, @lir_machine_code)
+      if JIT::DARWIN_ARM64
+        JIT.jit_write_protect(true)
+      else
+        # Linux 系: 一旦 RW で確保したわけではなく PROT_EXEC 込みで取っているので、
+        # ここで明示的に protect する必要はない (DEP/NX 環境でも MAP_ANONYMOUS は
+        # RWX を許容する設定が一般的)。気になる場合は alloc を RW にして
+        # ここで RX へ降格する 2 段階構えに変更する。
+      end
+      JIT.clear_icache(addr, bytes)
+
+      @jit_fn_addrs[m_idx] = addr
+      @jit_fn_sizes[m_idx] = size
+      nil
+    end
+
+    # JIT-4c: install 済み JIT エントリにディスパッチ。スタック末尾 argc 個を引数に
+    # 取り、callN で関数ポインタへ jmp。返り値をスタックに push して 1 を返す。
+    # 戻り値 0 = 「JIT 経路に乗せず通常 frame push を続行」(=現状常に 1 を返すので
+    # 将来 deopt が要るときに使う想定)。
+    def dispatch_jit_call(m_idx, argc, fn_addr)
+      a0 = 0; a1 = 0; a2 = 0; a3 = 0; a4 = 0; a5 = 0; a6 = 0; a7 = 0
+      # 引数は最後に push したものが最後の引数。逆順 pop でレジスタ順に並べる。
+      if argc == 0
+        # no args
+      elsif argc == 1
+        a0 = @stack.pop
+      elsif argc == 2
+        a1 = @stack.pop
+        a0 = @stack.pop
+      elsif argc == 3
+        a2 = @stack.pop
+        a1 = @stack.pop
+        a0 = @stack.pop
+      elsif argc == 4
+        a3 = @stack.pop
+        a2 = @stack.pop
+        a1 = @stack.pop
+        a0 = @stack.pop
+      elsif argc == 5
+        a4 = @stack.pop
+        a3 = @stack.pop
+        a2 = @stack.pop
+        a1 = @stack.pop
+        a0 = @stack.pop
+      elsif argc == 6
+        a5 = @stack.pop
+        a4 = @stack.pop
+        a3 = @stack.pop
+        a2 = @stack.pop
+        a1 = @stack.pop
+        a0 = @stack.pop
+      elsif argc == 7
+        a6 = @stack.pop
+        a5 = @stack.pop
+        a4 = @stack.pop
+        a3 = @stack.pop
+        a2 = @stack.pop
+        a1 = @stack.pop
+        a0 = @stack.pop
+      elsif argc == 8
+        a7 = @stack.pop
+        a6 = @stack.pop
+        a5 = @stack.pop
+        a4 = @stack.pop
+        a3 = @stack.pop
+        a2 = @stack.pop
+        a1 = @stack.pop
+        a0 = @stack.pop
+      else
+        # 9 引数以上は install 時に弾いているはず。防御として install 失敗扱いにして
+        # 通常 frame push に流す。
+        @jit_fn_addrs[m_idx] = -1
+        return 0
+      end
+
+      ret = 0
+      if argc == 0
+        ret = JIT.call0(fn_addr)
+      elsif argc == 1
+        ret = JIT.call1(fn_addr, a0)
+      elsif argc == 2
+        ret = JIT.call2(fn_addr, a0, a1)
+      elsif argc == 3
+        ret = JIT.call3(fn_addr, a0, a1, a2)
+      elsif argc == 4
+        ret = JIT.call4(fn_addr, a0, a1, a2, a3)
+      elsif argc == 5
+        ret = JIT.call5(fn_addr, a0, a1, a2, a3, a4)
+      elsif argc == 6
+        ret = JIT.call6(fn_addr, a0, a1, a2, a3, a4, a5)
+      elsif argc == 7
+        ret = JIT.call7(fn_addr, a0, a1, a2, a3, a4, a5, a6)
+      elsif argc == 8
+        ret = JIT.call8(fn_addr, a0, a1, a2, a3, a4, a5, a6, a7)
+      end
+      @stack.push(ret)
+      1
     end
 
     def encode_arm64_insn(lir_id)

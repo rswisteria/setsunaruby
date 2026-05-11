@@ -1,0 +1,394 @@
+From c52004535f1bf811a4b0c0b31aefb60853a1063b Mon Sep 17 00:00:00 2001
+From: setsunaruby fork <setsunaruby@local>
+Date: Mon, 11 May 2026 23:09:50 +0900
+Subject: [PATCH 1/2] feat: JIT primitives for setsunaruby fork
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds module-style JIT.* primitives needed by setsunaruby's
+arm64 JIT execution path. Not upstreamed; this branch is
+maintained locally as a private fork.
+
+- lib/sp_runtime.h: sp_jit_alloc / sp_jit_protect / sp_jit_free /
+  sp_jit_write_u32 / sp_jit_write_words / sp_jit_clear_icache /
+  sp_jit_write_protect / sp_jit_call0..call8, plus SP_JIT_PROT_*
+  and SP_JIT_DARWIN_ARM64 constants.
+- spinel_codegen.rb: JIT recognized as known constant, infer_call_type
+  returns int for JIT.* receiver, compile_call_expr dispatches via
+  compile_jit_call_expr to sp_jit_* helpers, JIT::PROT_* and
+  JIT::DARWIN_ARM64 resolved in ConstantPathNode branch.
+
+setsunaruby 側からは module JIT 経由で alloc → write → protect →
+clear_icache → callN → free のパイプラインが組める。
+---
+ lib/sp_runtime.h  | 143 ++++++++++++++++++++++++++++++++++++++++++++++
+ spinel_codegen.rb | 108 +++++++++++++++++++++++++++++++++-
+ 2 files changed, 250 insertions(+), 1 deletion(-)
+
+diff --git a/lib/sp_runtime.h b/lib/sp_runtime.h
+index e83d342..294d1fe 100644
+--- a/lib/sp_runtime.h
++++ b/lib/sp_runtime.h
+@@ -895,6 +895,149 @@ int64_t sp_bigint_to_int(sp_Bigint *b);
+ const char *sp_bigint_to_s(sp_Bigint *b);
+ void sp_bigint_free(sp_Bigint *b);
+ 
++/* ===== JIT primitives (setsunaruby fork) ===== */
++/* setsunaruby が arm64 機械語を実機実行するために必要な低レベル API。
++   spinel 本家には無い、このフォーク専用の追加。Ruby 側からは module JIT 経由で
++   alloc/protect/write_u32/write_words/clear_icache/jit_write_protect/call0..call8
++   として見える。 */
++#if !defined(_WIN32)
++#include <sys/mman.h>
++#include <unistd.h>
++#if defined(__APPLE__)
++#include <pthread.h>
++#endif
++#endif
++
++#ifndef MAP_JIT
++#define MAP_JIT 0
++#endif
++
++/* JIT::PROT_* に対応する Ruby 側定数。POSIX の PROT_* の値は OS 依存なので
++   独立した定数 (1/2/4) を定義しておき、sp_jit_alloc / sp_jit_protect の中で
++   POSIX 値に変換する。これで Ruby 側は OS 非依存に prot を組める。 */
++#define SP_JIT_PROT_READ  ((mrb_int)1)
++#define SP_JIT_PROT_WRITE ((mrb_int)2)
++#define SP_JIT_PROT_EXEC  ((mrb_int)4)
++
++#if defined(__APPLE__) && defined(__aarch64__)
++#define SP_JIT_DARWIN_ARM64 ((mrb_bool)TRUE)
++#else
++#define SP_JIT_DARWIN_ARM64 ((mrb_bool)FALSE)
++#endif
++
++static mrb_int sp_jit_page_size(void) {
++#if defined(_WIN32)
++  SYSTEM_INFO si; GetSystemInfo(&si); return (mrb_int)si.dwPageSize;
++#else
++  long ps = sysconf(_SC_PAGESIZE);
++  return ps > 0 ? (mrb_int)ps : (mrb_int)4096;
++#endif
++}
++
++#if !defined(_WIN32)
++static int sp_jit_to_posix_prot(mrb_int p) {
++  int r = 0;
++  if (p & 1) r |= PROT_READ;
++  if (p & 2) r |= PROT_WRITE;
++  if (p & 4) r |= PROT_EXEC;
++  return r;
++}
++#endif
++
++static mrb_int sp_jit_alloc(mrb_int size, mrb_int prot) {
++#if defined(_WIN32)
++  /* Windows: 簡易対応 — VirtualAlloc は最初から RWX で取り、protect で絞る */
++  void *buf = VirtualAlloc(NULL, (size_t)size, MEM_RESERVE|MEM_COMMIT, PAGE_EXECUTE_READWRITE);
++  (void)prot;
++  return buf ? (mrb_int)(uintptr_t)buf : 0;
++#else
++  int pp = sp_jit_to_posix_prot(prot);
++  int flags = MAP_PRIVATE | MAP_ANONYMOUS;
++#if defined(__APPLE__) && defined(__aarch64__)
++  /* macOS arm64 で実行可能ページを取るには MAP_JIT が必須 (W^X)。
++     確保後の書き込みには pthread_jit_write_protect_np(0) が必要。 */
++  if (pp & PROT_EXEC) flags |= MAP_JIT;
++#endif
++  void *buf = mmap(NULL, (size_t)size, pp, flags, -1, 0);
++  if (buf == MAP_FAILED) return 0;
++  return (mrb_int)(uintptr_t)buf;
++#endif
++}
++
++static mrb_int sp_jit_protect(mrb_int addr, mrb_int size, mrb_int prot) {
++#if defined(_WIN32)
++  DWORD wp = PAGE_READONLY;
++  if ((prot & 2) && (prot & 4)) wp = PAGE_EXECUTE_READWRITE;
++  else if (prot & 4)            wp = PAGE_EXECUTE_READ;
++  else if (prot & 2)            wp = PAGE_READWRITE;
++  DWORD oldp; return VirtualProtect((void*)(uintptr_t)addr, (SIZE_T)size, wp, &oldp) ? 0 : -1;
++#else
++  return mprotect((void *)(uintptr_t)addr, (size_t)size, sp_jit_to_posix_prot(prot));
++#endif
++}
++
++static mrb_int sp_jit_free(mrb_int addr, mrb_int size) {
++#if defined(_WIN32)
++  (void)size; return VirtualFree((void*)(uintptr_t)addr, 0, MEM_RELEASE) ? 0 : -1;
++#else
++  return munmap((void *)(uintptr_t)addr, (size_t)size);
++#endif
++}
++
++static void sp_jit_write_protect(mrb_bool enable) {
++#if defined(__APPLE__) && defined(__aarch64__)
++  pthread_jit_write_protect_np(enable ? 1 : 0);
++#else
++  (void)enable;
++#endif
++}
++
++static void sp_jit_write_u32(mrb_int addr, mrb_int offset, mrb_int value) {
++  *(uint32_t *)((char *)(uintptr_t)addr + offset) = (uint32_t)value;
++}
++
++/* @lir_machine_code は IntArray<int64> に 32bit 命令語を 1 個/スロットで
++   詰めた形。ここで 32bit へダウンキャストして詰め直す。 */
++static void sp_jit_write_words(mrb_int addr, sp_IntArray *words) {
++  uint32_t *out = (uint32_t *)(uintptr_t)addr;
++  mrb_int *src  = words->data + words->start;
++  for (mrb_int i = 0; i < words->len; i++) {
++    out[i] = (uint32_t)(src[i] & 0xFFFFFFFFu);
++  }
++}
++
++static void sp_jit_clear_icache(mrb_int addr, mrb_int size) {
++#if defined(__GNUC__) || defined(__clang__)
++  __builtin___clear_cache((char *)(uintptr_t)addr,
++                          (char *)(uintptr_t)addr + (size_t)size);
++#else
++  (void)addr; (void)size;
++#endif
++}
++
++/* 関数ポインタ呼び出しは固定アリティで定義する。C ABI で可変引数を整数で渡す
++   汎用ラッパは書けない (varargs の呼び規約は固定引数と別)。setsunaruby 側は
++   compile 時にメソッドの引数数を知っているので、引数数で call0..call8 を選ぶ。 */
++typedef mrb_int (*sp_jit_fn0)(void);
++typedef mrb_int (*sp_jit_fn1)(mrb_int);
++typedef mrb_int (*sp_jit_fn2)(mrb_int, mrb_int);
++typedef mrb_int (*sp_jit_fn3)(mrb_int, mrb_int, mrb_int);
++typedef mrb_int (*sp_jit_fn4)(mrb_int, mrb_int, mrb_int, mrb_int);
++typedef mrb_int (*sp_jit_fn5)(mrb_int, mrb_int, mrb_int, mrb_int, mrb_int);
++typedef mrb_int (*sp_jit_fn6)(mrb_int, mrb_int, mrb_int, mrb_int, mrb_int, mrb_int);
++typedef mrb_int (*sp_jit_fn7)(mrb_int, mrb_int, mrb_int, mrb_int, mrb_int, mrb_int, mrb_int);
++typedef mrb_int (*sp_jit_fn8)(mrb_int, mrb_int, mrb_int, mrb_int, mrb_int, mrb_int, mrb_int, mrb_int);
++
++static inline mrb_int sp_jit_call0(mrb_int a){return ((sp_jit_fn0)(uintptr_t)a)();}
++static inline mrb_int sp_jit_call1(mrb_int a,mrb_int x0){return ((sp_jit_fn1)(uintptr_t)a)(x0);}
++static inline mrb_int sp_jit_call2(mrb_int a,mrb_int x0,mrb_int x1){return ((sp_jit_fn2)(uintptr_t)a)(x0,x1);}
++static inline mrb_int sp_jit_call3(mrb_int a,mrb_int x0,mrb_int x1,mrb_int x2){return ((sp_jit_fn3)(uintptr_t)a)(x0,x1,x2);}
++static inline mrb_int sp_jit_call4(mrb_int a,mrb_int x0,mrb_int x1,mrb_int x2,mrb_int x3){return ((sp_jit_fn4)(uintptr_t)a)(x0,x1,x2,x3);}
++static inline mrb_int sp_jit_call5(mrb_int a,mrb_int x0,mrb_int x1,mrb_int x2,mrb_int x3,mrb_int x4){return ((sp_jit_fn5)(uintptr_t)a)(x0,x1,x2,x3,x4);}
++static inline mrb_int sp_jit_call6(mrb_int a,mrb_int x0,mrb_int x1,mrb_int x2,mrb_int x3,mrb_int x4,mrb_int x5){return ((sp_jit_fn6)(uintptr_t)a)(x0,x1,x2,x3,x4,x5);}
++static inline mrb_int sp_jit_call7(mrb_int a,mrb_int x0,mrb_int x1,mrb_int x2,mrb_int x3,mrb_int x4,mrb_int x5,mrb_int x6){return ((sp_jit_fn7)(uintptr_t)a)(x0,x1,x2,x3,x4,x5,x6);}
++static inline mrb_int sp_jit_call8(mrb_int a,mrb_int x0,mrb_int x1,mrb_int x2,mrb_int x3,mrb_int x4,mrb_int x5,mrb_int x6,mrb_int x7){return ((sp_jit_fn8)(uintptr_t)a)(x0,x1,x2,x3,x4,x5,x6,x7);}
++
+ #ifdef __APPLE__
+ #pragma clang diagnostic pop
+ #endif
+diff --git a/spinel_codegen.rb b/spinel_codegen.rb
+index 7f5b15c..70c2466 100644
+--- a/spinel_codegen.rb
++++ b/spinel_codegen.rb
+@@ -991,7 +991,7 @@ class Compiler
+     if name == "ARGV" || name == "ENV" || name == "STDIN" || name == "STDOUT" || name == "STDERR"
+       return 1
+     end
+-    if name == "Math" || name == "File" || name == "Dir" || name == "Time" || name == "IO" || name == "Process" || name == "Kernel" || name == "Comparable" || name == "Enumerable"
++    if name == "Math" || name == "File" || name == "Dir" || name == "Time" || name == "IO" || name == "Process" || name == "Kernel" || name == "Comparable" || name == "Enumerable" || name == "JIT"
+       return 1
+     end
+     if name == "Object" || name == "Integer" || name == "String" || name == "Float" || name == "Symbol" || name == "Array" || name == "Hash" || name == "Range" || name == "Numeric" || name == "TrueClass" || name == "FalseClass" || name == "NilClass" || name == "Proc" || name == "Lambda" || name == "Regexp" || name == "MatchData" || name == "StringIO" || name == "Fiber"
+@@ -1429,6 +1429,14 @@ class Compiler
+         if rname == "Math"
+           return "float"
+         end
++        if rname == "JIT"
++          # PROT_* は int、DARWIN_ARM64 は bool。
++          leaf = @nd_name[nid]
++          if leaf == "DARWIN_ARM64"
++            return "bool"
++          end
++          return "int"
++        end
+       end
+       return "int"
+     end
+@@ -1849,6 +1857,13 @@ class Compiler
+       end
+     end
+ 
++    # JIT module (setsunaruby fork): JIT.alloc / JIT.callN 等は addr/値ともに int。
++    # write_u32 / write_words / clear_icache / jit_write_protect / free / protect も
++    # int で返す (実体は副作用が主、返り値 0 か -1)。
++    if recv >= 0 && @nd_type[recv] == "ConstantReadNode" && @nd_name[recv] == "JIT"
++      return "int"
++    end
++
+     # User-defined top-level method (bare call): take precedence over
+     # name-based builtin inference so `def minmax(a,b); ... end; minmax(1,2)`
+     # binds to the user def instead of Array#minmax's tuple return.
+@@ -13962,6 +13977,14 @@ class Compiler
+             return "2.71828182845904523536"
+           end
+         end
++        # JIT module (setsunaruby fork) の定数を C マクロにマップする。
++        # sp_runtime.h 側で SP_JIT_PROT_* / SP_JIT_DARWIN_ARM64 を定義済み。
++        if rname == "JIT"
++          if nname == "PROT_READ"     then return "SP_JIT_PROT_READ" end
++          if nname == "PROT_WRITE"    then return "SP_JIT_PROT_WRITE" end
++          if nname == "PROT_EXEC"     then return "SP_JIT_PROT_EXEC" end
++          if nname == "DARWIN_ARM64"  then return "SP_JIT_DARWIN_ARM64" end
++        end
+         if cpname != ""
+           return cpname
+         end
+@@ -14598,6 +14621,81 @@ class Compiler
+     end
+   end
+ 
++  # JIT.* (setsunaruby fork) を C 関数呼びに翻訳する。マッチしないときは ""
++  # を返して呼び元に通常パスを継続させる。型推論は infer_call_type で別途 int 固定。
++  def compile_jit_call_expr(nid, mname)
++    args_id = @nd_arguments[nid]
++    aargs = "".split(",").map { |x| x.to_i }
++    # aargs は本来 IntArray (= node id 配列) になる。Ruby 慣用で配列リテラルが
++    # 欲しいが spinel のサブセット流儀に従い "".split で空配列を作る。
++    a0 = "0"; a1 = "0"; a2 = "0"; a3 = "0"; a4 = "0"; a5 = "0"; a6 = "0"; a7 = "0"; a8 = "0"
++    if args_id >= 0
++      arg_ids = get_args(args_id)
++      if arg_ids.length > 0 then a0 = compile_expr(arg_ids[0]) end
++      if arg_ids.length > 1 then a1 = compile_expr(arg_ids[1]) end
++      if arg_ids.length > 2 then a2 = compile_expr(arg_ids[2]) end
++      if arg_ids.length > 3 then a3 = compile_expr(arg_ids[3]) end
++      if arg_ids.length > 4 then a4 = compile_expr(arg_ids[4]) end
++      if arg_ids.length > 5 then a5 = compile_expr(arg_ids[5]) end
++      if arg_ids.length > 6 then a6 = compile_expr(arg_ids[6]) end
++      if arg_ids.length > 7 then a7 = compile_expr(arg_ids[7]) end
++      if arg_ids.length > 8 then a8 = compile_expr(arg_ids[8]) end
++    end
++
++    if mname == "page_size"
++      return "sp_jit_page_size()"
++    end
++    if mname == "alloc"
++      return "sp_jit_alloc(" + a0 + ", " + a1 + ")"
++    end
++    if mname == "protect"
++      return "sp_jit_protect(" + a0 + ", " + a1 + ", " + a2 + ")"
++    end
++    if mname == "free"
++      return "sp_jit_free(" + a0 + ", " + a1 + ")"
++    end
++    if mname == "jit_write_protect"
++      return "(sp_jit_write_protect(" + a0 + "), (mrb_int)0)"
++    end
++    if mname == "write_u32"
++      return "(sp_jit_write_u32(" + a0 + ", " + a1 + ", " + a2 + "), (mrb_int)0)"
++    end
++    if mname == "write_words"
++      return "(sp_jit_write_words(" + a0 + ", " + a1 + "), (mrb_int)0)"
++    end
++    if mname == "clear_icache"
++      return "(sp_jit_clear_icache(" + a0 + ", " + a1 + "), (mrb_int)0)"
++    end
++    if mname == "call0"
++      return "sp_jit_call0(" + a0 + ")"
++    end
++    if mname == "call1"
++      return "sp_jit_call1(" + a0 + ", " + a1 + ")"
++    end
++    if mname == "call2"
++      return "sp_jit_call2(" + a0 + ", " + a1 + ", " + a2 + ")"
++    end
++    if mname == "call3"
++      return "sp_jit_call3(" + a0 + ", " + a1 + ", " + a2 + ", " + a3 + ")"
++    end
++    if mname == "call4"
++      return "sp_jit_call4(" + a0 + ", " + a1 + ", " + a2 + ", " + a3 + ", " + a4 + ")"
++    end
++    if mname == "call5"
++      return "sp_jit_call5(" + a0 + ", " + a1 + ", " + a2 + ", " + a3 + ", " + a4 + ", " + a5 + ")"
++    end
++    if mname == "call6"
++      return "sp_jit_call6(" + a0 + ", " + a1 + ", " + a2 + ", " + a3 + ", " + a4 + ", " + a5 + ", " + a6 + ")"
++    end
++    if mname == "call7"
++      return "sp_jit_call7(" + a0 + ", " + a1 + ", " + a2 + ", " + a3 + ", " + a4 + ", " + a5 + ", " + a6 + ", " + a7 + ")"
++    end
++    if mname == "call8"
++      return "sp_jit_call8(" + a0 + ", " + a1 + ", " + a2 + ", " + a3 + ", " + a4 + ", " + a5 + ", " + a6 + ", " + a7 + ", " + a8 + ")"
++    end
++    ""
++  end
++
+   def compile_fiber_new(nid)
+     @needs_fiber = 1
+     blk = @nd_block[nid]
+@@ -14884,6 +14982,14 @@ class Compiler
+       return compile_ieval_call_expr(nid)
+     end
+ 
++    # JIT module (setsunaruby fork). 詳細は lib/sp_runtime.h の sp_jit_* 参照。
++    if recv >= 0 && @nd_type[recv] == "ConstantReadNode" && @nd_name[recv] == "JIT"
++      r = compile_jit_call_expr(nid, mname)
++      if r != ""
++        return r
++      end
++    end
++
+     # Fiber.new { block }
+     if mname == "new" && recv >= 0
+       if constructor_class_name(recv) == "Fiber"
+-- 
+2.34.1
+
+
+From b5305bd261da35d47b1042ff35a22e025402f91d Mon Sep 17 00:00:00 2001
+From: setsunaruby fork <setsunaruby@local>
+Date: Mon, 11 May 2026 23:13:30 +0900
+Subject: [PATCH 2/2] feat: add JIT::ARCH_ARM64 for arch detection
+
+---
+ lib/sp_runtime.h  | 6 ++++++
+ spinel_codegen.rb | 5 +++--
+ 2 files changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/lib/sp_runtime.h b/lib/sp_runtime.h
+index 294d1fe..13eda2f 100644
+--- a/lib/sp_runtime.h
++++ b/lib/sp_runtime.h
+@@ -925,6 +925,12 @@ void sp_bigint_free(sp_Bigint *b);
+ #define SP_JIT_DARWIN_ARM64 ((mrb_bool)FALSE)
+ #endif
+ 
++#if defined(__aarch64__) || defined(_M_ARM64)
++#define SP_JIT_ARCH_ARM64 ((mrb_bool)TRUE)
++#else
++#define SP_JIT_ARCH_ARM64 ((mrb_bool)FALSE)
++#endif
++
+ static mrb_int sp_jit_page_size(void) {
+ #if defined(_WIN32)
+   SYSTEM_INFO si; GetSystemInfo(&si); return (mrb_int)si.dwPageSize;
+diff --git a/spinel_codegen.rb b/spinel_codegen.rb
+index 70c2466..1eeb5f9 100644
+--- a/spinel_codegen.rb
++++ b/spinel_codegen.rb
+@@ -1430,9 +1430,9 @@ class Compiler
+           return "float"
+         end
+         if rname == "JIT"
+-          # PROT_* は int、DARWIN_ARM64 は bool。
++          # PROT_* は int、DARWIN_ARM64 / ARCH_ARM64 は bool。
+           leaf = @nd_name[nid]
+-          if leaf == "DARWIN_ARM64"
++          if leaf == "DARWIN_ARM64" || leaf == "ARCH_ARM64"
+             return "bool"
+           end
+           return "int"
+@@ -13984,6 +13984,7 @@ class Compiler
+           if nname == "PROT_WRITE"    then return "SP_JIT_PROT_WRITE" end
+           if nname == "PROT_EXEC"     then return "SP_JIT_PROT_EXEC" end
+           if nname == "DARWIN_ARM64"  then return "SP_JIT_DARWIN_ARM64" end
++          if nname == "ARCH_ARM64"    then return "SP_JIT_ARCH_ARM64" end
+         end
+         if cpname != ""
+           return cpname
+-- 
+2.34.1
+
