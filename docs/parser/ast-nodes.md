@@ -42,10 +42,12 @@ end
 |---|---|---|---|
 | `:puts_stmt` | `puts <expr>` | `node_operand` = expr | 0 |
 | `:if_expr` | `if/elsif/else/end` | `node_left` = cond, `node_right` = then, `node_operand` = else | 1 |
-| `:while_stmt` | `while ... end` | `node_left` = cond, `node_right` = body | 1 |
+| `:while_stmt` | `while ... end` / `loop do ... end` | `node_left` = cond (loop は `:bool_lit(true)`), `node_right` = body | 1 / 4b |
 | `:method_def` | `def name(...) ... end` | `node_int_value` = name packed, `node_left` = params chain, `node_operand` = body | 2 |
 | `:class_def` | `class Name [< Parent] ... end` | `node_int_value` = name packed, `node_left` = body, `node_right` = `:class_parent_ref` or nil | 3d.1 / 3d.4 |
 | `:return_stmt` | `return <expr>` | `node_operand` = expr (省略時は `:nil_lit`) | 2 |
+| `:break_stmt` | `break` | フィールドなし。最内側 loop / while を抜ける | 4b |
+| `:next_stmt` | `next` | フィールドなし。最内側 loop / while の cond 再評価へ戻る | 4b |
 | `:seq` | 連続文 | `node_left` = head stmt, `node_right` = tail seq | 1 |
 
 `:seq` は複数文を**右結合チェーン**で表現 (`a; b; c` → `seq(a, seq(b, c))`)。

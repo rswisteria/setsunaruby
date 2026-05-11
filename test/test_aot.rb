@@ -345,6 +345,17 @@ assert_output(File.read(File.expand_path('../examples/bitops.rb', __dir__)),
               "8\n2\n8\n14\n6\n-1\n14\n15\nfalse\ntrue\ntrue\nfalse\ntrue\nfalse\ntrue\n7\n0\n6\n5\ntrue\n327683\n",
               "examples/bitops.rb")
 
+# ---- Stage 4b: loop / break / next ----
+assert_output("i = 0\nloop do\n  i = i + 1\n  if i >= 5\n    break\n  end\nend\nputs i\n",
+              "5\n", "LOOP: loop + break")
+assert_output("s = 0\ni = 0\nwhile i < 10\n  i = i + 1\n  if i % 2 == 0\n    next\n  end\n  s = s + i\nend\nputs s\n",
+              "25\n", "LOOP: while + next")
+assert_output(File.read(File.expand_path('../examples/loop.rb', __dir__)),
+              "5\n25\n12\n14\n5\n16\n",
+              "examples/loop.rb")
+assert_fails("break\n", "LOOP: break outside loop")
+assert_fails("next\n",  "LOOP: next outside loop")
+
 # ---- Stage GC-1: GC 動作下での examples 不変 ----
 assert_output(File.read(File.expand_path('../examples/gc.rb', __dir__)),
               "done: xy\nxy\nxy\n",

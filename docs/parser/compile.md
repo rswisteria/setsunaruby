@@ -54,15 +54,44 @@ then/else 双方が必ず 1 値残すため、合流後のスタック高さは�
 ### `:while_stmt`
 
 ```
-loop_start:
+loop_start:                  ; @loop_start_pcs.push(loop_start)
 <compile cond>
 JUMP_IF_FALSE loop_end
   <compile body>
   POP                        ; body の値を捨てる
   JUMP loop_start
-loop_end:
+loop_end:                    ; @break_patch_pcs[start..] を全て loop_end へ patch up
 PUSH_NIL                     ; while 全体の値
 ```
+
+`loop do ... end` (Stage 4b) は parser が cond=`:bool_lit(true)` の `:while_stmt`
+として AST 化するため、compiler 側の特別扱いは不要。
+
+### `:break_stmt` / `:next_stmt` (Stage 4b)
+
+`break` / `next` は **コンパイル時に既存の `JUMP` opcode に展開** される。新 opcode
+は不要。3 つの並列 IntArray でジャンプ解決を管理する:
+
+| 並列 IntArray | 役割 |
+|---|---|
+| `@loop_start_pcs` | loop / while の cond 再評価位置スタック (`next` の jump target) |
+| `@break_patch_starts` | 各 loop ごとの `@break_patch_pcs` 開始 idx |
+| `@break_patch_pcs` | 全 loop の `break` 用 placeholder PC を flat に並べる |
+| `@loop_scope_barriers` | method / block 境界での「可視 loop 深度」barrier |
+
+- `compile_while` 進入時: `@loop_start_pcs.push(loop_start)`、`@break_patch_starts.push(@break_patch_pcs.length)`
+- `compile_break`: `JUMP` を emit して placeholder PC を `@break_patch_pcs` に積む
+- `compile_next`: `JUMP` を emit して即 `loop_start_pcs.last` に patch
+- `compile_while` 退出時: `@break_patch_starts.pop` で得た開始 idx 以降の placeholder
+  をすべて `loop_end` (= 現在 PC) へ patch up
+
+ブロック (`do |x| ... end`) と method 境界では `@loop_scope_barriers` に
+現在の `@loop_start_pcs.length` を積み、内側からは外側 loop が「見えない」状態にする。
+これによりブロック内 / メソッド内 loop の外側で `break` / `next` を書くと compile error
+になる。
+
+`break` / `next` を含む method は HIR builder の不変条件 (各 stmt が 1 値残す) を
+壊すため `mark_current_method_jit_unsafe` で JIT 経路から除外する。
 
 ### `:method_def`
 
