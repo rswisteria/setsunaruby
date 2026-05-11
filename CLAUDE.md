@@ -21,6 +21,22 @@ ruby bin/setsunaruby.rb <file>    # CRuby で実行
 spinel は `~/spinel/spinel` (シェル PATH の `~/bin/spinel` も同等)。`make build`
 が呼び出す。spinel 自体のビルドはこのリポジトリの管轄外。
 
+**ただし JIT 実機実行 (案 C) のために `~/spinel` 側にプライベートフォーク
+`setsunaruby-jit` ブランチを維持している**。upstream には送らない方針。
+`vendor/spinel-jit-primitives.patch` に diff を保存してあるので、別マシンで
+spinel を clone した直後は以下で復旧:
+
+```bash
+cd ~/spinel
+git checkout -b setsunaruby-jit master
+git am < ~/setsunaruby/vendor/spinel-jit-primitives.patch
+make deps
+make
+```
+
+`make build` (setsunaruby) は前段で `verify-spinel-jit` を呼んで
+`$(SPINEL_HOME)/lib/sp_runtime.h` に `sp_jit_alloc` シンボルが居るかを確認する。
+
 ## リポジトリ運用
 
 - **`main` への直接 push は禁止** (権限ポリシーで拒否される)。ブランチを切って PR 経由で merge。
@@ -38,7 +54,8 @@ spinel は `~/spinel/spinel` (シェル PATH の `~/bin/spinel` も同等)。`ma
 |---|---|
 | 0, 0.5, 1 | ✅ 完了 (#2 closed) |
 | 2 (Method/再帰) | #3 |
-| JIT | #4 |
+| JIT (案 A: ダンプまで) | ✅ 完了 (#4) |
+| JIT (案 C: 実機実行経路) | ✅ 経路完成、複数 BB/call 解決は未着手 (#4) |
 | 3 (文字列・配列・ブロック・クラス・例外) | #5 (tracking) |
 | ∞ 自己ホスト | #6 |
 
