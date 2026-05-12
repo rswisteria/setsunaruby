@@ -1,8 +1,10 @@
 # JIT の動作状況と残タスク
 
-JIT は **案 A (機械語ダンプまで) で完成**、**案 C (実機実行) は経路実装済み**
-(spinel フォーク `setsunaruby-jit` に依存)。ただし JIT-side の機械語エンコーダに
-未解決の課題が残るため、実機で動くのは現状「単一 BB / call なし」のメソッドのみ。
+JIT は **案 A (機械語ダンプまで) で完成**、**案 C 実機実行は arm64 で
+multi-BB / 自己再帰 / spill 含めて動作** (spinel フォーク `setsunaruby-jit`
+に依存)。fib(10) が `SETSUNARUBY_JIT=1` で CRuby と一致するレベル。
+ただし cross-method 呼び出しと if-expression を最終式とするメソッドは
+install 拒否され bytecode で動作する。
 
 ## 動作している範囲 (案 A)
 
@@ -30,19 +32,45 @@ JIT は **案 A (機械語ダンプまで) で完成**、**案 C (実機実行) 
 非 arm64 ホスト / arity > 8 / 空 LIR / install エラーのときは
 `@jit_fn_addrs[m_idx] = -1` でマークし、通常のインタプリタ経路に流れる。
 
-### 既知の制約
+### 既知の制約 / install 拒否される method
 
-- **複数 BB を含むメソッドは crash する可能性が高い**: `encode_b` /
-  `encode_b_cond` / `encode_bl` が BB id / method idx を imm26 / imm19 に
-  リテラル埋めしているだけで、PC 相対 offset への解決が未実装。単一 BB
-  (= 制御フロー無し) でかつ method 呼出無しのメソッドのみ安全。
-- **x86_64 ホスト**: encoder は実装済 (`pass_encode_x86_64`)。`install_jit_for_method`
-  も write_bytes 経由でディスパッチする。SysV AMD64 で arity > 6 は弾く (arg
-  register が 6 個まで)。実機実行は x86_64 Linux 環境で確認できていないため
-  「encode は正しい byte 列、実機で動くかは未検証」状態。byte 列の単体検証は
-  `test/test_jit_x86_64.rb` で確認 (`make test-jit-x86-64`)。
+- **cross-method の BL**: 自己再帰 (`BL` の callee が自分の `m_idx` と等しい)
+  のみ install を許可。他メソッド呼び出しは callee の JIT アドレスが事前
+  解決できないため install を中止し bytecode 経路に流す。
+- **if-expression を最終式とする method**: 例 `def f(n); if n<2; n; else; ...; end; end`。
+  HIR builder が implicit な stack-top の phi 化を行わないため Return が
+  一方の分岐の値しか参照しない不完全な HIR が生成される。`install_jit_for_method`
+  の dominance チェックがこれを検出して install 拒否、bytecode で動作する。
+  明示的なローカル変数経由 (`result = ...`) なら正しく phi 化されて JIT 化可能。
+- **x86_64 ホスト**: encoder は arm64 と同等 (linear-scan + spill + FRAME_ENTER 等
+  に対応) だが label fixup が未実装のため、multi-BB / BL を含むメソッドは
+  install 拒否される。leaf method (id / add 等) は実機実行可能の見込み
+  (x86_64 Linux での確認は環境待ち)。
 - **CRuby + SETSUNARUBY_JIT=1 は自動 OFF**: `defined?(JIT)` が CRuby では nil
   を返すので、shim 無しでも自動的にインタプリタ実行になる。
+
+### Register allocator (案 C v2)
+
+`pass_compute_live_ranges` + `pass_allocate_registers` の素朴 linear-scan が
+hir_id ごとに `[lr_start, lr_end]` を計算して 5 個の callee-saved レジスタ
+プール (arm64: X19..X23 / x86_64 SysV: rbx, r12..r15) を奪い合う。あふれは
+spill slot (frame 内の SP/RBP 相対) に書き出す:
+
+| LirOp | 用途 |
+|---|---|
+| `LOAD_STACK dst, slot` | 各 use の直前で SCRATCH に load |
+| `STORE_STACK slot, src` | 各 def の直後で frame の slot に store |
+| `FRAME_ENTER #frame_size` | prologue: FP/LR push + callee-saved save + spill area 確保 |
+| `FRAME_LEAVE #frame_size` | epilogue: callee-saved restore + frame 解放 |
+| `ADD_IMM dst, src, #imm12` | boxed Fixnum 補正用 (FIXNUM_ADD = ADD; SUB_IMM #1) |
+| `SUB_IMM dst, src, #imm12` | 同上 (FIXNUM_SUB = SUB; ADD_IMM #1) |
+
+予約 reg: arm64 X16/X17 (= IP0/IP1)、x86_64 r10/r11 が spill scratch。
+
+PHI は hir_id 順序的に末尾に append されるが、論理的に BB 先頭で値が確定する
+ため `lr_start = bb_first_insn[bb]` に補正して allocator が phi の def より
+先に use を処理することを防ぐ。allocator は hir_id 順ではなく lr_start 昇順に
+selection sort してから linear scan を行う。
 
 ## spinel への追加要件 (= 個人フォーク `setsunaruby-jit` ブランチ)
 
@@ -73,8 +101,8 @@ target がパッチ適用済みかを確認する。
 | A: ダンプまで | ✅ 完成 | HIR/LIR/機械語 hex を STDERR にダンプ |
 | B: dlopen 経由 | — | 採用せず (`spinel-jit-primitives.patch` で直接 mmap する案 C に進んだため) |
 | C: 実機実行 (1 BB) | ✅ 経路完成 | mmap + W^X + 関数ポインタ呼び + icache flush 全て実装 |
-| C': 実機実行 (多 BB / call) | ❌ 未着手 | encode_b / b_cond / bl の PC-relative 解決が必要 |
-| C'': x86_64 emitter | ✅ encoder のみ | `pass_encode_x86_64` で SysV AMD64 の byte 列生成。byte 列単体テストで検証 (`make test-jit-x86-64`)。x86_64 Linux での実機実行確認は環境待ち |
+| C': 実機実行 (多 BB / call) | ✅ 完成 (arm64) | linear-scan register allocation + spill + 2-pass label fixup + 自己再帰 BL + PROLOGUE パラメタ化。`make test-jit-recursion` で fib(10) が JIT 完走 |
+| C'': x86_64 emitter | ✅ encoder のみ | `pass_encode_x86_64` で SysV AMD64 の byte 列生成。byte 列単体テストで検証 (`make test-jit-x86-64`)。x86_64 Linux での multi-BB label fixup は未実装 |
 
 ## CRuby と AOT での挙動差
 

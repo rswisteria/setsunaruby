@@ -21,14 +21,20 @@ LIR (Low-level IR) は HIR から下げられた、arm64 機械語 1:1 対応に
 
 ## LIR 命令一覧
 
-### MOV (0x01-0x02)
+### MOV (0x01-0x05)
 
 | LirOp | hex | フィールド | arm64 |
 |---|---|---|---|
 | `MOV_IMM` | 0x01 | op0 = dst reg, op1 = 16bit 即値 | MOVZ Xd, #imm |
 | `MOV_REG` | 0x02 | op0 = dst reg, op1 = src reg | ORR Xd, XZR, Xm |
+| `MOV_FROM_ARG` | 0x03 | op0 = dst reg, op1 = arg slot | (arm64 では MOV_REG と同義) |
+| `MOV_TO_ARG` | 0x04 | op0 = arg slot, op1 = src reg | (arm64 では MOV_REG と同義) |
+| `MOV_TO_RET` | 0x05 | op0 = src reg (dst は暗黙の戻り値 reg) | MOV X0, Xsrc |
 
-### 算術 (0x10-0x13)
+x86_64 (SysV) では `MOV_FROM_ARG` / `MOV_TO_ARG` は RDI/RSI/RDX/RCX/R8/R9 を、
+`MOV_TO_RET` は RAX を使う。
+
+### 算術 (0x10-0x15)
 
 | LirOp | hex | フィールド | arm64 |
 |---|---|---|---|
@@ -36,6 +42,11 @@ LIR (Low-level IR) は HIR から下げられた、arm64 機械語 1:1 対応に
 | `SUB` | 0x11 | 同上 | SUB Xd, Xn, Xm |
 | `MUL` | 0x12 | 同上 | MADD Xd, Xn, Xm, XZR |
 | `SDIV` | 0x13 | 同上 | SDIV Xd, Xn, Xm |
+| `ADD_IMM` | 0x14 | op0 = dst, op1 = src, op2 = imm12 (0..4095) | ADD Xd, Xn, #imm |
+| `SUB_IMM` | 0x15 | 同上 | SUB Xd, Xn, #imm |
+
+`ADD_IMM` / `SUB_IMM` は boxed Fixnum の +1 / -1 補正で使う:
+`FIXNUM_ADD = ADD; SUB_IMM #1`、`FIXNUM_SUB = SUB; ADD_IMM #1`。
 
 ### 比較・条件 (0x20-0x21)
 
@@ -75,6 +86,20 @@ LIR (Low-level IR) は HIR から下げられた、arm64 機械語 1:1 対応に
 | `BL` | 0x40 | op0 = callee method idx | BL label |
 | `RET` | 0x50 | (なし) | RET (= RET X30) |
 
+### スタック spill / フレーム管理 (0x60-0x63)
+
+| LirOp | hex | フィールド | arm64 |
+|---|---|---|---|
+| `LOAD_STACK` | 0x60 | op0 = dst reg, op1 = spill slot | LDR Xt, [SP, #imm12*8] |
+| `STORE_STACK` | 0x61 | op0 = spill slot, op1 = src reg | STR Xt, [SP, #imm12*8] |
+| `FRAME_ENTER` | 0x62 | op0 = frame_size (byte) | STP X29,X30,[SP,#-FRAME]! + MOV X29,SP + 個別 STR |
+| `FRAME_LEAVE` | 0x63 | op0 = frame_size (byte) | 個別 LDR + LDP X29,X30,[SP],#FRAME |
+
+`LOAD_STACK` / `STORE_STACK` の slot は frame 内のオフセット。arm64 では
+`[SP + 16 + 8 * saved_reg_count + 8 * slot]` を指し、x86_64 では
+`[RBP - 8 - 8 * saved_reg_count - 8 * slot]`。スクラッチ reg は arm64 X16/X17、
+x86_64 r10/r11 を予約 (allocator pool 外)。
+
 ### Arm64Cond
 
 B.cond 等で使う condition code。
@@ -92,21 +117,25 @@ B.cond 等で使う condition code。
 
 ## HIR → LIR lowering (`pass_lower_to_lir`)
 
-各 BB の HIR insn を順に LIR 変換。代表的なルール:
+各 BB の HIR insn を順に LIR 変換。代表的なルール (`FRAME_ENTER` は関数先頭で 1 個、
+`FRAME_LEAVE` は `Return` の直前に挿入):
 
 | HIR | LIR |
 |---|---|
-| `LoadParam slot=k` | `MOV_REG Xreg, X<k>` (引数レジスタからローカル reg へ) |
-| `LoadConst INT n` | `MOV_IMM Xreg, #n` |
-| `FixnumAdd v_lhs, v_rhs` | `ADD Xreg, Xlhs, Xrhs` |
-| `FixnumSub` | `SUB` |
-| `FixnumMul` | `MUL` |
-| `FixnumDiv` | `SDIV` (剰余は MSUB 省略、ダンプで明示) |
-| `FixnumLt` (に続く JumpIfFalse) | `CMP Xa, Xb` + `B_GE target` |
-| `GuardFixnum v` | `TBZ Xv, #0, side_exit` (LSB が 0 なら Fixnum でない) |
-| `Call m_idx(args...)` | 引数を X0..X7 に MOV_REG → `BL m_idx` → 戻り値 X0 |
-| `Return v` | `MOV_REG X0, Xv` + `RET` |
-| `Phi` (out-of-SSA) | BB 末尾の jump/return 直前に `MOV_REG` 挿入 |
+| (関数先頭) | `FRAME_ENTER #frame_size` |
+| `LoadParam slot=k` | `MOV_FROM_ARG dst_reg, slot=k` |
+| `LoadConst INT n` | `MOV_IMM dst_reg, #n` |
+| `FixnumAdd v_lhs, v_rhs` | `ADD dst, lhs, rhs` + `SUB_IMM dst, dst, #1` (boxed 補正) |
+| `FixnumSub` | `SUB dst, lhs, rhs` + `ADD_IMM dst, dst, #1` |
+| `FixnumMul / Div / Mod` | `MUL` / `SDIV` (補正未実装、install で弾く) |
+| `FixnumLt` (に続く `JumpIfFalse`) | `CMP lhs, rhs` + `B_GE target` |
+| `GuardFixnum v` | `TBZ Xv, #0, side_exit` (`@jit_exec_enabled` では emit 省略) |
+| `Call m_idx(args...)` | 各 arg を `MOV_TO_ARG` → `BL m_idx` → 戻り値を `MOV_FROM_ARG dst, slot=0` |
+| `Return v` | `MOV_TO_RET v` + `FRAME_LEAVE #frame_size` + `RET` |
+| `Phi` (out-of-SSA) | BB 末尾の jump/return 直前 (および fall-through 時の末尾) に `MOV_REG` 挿入 |
+
+spilled value の use 直前には `LOAD_STACK SCRATCH, slot`、def 直後には
+`STORE_STACK slot, SCRATCH` が自動的に挿入される (`lower_use_reg` / `lower_def_store`)。
 
 ### 素朴レジスタ割り当て
 

@@ -51,7 +51,11 @@ test-aot: build
 test-jit-x86-64:
 	ruby test/test_jit_x86_64.rb
 
-test-all: test-cruby test-aot test-jit-x86-64
+# JIT 再帰 / multi-BB 実行テスト (arm64 ホスト + SETSUNARUBY_JIT=1 で fib 完走)。
+test-jit-recursion: build
+	ruby test/test_jit_recursion.rb
+
+test-all: test-cruby test-aot test-jit-x86-64 test-jit-recursion
 
 bench: build
 	ruby benchmark/run_bench.rb

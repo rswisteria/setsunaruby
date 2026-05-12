@@ -62,18 +62,10 @@ def encode_x86_64_for(src)
 end
 
 # --- 恒等関数 def id(n); n; end のエンコード ---
-# LIR: MOV_FROM_ARG x9, arg0 ; MOV_TO_RET x9 ; RET
-#
-#   MOV_FROM_ARG dst=9 (= r8), slot=0 (= rdi)
-#     mov r/m64, r64 で dst=r8 (r/m), src=rdi (reg)
-#     REX.W=1 + REX.B=1 (r8>=8) + REX.R=0 (rdi<8) → 0x49
-#     opcode 0x89, ModRM 0xC0 | ((7 & 7) << 3) | (8 & 7) = 0xF8
-#     bytes: 49 89 F8
-#   MOV_TO_RET src=9 (= r8): mov rax, r8
-#     REX.W + REX.R=1 (r8>=8) + REX.B=0 (rax<8) → 0x4C
-#     opcode 0x89, ModRM 0xC0 | ((8 & 7) << 3) | (0 & 7) = 0xC0
-#     bytes: 4C 89 C0
-#   RET → C3
+# 新 allocator により LoadParam(0) は vreg 19 = RBX に割当てられる。saved_reg_count=1
+# のため FRAME_ENTER は push rbp + mov rbp,rsp + sub rsp,#32 + save rbx を生成し、
+# FRAME_LEAVE で逆順に restore + add rsp + pop rbp。MOV_FROM_ARG = mov rbx, rdi、
+# MOV_TO_RET = mov rax, rbx。
 src_id = <<~RUBY
   def id(n)
     n
@@ -87,23 +79,27 @@ RUBY
 
 bytes = encode_x86_64_for(src_id)
 expected = [
-  0x49, 0x89, 0xF8,                # mov r8, rdi
-  0x4C, 0x89, 0xC0,                # mov rax, r8
-  0xC3                              # ret
+  # FRAME_ENTER #32
+  0x55,                                    # push rbp
+  0x48, 0x89, 0xE5,                        # mov rbp, rsp
+  0x48, 0x81, 0xEC, 0x20, 0x00, 0x00, 0x00, # sub rsp, #32
+  0x48, 0x89, 0x9D, 0xF8, 0xFF, 0xFF, 0xFF, # mov [rbp-8], rbx (save callee-saved)
+  # body
+  0x48, 0x89, 0xFB,                        # mov rbx, rdi (= LoadParam slot 0)
+  0x48, 0x89, 0xD8,                        # mov rax, rbx (= return value)
+  # FRAME_LEAVE #32
+  0x48, 0x8B, 0x9D, 0xF8, 0xFF, 0xFF, 0xFF, # mov rbx, [rbp-8] (restore)
+  0x48, 0x81, 0xC4, 0x20, 0x00, 0x00, 0x00, # add rsp, #32
+  0x5D,                                    # pop rbp
+  # RET
+  0xC3
 ]
-assert_eq(bytes, expected, "id(n) を x86_64 にエンコード")
+assert_eq(bytes, expected, "id(n) を x86_64 にエンコード (新 allocator)")
 
 # --- add(a, b) = a + b ---
-# LIR (型プロファイル経由で FIXNUM_ADD に specialize される想定):
-#   MOV_FROM_ARG dst=9 (r8), slot=0 (rdi)
-#   MOV_FROM_ARG dst=10 (r9), slot=1 (rsi)
-#   ADD dst=13 (r12), lhs=9 (r8), rhs=10 (r9)   # 2-operand: mov r12, r8 ; add r12, r9
-#   MOV_TO_RET src=13 (r12)
-#   RET
-#   TBZ x9 / TBZ x10                             # GUARD_FIXNUM (BB 末尾に emit)
-#
-# TBZ は x86_64 では test+jz 相当の実装に変える必要があるが、現状は multi-BB / call
-# と一緒に install 側で弾く前提なので 6 byte NOP プレースホルダで埋めている。
+# LIR: FRAME_ENTER + MOV_FROM_ARG x19/x20 + ADD/SUB_IMM (boxing 補正) + MOV_TO_RET +
+#      FRAME_LEAVE + RET。CRuby tests では GUARD_FIXNUM が残るため末尾に NOP プレースホルダ。
+# 物理マッピング: vreg 19=rbx, 20=r12, 22=r13。
 src_add = <<~RUBY
   def add(a, b)
     a + b
@@ -118,17 +114,33 @@ RUBY
 
 bytes_add = encode_x86_64_for(src_add)
 expected_add = [
-  0x49, 0x89, 0xF8,                # mov r8, rdi
-  0x49, 0x89, 0xF1,                # mov r9, rsi
-  0x4D, 0x89, 0xC4,                # mov r12, r8
-  0x4D, 0x01, 0xCC,                # add r12, r9
-  0x4C, 0x89, 0xE0,                # mov rax, r12
-  0xC3,                            # ret
-  # GUARD_FIXNUM x9 / x10 の TBZ プレースホルダ (各 6 byte NOP)
+  # FRAME_ENTER #48 (saved_reg_count=3、callee-saved を rbx/r12/r13 まで保存)
+  0x55,
+  0x48, 0x89, 0xE5,
+  0x48, 0x81, 0xEC, 0x30, 0x00, 0x00, 0x00,
+  0x48, 0x89, 0x9D, 0xF8, 0xFF, 0xFF, 0xFF, # mov [rbp-8], rbx
+  0x4C, 0x89, 0xA5, 0xF0, 0xFF, 0xFF, 0xFF, # mov [rbp-16], r12
+  0x4C, 0x89, 0xAD, 0xE8, 0xFF, 0xFF, 0xFF, # mov [rbp-24], r13
+  # body
+  0x48, 0x89, 0xFB,                         # mov rbx, rdi (param a → vreg 19)
+  0x49, 0x89, 0xF4,                         # mov r12, rsi (param b → vreg 20)
+  0x49, 0x89, 0xDD,                         # mov r13, rbx (dst = lhs, prep ADD)
+  0x4D, 0x01, 0xE5,                         # add r13, r12
+  0x49, 0x81, 0xED, 0x01, 0x00, 0x00, 0x00, # sub r13, #1 (boxing -1 補正)
+  0x4C, 0x89, 0xE8,                         # mov rax, r13 (return)
+  # FRAME_LEAVE #48
+  0x48, 0x8B, 0x9D, 0xF8, 0xFF, 0xFF, 0xFF,
+  0x4C, 0x8B, 0xA5, 0xF0, 0xFF, 0xFF, 0xFF,
+  0x4C, 0x8B, 0xAD, 0xE8, 0xFF, 0xFF, 0xFF,
+  0x48, 0x81, 0xC4, 0x30, 0x00, 0x00, 0x00,
+  0x5D,
+  # RET
+  0xC3,
+  # GUARD_FIXNUM の TBZ プレースホルダ (x19, x20、各 6 byte NOP)
   0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
   0x90, 0x90, 0x90, 0x90, 0x90, 0x90
 ]
-assert_eq(bytes_add, expected_add, "add(a, b) を x86_64 にエンコード (2-operand 化)")
+assert_eq(bytes_add, expected_add, "add(a, b) を x86_64 にエンコード (新 allocator + 2-operand)")
 
 puts ""
 puts "#{$pass} passed, #{$fail} failed (JIT x86_64 encoder unit)"
