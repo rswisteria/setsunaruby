@@ -29,6 +29,7 @@ module Setsunaruby
     HASH_ROCKET = :hash_rocket   # `=>` (Stage 3e: rescue Class => e の束縛)
     IVAR     = :ivar       # `@var` インスタンス変数 (Stage 3d.1)。int_value = (start<<16)|len (start は @ の次)
     STR      = :str        # 文字列リテラル (Stage 3a)。int_value = strlit_idx
+    SYM      = :sym        # Symbol リテラル (Stage 4c)。int_value = (start<<16)|len (start は `:` の次)
     PLUS      = :plus
     MINUS    = :minus
     STAR     = :star

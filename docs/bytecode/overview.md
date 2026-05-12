@@ -17,11 +17,15 @@ opcode 一覧は [opcodes.md](opcodes.md)。
 | `true` | `4` | `== 4` |
 | Fixnum `n` | `(n \<\< 1) | 1` | 下位 1 bit が 1 (`v & 1 == 1`) |
 | ヒープ参照 | `(idx \<\< 3) | 0b110` | 下位 3 bit が `0b110` (`v & 7 == 6`) |
+| Symbol `:foo` | `sym_id \<\< 3` (sym_id ≥ 1) | `v != 0 && (v & 7) == 0` (Stage 4c) |
 
 - `nil` / `false` / `true` は `lib/setsunaruby/object.rb` で `NIL_VAL` / `FALSE_VAL` /
   `TRUE_VAL` 定数として定義
 - Fixnum 範囲は LSB を 1 で潰すため Ruby の通常 Integer 範囲より 1 bit 狭い
 - `truthy?` 判定: `v != NIL_VAL && v != FALSE_VAL` (0 含むそれ以外は真)
+- Symbol は intern table (`@sym_name_starts` / `@sym_name_lens` の並列 IntArray) を
+  別途持ち、ヒープには載らない (`@heap_kind` の管理外)。詳細は
+  [opcodes.md](opcodes.md) の `PUSH_SYM` を参照
 
 ## ヒープオブジェクト
 

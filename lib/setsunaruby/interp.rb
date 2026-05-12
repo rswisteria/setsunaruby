@@ -45,6 +45,7 @@ module Setsunaruby
     TILDE_B    = 126 # '~' (Stage 4a 整数 NOT)
     AT_B       = 64  # '@' (Stage 3d.1 インスタンス変数)
     PCT   = 37
+    COLON_B = 58     # ':' (Stage 4c Symbol literal `:foo` の先頭)
     EQ    = 61
     LT_BYTE = 60
     GT_BYTE = 62
@@ -303,6 +304,12 @@ module Setsunaruby
       @strlit_pool   = []
       @strlit_starts = []
       @strlit_lens   = []
+      # Stage 4c: Symbol intern table (parallel IntArray、spinel ルール 3 遵守)。
+      # @sym_name_starts[sym_id] / @sym_name_lens[sym_id] が @bytes 上の名前範囲を指す。
+      # sym_id = 0 は使わない (obj_id 0 = NIL_VAL との衝突回避)。initialize 時点でダミーを
+      # 入れることはせず、run_string の頭で 1 件 push する。
+      @sym_name_starts = []
+      @sym_name_lens   = []
       # Stage 3b: 配列要素プール (要素は obj_id = tagged value)。
       @heap_arr_pool = []
       # Stage 3d.1: ユーザ定義クラスとインスタンス状態。
@@ -453,6 +460,10 @@ module Setsunaruby
       @strlit_pool   = []
       @strlit_starts = []
       @strlit_lens   = []
+      # Stage 4c: Symbol intern table。sym_id=0 はダミー (obj_id=0 = NIL_VAL を避けるため)。
+      # `intern_symbol` が sym_id を 1 から払い出す。
+      @sym_name_starts = [0]
+      @sym_name_lens   = [0]
       @heap_arr_pool = []
       @class_name_starts   = []
       @class_name_lens     = []
@@ -556,6 +567,8 @@ module Setsunaruby
           return read_string
         elsif b == AT_B
           return read_ivar
+        elsif b == COLON_B
+          return read_symbol
         elsif digit?(b)
           return read_number
         elsif ident_start?(b)
@@ -639,6 +652,30 @@ module Setsunaruby
         @lex_pos += 1
       end
       Token.new(TokenKind::INT, n, "", @line)
+    end
+
+    # Stage 4c: Symbol literal `:foo` / `:foo?` / `:foo!` を 1 つ読む。
+    # `:` の直後は必ず ident_start? が来る (それ以外は字句エラー、現状 `?:` 三項演算子は未対応)。
+    # 名前範囲は `:` を含まない `foo` 部分のみを保持する (puts 出力で ":" を出さないため)。
+    # int_value は packed `(name_start<<16)|name_len`。識別子末尾の `?` / `!` は read_ident_or_keyword
+    # と同じ規則で 1 byte 取り込む (`block_given?` のような predicate symbol を許容)。
+    def read_symbol
+      @lex_pos += 1   # consume `:`
+      if @lex_pos >= @bytes.length || !ident_start?(@bytes[@lex_pos])
+        raise "Lexer error: line #{@line}: : の後に識別子が必要です (Symbol literal)"
+      end
+      name_start = @lex_pos
+      while @lex_pos < @bytes.length && ident_cont?(@bytes[@lex_pos])
+        @lex_pos += 1
+      end
+      if @lex_pos < @bytes.length
+        last = @bytes[@lex_pos]
+        if last == Q_MARK_B || last == BANG_B
+          @lex_pos += 1
+        end
+      end
+      packed = (name_start << 16) | (@lex_pos - name_start)
+      Token.new(TokenKind::SYM, packed, "", @line)
     end
 
     # `@ident` インスタンス変数を 1 つ読む。`@` の次に通常の識別子が続く必要あり。
@@ -1605,6 +1642,12 @@ module Setsunaruby
         v = @cur_token.int_value
         @cur_token = next_token
         ASTNode.new(:str_lit, v, false, :nop, nil, nil, nil)
+      elsif k == TokenKind::SYM
+        # Stage 4c: Symbol literal。int_value は名前バイト範囲の packed (start<<16)|len。
+        # intern は compile 時に行う (parser は packed 値だけを保持)。
+        v = @cur_token.int_value
+        @cur_token = next_token
+        ASTNode.new(:sym_lit, v, false, :nop, nil, nil, nil)
       elsif k == TokenKind::KW_TRUE
         @cur_token = next_token
         ASTNode.new(:bool_lit, 0, true, :nop, nil, nil, nil)
@@ -1802,6 +1845,15 @@ module Setsunaruby
         # node_int_value = strlit_idx。VM の PUSH_STR が毎回新しいヒープ String を確保する。
         @bytecode.push(Op::PUSH_STR)
         encode_signed(node.node_int_value)
+      elsif k == :sym_lit
+        # Stage 4c: Symbol literal を PUSH_SYM に展開。compile 時に intern を実行して
+        # sym_id を確定させる (実行時 intern は不要)。HIR/LIR は PUSH_SYM 未対応のため
+        # JIT 不可マーク。
+        packed = node.node_int_value
+        sym_id = intern_symbol(packed >> 16, packed & 0xFFFF)
+        @bytecode.push(Op::PUSH_SYM)
+        encode_signed(sym_id)
+        mark_current_method_jit_unsafe
       elsif k == :bool_lit
         if node.node_bool_value
           @bytecode.push(Op::PUSH_TRUE)
@@ -3179,6 +3231,9 @@ module Setsunaruby
         elsif op == Op::PUSH_STR
           lit_idx = decode_signed
           @stack.push(heap_str_alloc_from_lit(lit_idx))
+        elsif op == Op::PUSH_SYM
+          sym_id = decode_signed
+          @stack.push(box_sym(sym_id))
         elsif op == Op::PUSH_TRUE
           @stack.push(ObjectVal::TRUE_VAL)
         elsif op == Op::PUSH_FALSE
@@ -3364,6 +3419,21 @@ module Setsunaruby
       end
     end
 
+    # Stage 4c: Symbol value 表現。obj_id = sym_id << 3 (sym_id >= 1)。
+    # tag は `(v & 7) == 0 && v != 0` で判定する。NIL_VAL (= 0) / HEAP (= 6) /
+    # Fixnum (LSB=1) / TRUE_VAL (= 4) / FALSE_VAL (= 2) のいずれとも排他。
+    def symbol?(v)
+      v != ObjectVal::NIL_VAL && (v & 7) == 0
+    end
+
+    def box_sym(sym_id)
+      sym_id << 3
+    end
+
+    def unbox_sym(v)
+      v >> 3
+    end
+
     def to_puts_string(v)
       if fixnum?(v)
         unbox_int(v).to_s
@@ -3375,9 +3445,44 @@ module Setsunaruby
         ""
       elsif heap_str?(v)
         heap_str_to_ruby(v)
+      elsif symbol?(v)
+        sym_name_to_ruby_string(v)
       else
         "#<obj>"
       end
+    end
+
+    # Symbol の名前バイト範囲を Ruby String に再構築する (puts 出力経路)。
+    # `:foo` → "foo"。@bytes は GC 対象外で常に存在する。
+    def sym_name_to_ruby_string(obj_id)
+      sym_id = unbox_sym(obj_id)
+      s = @sym_name_starts[sym_id]
+      l = @sym_name_lens[sym_id]
+      result = ""
+      i = 0
+      while i < l
+        result = result + @bytes[s + i].chr
+        i += 1
+      end
+      result
+    end
+
+    # 同名 Symbol を同じ sym_id に正規化 (compile 時に呼ぶ)。`bytes_eq` 同等の
+    # 線形探索で既存エントリを探す (Symbol 数は実用上少数なので O(n) で十分)。
+    # spinel ルール 3 (parallel IntArray) と 11 (Integer 識別) を遵守。
+    def intern_symbol(name_start, name_len)
+      i = 1   # sym_id 0 はダミー
+      while i < @sym_name_starts.length
+        if @sym_name_lens[i] == name_len &&
+           bytes_eq(@sym_name_starts[i], name_start, name_len)
+          return i
+        end
+        i += 1
+      end
+      new_id = @sym_name_starts.length
+      @sym_name_starts.push(name_start)
+      @sym_name_lens.push(name_len)
+      new_id
     end
 
     # `puts [1, 2, 3]` → 各要素を別行で出力 (Ruby と同じ)。空配列は何も出力しない。
