@@ -20,6 +20,10 @@ module Setsunaruby
     SUB  = 0x11
     MUL  = 0x12
     SDIV = 0x13
+    # JIT-4c regalloc: boxed Fixnum 補正用の +1 / -1 即値命令。
+    # FIXNUM_ADD は (a_boxed + b_boxed) - 1、FIXNUM_SUB は (a_boxed - b_boxed) + 1。
+    ADD_IMM = 0x14     # op0 = dst reg, op1 = src reg, op2 = imm12 (0..4095)
+    SUB_IMM = 0x15
 
     CMP  = 0x20        # op0 = lhs reg, op1 = rhs reg (= SUBS XZR, Xn, Xm)
     TBZ  = 0x21        # op0 = src reg, op1 = bit number, op2 = target lir_id
@@ -34,6 +38,18 @@ module Setsunaruby
 
     BL   = 0x40        # op0 = callee method idx (= function label のプレースホルダ)
     RET  = 0x50        # 引数なし (x30 から戻る)
+
+    # JIT-4c regalloc: スタック spill。allocator がレジスタ不足で値を spill するとき、
+    # def 直後に STORE_STACK、use 直前に LOAD_STACK を emit する。
+    # op0 = レジスタ番号, op1 = spill slot index (0-based、frame size 内で sp/rsp 相対)。
+    LOAD_STACK  = 0x60   # op0 = dst reg, op1 = slot
+    STORE_STACK = 0x61   # op0 = slot, op1 = src reg
+
+    # JIT-4c regalloc: 関数 frame の確保・解放。allocator が決めた frame_size を運ぶ。
+    # frame_size = (saved_callee_count + spill_slot_count) * 8、16 byte align で繰り上げ。
+    # op0 = frame_size (byte)。サイズ 0 のとき従来の単純な push/pop で済ます (互換性)。
+    FRAME_ENTER = 0x62   # arm64: sub sp, sp, #frame_size + callee-saved store / x86_64: push regs + sub rsp
+    FRAME_LEAVE = 0x63   # arm64: callee-saved restore + add sp, sp, #frame_size / x86_64: add rsp + pop regs
   end
 
   # arm64 condition code (B.cond / SET 等で使う)

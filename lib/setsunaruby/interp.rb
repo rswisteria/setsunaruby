@@ -231,6 +231,22 @@ module Setsunaruby
       # JIT-4c x86_64: 可変長命令の byte 並び。pass_encode_x86_64 が build。
       # arm64 は @lir_machine_code (固定 4 byte word) を使うので別。
       @jit_bytes        = []
+      # JIT-4c regalloc: hir_id ごとの live range と物理 reg / spill slot 割当。
+      # pass_compute_live_ranges → pass_allocate_registers の順に build される。
+      # 全 IntArray (spinel rule 3)、length は @hir_kind 全体 (deleted insn 含む)。
+      @lr_start         = []   # 開始 hir_id (= def 位置)
+      @lr_end           = []   # 終了 hir_id (= 最後の use 位置)
+      @lr_reg           = []   # 物理 reg 番号 (-1 = spilled)
+      @lr_spill_slot    = []   # spill slot 番号 (-1 = レジスタにある)
+      # frame size 関連。pass_allocate_registers が決定し、PROLOGUE/EPILOGUE/encode で参照。
+      @spill_slot_count    = 0   # spill された hir_id 数
+      @saved_reg_count     = 0   # callee-saved として実際に使った reg 数 (prologue で stp する数)
+      @jit_frame_size      = 0   # frame size (byte、16-align)
+      # 2-pass label fixup 用: 各 BB の機械語先頭 byte offset、各 LIR insn の byte offset、
+      # side exit stub の byte offset。pass_encode_* が build。
+      @bb_first_byte_offset    = []
+      @lir_byte_offset         = []
+      @jit_side_exit_byte_offset = 0
       # spinel AOT で ENV が解釈されない場合は常に false 相当 (HIR ダンプは CRuby のみ)。
       @dump_hir      = ENV["SETSUNARUBY_DUMP_HIR"] == "1"
       # JIT-4c: 実機実行を有効化するゲート。SETSUNARUBY_JIT=1 で ON。デフォルト OFF
@@ -402,6 +418,16 @@ module Setsunaruby
       @lir_bb            = []
       @lir_machine_code  = []
       @jit_bytes         = []
+      @lr_start          = []
+      @lr_end            = []
+      @lr_reg            = []
+      @lr_spill_slot     = []
+      @spill_slot_count  = 0
+      @saved_reg_count   = 0
+      @jit_frame_size    = 0
+      @bb_first_byte_offset    = []
+      @lir_byte_offset         = []
+      @jit_side_exit_byte_offset = 0
       # @profile_fixnum_pc は bytecode コンパイル完了後に length 分一括確保するため、
       # 冒頭リセットには含めない (= run_string 後半で `[] + push` 経由で初期化)。
       @dump_hir      = ENV["SETSUNARUBY_DUMP_HIR"] == "1"
@@ -4577,6 +4603,16 @@ module Setsunaruby
       @lir_bb            = []
       @lir_machine_code  = []
       @jit_bytes         = []
+      @lr_start          = []
+      @lr_end            = []
+      @lr_reg            = []
+      @lr_spill_slot     = []
+      @spill_slot_count  = 0
+      @saved_reg_count   = 0
+      @jit_frame_size    = 0
+      @bb_first_byte_offset    = []
+      @lir_byte_offset         = []
+      @jit_side_exit_byte_offset = 0
 
       # JIT-3b3: BB0 先頭にメソッドパラメータの初期 reaching def (LoadParam) を arity 個 emit。
       # rename DFS の時点で「未定義変数」エッジケースを避けるための前提セットアップ。
@@ -4848,6 +4884,10 @@ module Setsunaruby
         dump_hir(m_idx, "optimized")
         dump_cfg_analysis(m_idx)
       end
+      # JIT-4c regalloc: lower の前に live range と物理 reg 割当を完了させる。
+      # lower_insn は @lr_reg[hir_id] と @lr_spill_slot[hir_id] を参照する。
+      pass_compute_live_ranges
+      pass_allocate_registers
       pass_lower_to_lir
       pass_encode_native
       if @dump_hir
@@ -5987,11 +6027,15 @@ module Setsunaruby
         rename_bb_visit(child, num_slots, reaching_top, saved_stack)
         di += 1
       end
-      # 5. この BB で push した分を pop
-      while saved_stack.length > mark
+      # 5. この BB で push した分を pop。
+      # spinel の "loop-invariant length hoisting" が pop による length 変化を追えない
+      # ため、length を手動で減らすローカル変数で while 条件を組む (CRuby は影響なし)。
+      len = saved_stack.length
+      while len > mark
         prev_value = saved_stack.pop
         slot = saved_stack.pop
         reaching_top[slot] = prev_value
+        len -= 2
       end
       nil
     end
@@ -6197,8 +6241,300 @@ module Setsunaruby
     # critical edge split は行わないため while loop 等で phi のコピーは
     # 厳密には正しくないが、構造は読み取れる教育用の最小実装。
 
+    # =========================================================================
+    # JIT-4c regalloc: live range + linear-scan allocator + spill
+    # =========================================================================
+    #
+    # Physical reg のマッピング (vreg → 物理 reg):
+    #   arm64       : vreg N = X<N>。スタック scratch X16/X17、callee-saved X19..X23 を
+    #                 allocator pool に提供。
+    #   x86_64 SysV : x86_64_phys_reg(vreg) で対応。spill scratch vreg 16/17 → r10/r11、
+    #                 pool vreg 19..23 → rbx/r12/r13/r14/r15。
+    #
+    # 設計上の選択:
+    #   - allocator pool は callee-saved のみ (5 reg)。BL を含むか否かに関わらず常に
+    #     callee-saved を使う。leaf method でも prologue で stp する分のオーバヘッドが
+    #     付くが、設計を単純にする (arm64/x86_64 ともに 5 reg ぴったり収まる)。
+    #   - reserved spill scratch は 2 個 (vreg 16, 17)。allocator は使わない。
+    #     spilled value の load/store で使う。
+    #   - frame layout: 上から callee-saved 群、下に spill slots (16-byte align)。
+    #
+    REGALLOC_POOL_BASE = 19    # pool 内最初の vreg (= X19 / rbx)
+    REGALLOC_POOL_SIZE = 5     # X19..X23 / rbx..r15 の 5 個
+    SPILL_SCRATCH_0    = 16    # arm64 X16 / x86_64 r10。use 側 1
+    SPILL_SCRATCH_1    = 17    # arm64 X17 / x86_64 r11。use 側 2 (binop 用)
+
+    # 旧設計の reg 割当 (mod 20 のリングバッファ)。新 allocator が走った後は
+    # `@lr_reg[hir_id]` を直接参照するため、本メソッドはどこからも呼ばれない。
+    # 既存 test_stage_jit.rb のテキスト参照と、CRuby で allocator がエラー出した
+    # ときのフォールバック用に残しておく。
     def hir_to_reg(hir_id)
       9 + (hir_id % 20)
+    end
+
+    # 各 hir_id が値を生成する (= def する) か。allocator がレジスタを割り当てる対象。
+    # lower_insn が LIR の dst として hir_to_reg(i) を渡している kind と一致させる。
+    def defs_value?(i)
+      kind = @hir_kind[i]
+      result = false
+      if kind == HirOp::LOAD_CONST || kind == HirOp::LOAD_PARAM
+        result = true
+      elsif kind == HirOp::PHI
+        result = true
+      elsif fixnum_arith_kind?(kind)
+        result = true
+      elsif kind == HirOp::CALL
+        result = true   # 戻り値を hir_to_reg(i) に受け取る
+      end
+      result
+    end
+
+    # use idx を見つけて lr_end[v] を伸ばす。accumulate_uses と同じ取り回し。
+    def extend_lr_use(v, idx)
+      if v < 0
+        return nil
+      end
+      if @lr_end[v] < idx
+        @lr_end[v] = idx
+      end
+      nil
+    end
+
+    def extend_uses_for_insn(i)
+      kind = @hir_kind[i]
+      if kind == HirOp::JUMP_IF_FALSE
+        extend_lr_use(@hir_op0[i], i)
+      elsif binop_kind?(kind)
+        extend_lr_use(@hir_op0[i], i)
+        extend_lr_use(@hir_op1[i], i)
+      elsif kind == HirOp::GUARD_FIXNUM
+        extend_lr_use(@hir_op0[i], i)
+      elsif kind == HirOp::CALL || kind == HirOp::CALL_WITH_BLOCK
+        args_start = @hir_op1[i]
+        arity      = @hir_op2[i]
+        j = 0
+        while j < arity
+          extend_lr_use(@hir_call_args[args_start + j], i)
+          j += 1
+        end
+      elsif kind == HirOp::RETURN
+        extend_lr_use(@hir_op0[i], i)
+      end
+      # PHI の args は別途 extend_phi_args で BB 末尾まで extend する。
+      # STORE_LOCAL / PUTS / ARRAY_* は LIR にならない (現状) ので無視。
+      nil
+    end
+
+    # phi の引数は predecessor BB の末尾まで生存する必要がある (= emit_phi_copies_for_bb
+    # で BB 末尾の JUMP/JIF/RETURN 直前に MOV phi_reg, arg_reg を emit するため)。
+    def extend_phi_args(phi_id)
+      args_start = @hir_op1[phi_id]
+      arity      = @hir_op2[phi_id]
+      bb         = @hir_bb[phi_id]
+      pred_start = @bb_preds_starts[bb]
+      pred_count = @bb_preds_counts[bb]
+      pi = 0
+      while pi < arity && pi < pred_count
+        v = @hir_phi_args[args_start + pi]
+        if v >= 0
+          pred_bb = @bb_preds_flat[pred_start + pi]
+          pred_last = @bb_last_insn[pred_bb]
+          extend_lr_use(v, pred_last)
+        end
+        pi += 1
+      end
+      nil
+    end
+
+    # pass_compute_live_ranges: 各 hir_id について live range [start, end] と
+    # crosses_call (BL を跨いで生存しているか) を計算する。lr_start = def 位置、
+    # lr_end = 最後の use 位置。死んだ hir_id は -1 のまま。
+    # PHI は hir_id が後ろに append されるが、論理的には BB 先頭で値が生成される
+    # ので lr_start を bb_first_insn[phi.bb] に補正する (allocator が phi の use を
+    # phi の def より早く処理しないように)。
+    def pass_compute_live_ranges
+      n = @hir_kind.length
+      @lr_start = []
+      @lr_end = []
+      i = 0
+      while i < n
+        @lr_start.push(-1)
+        @lr_end.push(-1)
+        i += 1
+      end
+      # 1. def position を設定
+      i = 0
+      while i < n
+        if @hir_deleted[i] == 0 && defs_value?(i)
+          if @hir_kind[i] == HirOp::PHI
+            # PHI は BB 先頭で値が確定する。bb_first_insn[bb] (= 最初の non-PHI insn)
+            # を lr_start として、phi 自体の hir_id (= 末尾) ではなくその位置から
+            # 生きていることにする。
+            phi_bb = @hir_bb[i]
+            @lr_start[i] = @bb_first_insn[phi_bb]
+          else
+            @lr_start[i] = i
+          end
+          @lr_end[i] = @lr_start[i]
+        end
+        i += 1
+      end
+      # 2. use で end を伸ばす
+      i = 0
+      while i < n
+        if @hir_deleted[i] == 0
+          extend_uses_for_insn(i)
+        end
+        i += 1
+      end
+      # 3. phi の args は predecessor BB 末尾まで生存
+      i = 0
+      while i < n
+        if @hir_deleted[i] == 0 && @hir_kind[i] == HirOp::PHI
+          extend_phi_args(i)
+        end
+        i += 1
+      end
+      # 設計メモ: 旧版では BL を跨ぐ hir_id に「caller-saved 不可」のマークを付ける
+      # crosses_call 計算をしていたが、現 allocator は pool を callee-saved の 5 reg
+      # 固定にしたため不要。caller-saved を pool に加える将来拡張で復活させる。
+      nil
+    end
+
+    # pass_allocate_registers: linear-scan で物理 reg を割り当てる。pool は 5 個の
+    # callee-saved reg (REGALLOC_POOL_BASE..+REGALLOC_POOL_SIZE-1)。あふれは spill slot へ。
+    # lr_start 昇順で処理する。PHI は bb_first_insn 位置で開始するので hir_id 順とは別。
+    def pass_allocate_registers
+      n = @hir_kind.length
+      @lr_reg = []
+      @lr_spill_slot = []
+      i = 0
+      while i < n
+        @lr_reg.push(-1)
+        @lr_spill_slot.push(-1)
+        i += 1
+      end
+      # 1. lr_start 昇順で hir_id を並べる (active な hir_id のみ)。
+      #    spinel 制約上 sort_by 等が使えないので、selection sort で安定 sort。
+      order = []
+      i = 0
+      while i < n
+        if @lr_start[i] >= 0
+          order.push(i)
+        end
+        i += 1
+      end
+      # selection sort by lr_start (ascending)
+      pos = 0
+      while pos < order.length
+        min_idx = pos
+        scan = pos + 1
+        while scan < order.length
+          if @lr_start[order[scan]] < @lr_start[order[min_idx]]
+            min_idx = scan
+          end
+          scan += 1
+        end
+        if min_idx != pos
+          tmp = order[pos]
+          order[pos] = order[min_idx]
+          order[min_idx] = tmp
+        end
+        pos += 1
+      end
+      # 2. active pool: idx = vreg offset、value = 占有中の hir_id (-1 = free)
+      active = []
+      i = 0
+      while i < REGALLOC_POOL_SIZE
+        active.push(-1)
+        i += 1
+      end
+      @spill_slot_count = 0
+      # 3. 順に reg を割り当てる
+      oi = 0
+      while oi < order.length
+        h = order[oi]
+        start_pos = @lr_start[h]
+        # expired: active 中で lr_end < start_pos のものを free
+        ai = 0
+        while ai < REGALLOC_POOL_SIZE
+          owner = active[ai]
+          if owner >= 0 && @lr_end[owner] < start_pos
+            active[ai] = -1
+          end
+          ai += 1
+        end
+        # 空き探し
+        free_slot = -1
+        ai = 0
+        while ai < REGALLOC_POOL_SIZE && free_slot < 0
+          if active[ai] < 0
+            free_slot = ai
+          end
+          ai += 1
+        end
+        if free_slot >= 0
+          @lr_reg[h] = REGALLOC_POOL_BASE + free_slot
+          active[free_slot] = h
+        else
+          # spill
+          @lr_spill_slot[h] = @spill_slot_count
+          @spill_slot_count += 1
+        end
+        oi += 1
+      end
+      # callee-saved reg は使った数だけ prologue で stp する。pool 内の使用 reg を数える
+      # (lr_reg が ≥ POOL_BASE なら使った)。
+      max_used = -1
+      i = 0
+      while i < n
+        r = @lr_reg[i]
+        if r >= REGALLOC_POOL_BASE
+          offset = r - REGALLOC_POOL_BASE
+          if offset > max_used
+            max_used = offset
+          end
+        end
+        i += 1
+      end
+      @saved_reg_count = max_used + 1   # 0..max_used までの reg を保存する
+      # frame size = 16 (FP+LR) + saved_reg * 8 + spill_slot * 8、16-byte align。
+      # 内訳: [sp+0..15]=FP/LR、[sp+16..]=saved callee-saved、その後ろ=spill slots。
+      raw = 16 + (@saved_reg_count + @spill_slot_count) * 8
+      @jit_frame_size = (raw + 15) & (-16)
+      nil
+    end
+
+    # allocator 完走後に hir_id の use を解決する。spill されていれば LOAD_STACK を
+    # emit して SCRATCH に load し、それを返す。scratch_slot は 0/1 で 2 つまで同時に
+    # 同 BB 内で生存可能 (binop の lhs/rhs 用)。
+    def lower_use_reg(hir_id, scratch_slot, bb)
+      if @lr_spill_slot[hir_id] >= 0
+        scratch = SPILL_SCRATCH_0
+        if scratch_slot == 1
+          scratch = SPILL_SCRATCH_1
+        end
+        emit_lir(LirOp::LOAD_STACK, scratch, @lr_spill_slot[hir_id], 0, bb)
+        return scratch
+      end
+      @lr_reg[hir_id]
+    end
+
+    # def 側の dst reg を決める。spill されていれば SCRATCH_0 に書き、後で
+    # lower_def_store で STORE_STACK させる。
+    def lower_def_reg(hir_id)
+      if @lr_spill_slot[hir_id] >= 0
+        return SPILL_SCRATCH_0
+      end
+      @lr_reg[hir_id]
+    end
+
+    # spill されている dst について、計算結果を spill slot に書き戻す。
+    def lower_def_store(hir_id, reg, bb)
+      if @lr_spill_slot[hir_id] >= 0
+        emit_lir(LirOp::STORE_STACK, @lr_spill_slot[hir_id], reg, 0, bb)
+      end
+      nil
     end
 
     def emit_lir(kind, op0, op1, op2, bb)
@@ -6211,6 +6547,10 @@ module Setsunaruby
     end
 
     def pass_lower_to_lir
+      # JIT-4c regalloc: 関数 entry に FRAME_ENTER を 1 個 emit する。frame_size は
+      # allocator が決定済み (@jit_frame_size)。BB 0 に紐付けるが、loopback target に
+      # しないように label fixup 側で除外する。
+      emit_lir(LirOp::FRAME_ENTER, @jit_frame_size, 0, 0, 0)
       b = 0
       while b < @bb_first_insn.length
         if bb_alive_count(b) > 0
@@ -6224,16 +6564,24 @@ module Setsunaruby
     def lower_bb(b)
       i = @bb_first_insn[b]
       last = @bb_last_insn[b]
+      # BB が JUMP/JIF/RETURN を持たず物理 fall-through する場合でも、後続 BB の phi に
+      # 値を伝える必要があるため、末尾で phi copy を emit する。spinel rule 12 回避で
+      # bool ではなく Integer フラグ。
+      has_terminator = 0
       while i <= last
         if @hir_deleted[i] == 0
           kind = @hir_kind[i]
           # jump / return の前に phi コピーを挿入する。
           if kind == HirOp::JUMP || kind == HirOp::JUMP_IF_FALSE || kind == HirOp::RETURN
             emit_phi_copies_for_bb(b)
+            has_terminator = 1
           end
           lower_insn(i, b)
         end
         i += 1
+      end
+      if has_terminator == 0
+        emit_phi_copies_for_bb(b)
       end
       # JIT-3c の GuardFixnum (BB 末尾範囲外) を、通常 insn の lower 後に処理。
       lower_guards_for_bb(b)
@@ -6241,13 +6589,18 @@ module Setsunaruby
     end
 
     def lower_guards_for_bb(b)
+      # JIT 実機実行モードでは型プロファイルを信頼し guard を skip する (= TBZ 未 emit)。
+      # ダンプモードでは従来通り emit して dump_lir で見える。
+      if @jit_exec_enabled
+        return nil
+      end
       i = 0
       while i < @hir_kind.length
         if @hir_kind[i] == HirOp::GUARD_FIXNUM && @hir_bb[i] == b && @hir_deleted[i] == 0
           # GuardFixnum: x{op0} の bit 0 (Fixnum タグ) が 1 でなければ side exit。
           # TBZ x{op0}, #0, side_exit_label。side_exit のラベル解決は将来 JIT-4d。
           # 現段階では target_lir_id = -1 (未解決) としてダンプのみ。
-          src = hir_to_reg(@hir_op0[i])
+          src = lower_use_reg(@hir_op0[i], 0, b)
           emit_lir(LirOp::TBZ, src, 0, -1, b)
         end
         i += 1
@@ -6287,7 +6640,10 @@ module Setsunaruby
           args_start = @hir_op1[i]
           src_hir = @hir_phi_args[args_start + idx]
           if src_hir >= 0
-            emit_lir(LirOp::MOV_REG, hir_to_reg(i), hir_to_reg(src_hir), 0, from_bb)
+            src_reg = lower_use_reg(src_hir, 0, from_bb)
+            dst_reg = lower_def_reg(i)
+            emit_lir(LirOp::MOV_REG, dst_reg, src_reg, 0, from_bb)
+            lower_def_store(i, dst_reg, from_bb)
           end
         end
         i += 1
@@ -6301,29 +6657,55 @@ module Setsunaruby
         lower_load_const(i, bb)
       elsif kind == HirOp::LOAD_PARAM
         # arch 中立: 第 N 引数 (slot 0..7) を scratch reg にコピーする。
-        # arm64 では X<slot>、x86_64 (SysV) では RDI/RSI/RDX/RCX/R8/R9 からの mov。
-        emit_lir(LirOp::MOV_FROM_ARG, hir_to_reg(i), @hir_op0[i], 0, bb)
+        dst = lower_def_reg(i)
+        emit_lir(LirOp::MOV_FROM_ARG, dst, @hir_op0[i], 0, bb)
+        lower_def_store(i, dst, bb)
       elsif kind == HirOp::FIXNUM_ADD
-        emit_lir(LirOp::ADD, hir_to_reg(i), hir_to_reg(@hir_op0[i]), hir_to_reg(@hir_op1[i]), bb)
+        # boxed Fixnum: (a<<1|1) + (b<<1|1) = (a+b)<<1 + 2、欲しい値は (a+b)<<1|1。
+        # よって ADD の後に SUB_IMM #1。
+        lhs = lower_use_reg(@hir_op0[i], 0, bb)
+        rhs = lower_use_reg(@hir_op1[i], 1, bb)
+        dst = lower_def_reg(i)
+        emit_lir(LirOp::ADD, dst, lhs, rhs, bb)
+        emit_lir(LirOp::SUB_IMM, dst, dst, 1, bb)
+        lower_def_store(i, dst, bb)
       elsif kind == HirOp::FIXNUM_SUB
-        emit_lir(LirOp::SUB, hir_to_reg(i), hir_to_reg(@hir_op0[i]), hir_to_reg(@hir_op1[i]), bb)
+        # boxed Fixnum: (a<<1|1) - (b<<1|1) = (a-b)<<1、欲しい値は (a-b)<<1|1 = +1。
+        lhs = lower_use_reg(@hir_op0[i], 0, bb)
+        rhs = lower_use_reg(@hir_op1[i], 1, bb)
+        dst = lower_def_reg(i)
+        emit_lir(LirOp::SUB, dst, lhs, rhs, bb)
+        emit_lir(LirOp::ADD_IMM, dst, dst, 1, bb)
+        lower_def_store(i, dst, bb)
       elsif kind == HirOp::FIXNUM_MUL
-        emit_lir(LirOp::MUL, hir_to_reg(i), hir_to_reg(@hir_op0[i]), hir_to_reg(@hir_op1[i]), bb)
+        # boxed Fixnum 乗算は補正が複雑なので install で弾く。MUL は emit するが
+        # @jit_exec_enabled では install 拒否される。
+        lhs = lower_use_reg(@hir_op0[i], 0, bb)
+        rhs = lower_use_reg(@hir_op1[i], 1, bb)
+        dst = lower_def_reg(i)
+        emit_lir(LirOp::MUL, dst, lhs, rhs, bb)
+        lower_def_store(i, dst, bb)
       elsif kind == HirOp::FIXNUM_DIV
-        emit_lir(LirOp::SDIV, hir_to_reg(i), hir_to_reg(@hir_op0[i]), hir_to_reg(@hir_op1[i]), bb)
+        lhs = lower_use_reg(@hir_op0[i], 0, bb)
+        rhs = lower_use_reg(@hir_op1[i], 1, bb)
+        dst = lower_def_reg(i)
+        emit_lir(LirOp::SDIV, dst, lhs, rhs, bb)
+        lower_def_store(i, dst, bb)
       elsif kind == HirOp::FIXNUM_MOD
-        # arm64 には MOD 命令がない。本格実装では `SDIV + MSUB` の 2 命令で表現するが、
-        # 案 A の最小スコープでは SDIV のみ emit (= ダンプ上で「商」が見える) して、
-        # 実機実行時の MSUB は将来の JIT-4d で対応する。
-        emit_lir(LirOp::SDIV, hir_to_reg(i), hir_to_reg(@hir_op0[i]), hir_to_reg(@hir_op1[i]), bb)
+        # arm64 に MOD 直接命令なし。本格実装では SDIV + MSUB の 2 命令。現状は SDIV のみ。
+        lhs = lower_use_reg(@hir_op0[i], 0, bb)
+        rhs = lower_use_reg(@hir_op1[i], 1, bb)
+        dst = lower_def_reg(i)
+        emit_lir(LirOp::SDIV, dst, lhs, rhs, bb)
+        lower_def_store(i, dst, bb)
       elsif compare_kind?(kind) || fixnum_compare_kind?(kind)
-        # 比較は CMP のみ emit。JumpIfFalse 側で B.cond を出す前提。
-        emit_lir(LirOp::CMP, hir_to_reg(@hir_op0[i]), hir_to_reg(@hir_op1[i]), 0, bb)
+        # 比較は CMP のみ emit (フラグ設定、dst なし)。JumpIfFalse 側で B.cond を出す前提。
+        lhs = lower_use_reg(@hir_op0[i], 0, bb)
+        rhs = lower_use_reg(@hir_op1[i], 1, bb)
+        emit_lir(LirOp::CMP, lhs, rhs, 0, bb)
       elsif kind == HirOp::JUMP
         emit_lir(LirOp::B, @bb_succ0[bb], 0, 0, bb)
       elsif kind == HirOp::JUMP_IF_FALSE
-        # 直前の比較 HIR insn の kind から「偽分岐」相当の B.cond を選ぶ。
-        # 例: FIXNUM_LT (a < b) が偽 (= a >= b) なら BB2 へ → B_GE。
         cond_hid = @hir_op0[i]
         cond_kind = @hir_kind[cond_hid]
         b_cond = lir_b_cond_for_false(cond_kind)
@@ -6336,18 +6718,19 @@ module Setsunaruby
         ai = 0
         while ai < arity
           arg_hir = @hir_call_args[args_start + ai]
-          emit_lir(LirOp::MOV_TO_ARG, ai, hir_to_reg(arg_hir), 0, bb)
+          arg_reg = lower_use_reg(arg_hir, 0, bb)
+          emit_lir(LirOp::MOV_TO_ARG, ai, arg_reg, 0, bb)
           ai += 1
         end
         emit_lir(LirOp::BL, callee, 0, 0, bb)
-        # 戻り値 (arm64: X0, x86_64: RAX) を hir_to_reg(i) にコピー。
-        # MOV_FROM_ARG slot=0 が偶然「arm64 X0 / x86_64 RDI」に相当するため、ここは
-        # 厳密には MOV_FROM_RET 相当の専用 op が望ましいが、現状 BL を含むメソッドは
-        # 多 BB / cross-method の制約で install されないので未実装で問題なし。
-        emit_lir(LirOp::MOV_REG, hir_to_reg(i), 0, 0, bb)
+        # 戻り値 (arm64: X0, x86_64: RAX) を dst に。MOV_FROM_ARG slot=0 で受け取れる。
+        dst = lower_def_reg(i)
+        emit_lir(LirOp::MOV_FROM_ARG, dst, 0, 0, bb)
+        lower_def_store(i, dst, bb)
       elsif kind == HirOp::RETURN
-        # 戻り値レジスタ (arm64: X0, x86_64: RAX) に値を置いて RET。
-        emit_lir(LirOp::MOV_TO_RET, hir_to_reg(@hir_op0[i]), 0, 0, bb)
+        ret_src = lower_use_reg(@hir_op0[i], 0, bb)
+        emit_lir(LirOp::MOV_TO_RET, ret_src, 0, 0, bb)
+        emit_lir(LirOp::FRAME_LEAVE, @jit_frame_size, 0, 0, bb)
         emit_lir(LirOp::RET, 0, 0, 0, bb)
       end
       # PHI / PUTS / 観測なしの generic ADD 等は lower しない (= LIR には現れない)。
@@ -6375,30 +6758,204 @@ module Setsunaruby
 
     def lower_load_const(i, bb)
       tag = @hir_op0[i]
+      dst = lower_def_reg(i)
       if tag == HirConstTag::INT
         # box 形式 (n << 1 | 1) で MOVZ。MOVZ は 16bit zero-extend なので、
         # 負数の boxed 値や 16bit を超える整数は上位 bit が落ちて誤った値になる。
-        # 完全対応には MOVN または MOVZ + MOVK チェーンが必要だが、案 A (実機実行
-        # なし、ダンプのみ) では下位 16bit のみ表示する素朴版。
+        # 完全対応には MOVN または MOVZ + MOVK チェーンが必要だが、現状は下位 16bit のみ。
         v = (@hir_op1[i] << 1) | 1
-        emit_lir(LirOp::MOV_IMM, hir_to_reg(i), v & 0xFFFF, 0, bb)
+        emit_lir(LirOp::MOV_IMM, dst, v & 0xFFFF, 0, bb)
       elsif tag == HirConstTag::TRUE
-        emit_lir(LirOp::MOV_IMM, hir_to_reg(i), ObjectVal::TRUE_VAL, 0, bb)
+        emit_lir(LirOp::MOV_IMM, dst, ObjectVal::TRUE_VAL, 0, bb)
       elsif tag == HirConstTag::FALSE
-        emit_lir(LirOp::MOV_IMM, hir_to_reg(i), ObjectVal::FALSE_VAL, 0, bb)
+        emit_lir(LirOp::MOV_IMM, dst, ObjectVal::FALSE_VAL, 0, bb)
       elsif tag == HirConstTag::NIL
-        emit_lir(LirOp::MOV_IMM, hir_to_reg(i), ObjectVal::NIL_VAL, 0, bb)
+        emit_lir(LirOp::MOV_IMM, dst, ObjectVal::NIL_VAL, 0, bb)
+      end
+      lower_def_store(i, dst, bb)
+      nil
+    end
+
+    # arm64 エンコード。3 段階で構成:
+    #   1. 仮 emit (各 LIR を機械語ワードに展開、@lir_byte_offset / @bb_first_byte_offset 記録)
+    #   2. side exit stub (= mov x0, #0 ; ret) を末尾に append
+    #   3. label fixup (B / B.cond / BL / TBZ の rel offset を解決)
+    def pass_encode_arm64
+      @bb_first_byte_offset = []
+      @lir_byte_offset = []
+      nbb = @bb_first_insn.length
+      bi = 0
+      while bi < nbb
+        @bb_first_byte_offset.push(-1)
+        bi += 1
+      end
+      # Pass 1: emit
+      i = 0
+      while i < @lir_kind.length
+        @lir_byte_offset.push(@lir_machine_code.length * 4)
+        bb = @lir_bb[i]
+        if @bb_first_byte_offset[bb] < 0 && lir_is_frame_or_prologue?(@lir_kind[i]) == 0
+          @bb_first_byte_offset[bb] = @lir_machine_code.length * 4
+        end
+        emit_arm64_insn(i)
+        i += 1
+      end
+      # Pass 2: side exit stub
+      @jit_side_exit_byte_offset = @lir_machine_code.length * 4
+      @lir_machine_code.push(encode_movz(0, 0))   # mov x0, #0
+      @lir_machine_code.push(encode_ret)          # ret
+      # Pass 3: label fixup
+      pass_fixup_arm64
+      nil
+    end
+
+    # FRAME_ENTER / FRAME_LEAVE 等の prologue 系 LIR か判定。BB の先頭 byte offset
+    # 記録から除外することで loopback target が prologue を踏まないようにする。
+    def lir_is_frame_or_prologue?(kind)
+      result = 0
+      if kind == LirOp::FRAME_ENTER
+        result = 1
+      end
+      result
+    end
+
+    # arm64 label fixup: B / B.cond / BL / TBZ を PC 相対の正しい offset に書き換える。
+    # BL の op0 = m_idx (callee メソッド index)。self_m_idx と一致 (= 自己再帰) なら
+    # function 先頭 (byte 0) を target にする。それ以外 (= cross-method) は
+    # install_jit_for_method が弾く前提で、ここではプレースホルダのままにする。
+    def pass_fixup_arm64
+      i = 0
+      while i < @lir_kind.length
+        kind = @lir_kind[i]
+        cur_off = @lir_byte_offset[i]
+        word_idx = cur_off / 4
+        if kind == LirOp::B
+          target_bb = @lir_op0[i]
+          target_off = @bb_first_byte_offset[target_bb]
+          rel = (target_off - cur_off) / 4
+          @lir_machine_code[word_idx] = encode_b(rel)
+        elsif kind == LirOp::B_EQ || kind == LirOp::B_NE || kind == LirOp::B_LT || kind == LirOp::B_GT || kind == LirOp::B_LE || kind == LirOp::B_GE
+          target_bb = @lir_op0[i]
+          target_off = @bb_first_byte_offset[target_bb]
+          rel = (target_off - cur_off) / 4
+          cond = arm64_cond_for_lir_b(kind)
+          @lir_machine_code[word_idx] = encode_b_cond(cond, rel)
+        elsif kind == LirOp::BL
+          # BL の callee = @lir_op0[i] (m_idx)。FRAME_ENTER は byte 0 にあるので
+          # 自己再帰の target も byte 0 (= function entry)。
+          # 自己再帰かどうかは install_jit_for_method の m_idx で判定 (ここでは byte 0 を assume)。
+          rel = (0 - cur_off) / 4
+          @lir_machine_code[word_idx] = encode_bl(rel)
+        elsif kind == LirOp::TBZ
+          # GUARD: side exit stub へジャンプ。
+          rt = @lir_op0[i]
+          bit = @lir_op1[i]
+          rel = (@jit_side_exit_byte_offset - cur_off) / 4
+          @lir_machine_code[word_idx] = encode_tbz(rt, bit, rel)
+        end
+        i += 1
       end
       nil
     end
 
-    def pass_encode_arm64
-      i = 0
-      while i < @lir_kind.length
-        @lir_machine_code.push(encode_arm64_insn(i))
-        i += 1
+    # LIR_B_* condition を Arm64Cond に。
+    def arm64_cond_for_lir_b(kind)
+      result = Arm64Cond::EQ
+      if kind == LirOp::B_NE
+        result = Arm64Cond::NE
+      elsif kind == LirOp::B_LT
+        result = Arm64Cond::LT
+      elsif kind == LirOp::B_GT
+        result = Arm64Cond::GT
+      elsif kind == LirOp::B_LE
+        result = Arm64Cond::LE
+      elsif kind == LirOp::B_GE
+        result = Arm64Cond::GE
+      end
+      result
+    end
+
+    # 1 LIR insn を arm64 機械語ワード列に展開して @lir_machine_code に push。
+    # 多くの LIR は 1 word だが、FRAME_ENTER / FRAME_LEAVE は 2+ words。
+    def emit_arm64_insn(lir_id)
+      kind = @lir_kind[lir_id]
+      if kind == LirOp::FRAME_ENTER
+        emit_arm64_frame_enter(@lir_op0[lir_id])
+      elsif kind == LirOp::FRAME_LEAVE
+        emit_arm64_frame_leave(@lir_op0[lir_id])
+      elsif kind == LirOp::LOAD_STACK
+        # ldr Xt, [sp, #imm12*8]。op0 = dst reg, op1 = spill slot index。
+        # spill 領域は saved_reg_count 個の callee-saved の後ろから始まる:
+        #   byte_offset = 16 (FP/LR) + 8 * saved_reg_count + 8 * slot
+        offset = 16 + 8 * @saved_reg_count + 8 * @lir_op1[lir_id]
+        @lir_machine_code.push(encode_ldr_sp(@lir_op0[lir_id], offset))
+      elsif kind == LirOp::STORE_STACK
+        offset = 16 + 8 * @saved_reg_count + 8 * @lir_op0[lir_id]
+        @lir_machine_code.push(encode_str_sp(@lir_op1[lir_id], offset))
+      else
+        @lir_machine_code.push(encode_arm64_insn(lir_id))
       end
       nil
+    end
+
+    # arm64 FRAME_ENTER: stp x29,x30,[sp,#-FRAME]! + mov x29,sp + saved-reg STRs。
+    # frame_size = 16 (FP/LR) + 8 * saved_reg_count + 8 * spill_slot_count、16-align。
+    # @jit_frame_size に格納済み。saved_reg_count 個の callee-saved を [sp+16..] に str。
+    def emit_arm64_frame_enter(frame_size)
+      # stp x29, x30, [sp, #-FRAME]!  (pre-index, decrement-before)
+      @lir_machine_code.push(encode_stp_pre_sp(29, 30, -frame_size))
+      # mov x29, sp  (= add x29, sp, #0)
+      @lir_machine_code.push(0x910003FD)
+      # callee-saved を [sp+16+8*k] に保存。pool reg は 19..23 = base+0..base+4。
+      k = 0
+      while k < @saved_reg_count
+        reg = REGALLOC_POOL_BASE + k
+        offset = 16 + 8 * k
+        @lir_machine_code.push(encode_str_sp(reg, offset))
+        k += 1
+      end
+      nil
+    end
+
+    # arm64 FRAME_LEAVE: saved-reg LDRs + ldp x29,x30,[sp],#FRAME (post-index)。
+    def emit_arm64_frame_leave(frame_size)
+      k = 0
+      while k < @saved_reg_count
+        reg = REGALLOC_POOL_BASE + k
+        offset = 16 + 8 * k
+        @lir_machine_code.push(encode_ldr_sp(reg, offset))
+        k += 1
+      end
+      @lir_machine_code.push(encode_ldp_post_sp(29, 30, frame_size))
+      nil
+    end
+
+    # STR Xt, [SP, #imm12_scaled] (unsigned offset, scaled by 8)
+    # 1111 1001 00 imm12 11111 Rt
+    def encode_str_sp(rt, byte_offset)
+      imm12 = byte_offset / 8
+      0xF9000000 | ((imm12 & 0xFFF) << 10) | (31 << 5) | (rt & 0x1F)
+    end
+
+    # LDR Xt, [SP, #imm12_scaled]
+    # 1111 1001 01 imm12 11111 Rt
+    def encode_ldr_sp(rt, byte_offset)
+      imm12 = byte_offset / 8
+      0xF9400000 | ((imm12 & 0xFFF) << 10) | (31 << 5) | (rt & 0x1F)
+    end
+
+    # STP Xt1, Xt2, [SP, #imm7_scaled]! (pre-index)
+    # 1010 1001 10 1 imm7 Xt2 11111 Xt1。imm7 は signed (-64..63)、scaled by 8。
+    def encode_stp_pre_sp(rt1, rt2, byte_offset)
+      imm7 = (byte_offset / 8) & 0x7F
+      0xA9800000 | (imm7 << 15) | ((rt2 & 0x1F) << 10) | (31 << 5) | (rt1 & 0x1F)
+    end
+
+    # LDP Xt1, Xt2, [SP], #imm7_scaled (post-index)
+    # 1010 1000 11 0 imm7 Xt2 11111 Xt1
+    def encode_ldp_post_sp(rt1, rt2, byte_offset)
+      imm7 = (byte_offset / 8) & 0x7F
+      0xA8C00000 | (imm7 << 15) | ((rt2 & 0x1F) << 10) | (31 << 5) | (rt1 & 0x1F)
     end
 
     # アーキ別エンコーダの dispatcher。defined?(JIT) かつ JIT::ARCH_ARM64 == false
@@ -6442,23 +6999,87 @@ module Setsunaruby
     # は install をスキップ (@jit_fn_addrs[m_idx] = -1 でマーク、以後再試行しない)。
     # BL や分岐の target 解決は encoder 側の未解決 task で、複数 BB を持つメソッドは
     # crash する可能性が高い ── ここでは「install できる入力なら install する」のみ。
+    # `def_bb` が `use_bb` を支配する (= def_bb は use_bb の ancestor in dominator tree)
+    # か判定。HIR の RETURN 等で use の def が dominate していなければ install を拒否する。
+    def def_dominates_use?(def_bb, use_bb)
+      cur = use_bb
+      while cur != 0 && cur != def_bb
+        nxt = @bb_idom[cur]
+        if nxt == cur
+          # root に到達。def_bb に未遭遇なら not dominated。
+          if def_bb == 0
+            return true
+          end
+          return false
+        end
+        cur = nxt
+      end
+      cur == def_bb
+    end
+
     def install_jit_for_method(m_idx)
       if @method_arities[m_idx] > 8
         @jit_fn_addrs[m_idx] = -1
         return nil
       end
-      # B / B.cond / BL / TBZ を含む LIR は target 解決が未実装 (= プレースホルダの
-      # offset=0 で emit されたまま)。install すると jmp/call 0x00000000 を踏んで
-      # SIGSEGV になるため、ここで弾いて bytecode 経路に流す。multi-BB / call / guard
-      # サポートが完成したら除去する。
+      # if-expression の戻り値が phi 化されない HIR bug を持つメソッドを検出して弾く。
+      # 具体的には RETURN の source hir_id v の定義 BB が return の BB を支配して
+      # いなければ「v は実行時に未定義値」になりうる。`def result = ...; if ...; result; end`
+      # のように明示 STORE_LOCAL 経由なら phi が入るので問題ない。
+      ri = 0
+      while ri < @hir_kind.length
+        if @hir_deleted[ri] == 0 && @hir_kind[ri] == HirOp::RETURN
+          src = @hir_op0[ri]
+          if src >= 0 && src < @hir_bb.length
+            def_bb = @hir_bb[src]
+            use_bb = @hir_bb[ri]
+            if def_bb >= 0 && def_dominates_use?(def_bb, use_bb) == false
+              @jit_fn_addrs[m_idx] = -1
+              return nil
+            end
+          end
+        end
+        ri += 1
+      end
+      # 残る install filter:
+      #   - cross-method BL (= 自身以外のメソッド呼び出し) はサポート外。callee が
+      #     JIT 化されているとは限らず、コードキャッシュ内の他関数を直接 BL する
+      #     正しい offset を知る手段がない。自己再帰 (BL.op0 == m_idx) のみ通す。
+      #   - TBZ は @jit_exec_enabled では emit されない (guards skip)。万一来たら弾く。
+      #   - x86_64 で B / B.cond を含むメソッドは label fixup 未実装。
       j = 0
       while j < @lir_kind.length
         k = @lir_kind[j]
-        if k == LirOp::B || k == LirOp::B_EQ || k == LirOp::B_NE || k == LirOp::B_LT || k == LirOp::B_GT || k == LirOp::B_LE || k == LirOp::B_GE || k == LirOp::BL || k == LirOp::TBZ
+        if k == LirOp::BL && @lir_op0[j] != m_idx
           @jit_fn_addrs[m_idx] = -1
           return nil
         end
+        if k == LirOp::TBZ
+          @jit_fn_addrs[m_idx] = -1
+          return nil
+        end
+        if defined?(JIT) && JIT::ARCH_ARM64 == false
+          # x86_64 path: B / B.cond の label fixup が未実装なので、これらを含むメソッドは弾く
+          if k == LirOp::B || k == LirOp::B_EQ || k == LirOp::B_NE || k == LirOp::B_LT || k == LirOp::B_GT || k == LirOp::B_LE || k == LirOp::B_GE
+            @jit_fn_addrs[m_idx] = -1
+            return nil
+          end
+        end
         j += 1
+      end
+      # HIR レベルで弾くもの:
+      #   - FIXNUM_MUL / DIV / MOD: boxed Fixnum 補正未実装 (補正なしで MUL/SDIV を
+      #     emit すると誤った値が返る)。FIXNUM_ADD / SUB のみ +1 / -1 補正済み。
+      hi = 0
+      while hi < @hir_kind.length
+        if @hir_deleted[hi] == 0
+          hk = @hir_kind[hi]
+          if hk == HirOp::FIXNUM_MUL || hk == HirOp::FIXNUM_DIV || hk == HirOp::FIXNUM_MOD
+            @jit_fn_addrs[m_idx] = -1
+            return nil
+          end
+        end
+        hi += 1
       end
       bytes = 0
       if JIT::ARCH_ARM64
@@ -6612,6 +7233,12 @@ module Setsunaruby
         result = encode_add_reg(@lir_op0[lir_id], @lir_op1[lir_id], @lir_op2[lir_id])
       elsif kind == LirOp::SUB
         result = encode_sub_reg(@lir_op0[lir_id], @lir_op1[lir_id], @lir_op2[lir_id])
+      elsif kind == LirOp::ADD_IMM
+        # ADD Xd, Xn, #imm12 : 1001 0001 00 imm12 Rn Rd
+        result = 0x91000000 | ((@lir_op2[lir_id] & 0xFFF) << 10) | ((@lir_op1[lir_id] & 0x1F) << 5) | (@lir_op0[lir_id] & 0x1F)
+      elsif kind == LirOp::SUB_IMM
+        # SUB Xd, Xn, #imm12 : 1101 0001 00 imm12 Rn Rd
+        result = 0xD1000000 | ((@lir_op2[lir_id] & 0xFFF) << 10) | ((@lir_op1[lir_id] & 0x1F) << 5) | (@lir_op0[lir_id] & 0x1F)
       elsif kind == LirOp::MUL
         result = encode_mul_reg(@lir_op0[lir_id], @lir_op1[lir_id], @lir_op2[lir_id])
       elsif kind == LirOp::SDIV
@@ -6749,16 +7376,29 @@ module Setsunaruby
       result
     end
 
-    # LIR vreg 番号 (= hir_to_reg の戻り値、典型 9..28) を x86_64 物理 reg 番号
-    # (8..15 = r8..r15) に変換。0..7 は MOV_REG の例外用に そのままの 0..7 = rax..rdi。
+    # LIR vreg 番号を x86_64 物理 reg 番号に変換。allocator が生成する vreg は
+    #   - 0..7      : arg slots (MOV_FROM_ARG / MOV_TO_ARG 経由、x86_64_arg_reg で別マップ)
+    #   - 16, 17    : spill scratch → r10, r11 (caller-saved、固定)
+    #   - 19..23    : allocator pool → rbx, r12, r13, r14, r15 (callee-saved、5 個)
+    # それ以外の vreg は来ない想定 (allocator が出さない)。
     def x86_64_phys_reg(vreg)
       result = X64_RAX
       if vreg <= 7
         result = vreg
-      elsif vreg == 8
-        result = X64_R8
-      else
-        result = ((vreg - 9) % 8) + 8
+      elsif vreg == SPILL_SCRATCH_0
+        result = 10              # r10
+      elsif vreg == SPILL_SCRATCH_1
+        result = 11              # r11
+      elsif vreg == 19
+        result = X64_RBX         # 3
+      elsif vreg == 20
+        result = 12              # r12
+      elsif vreg == 21
+        result = 13              # r13
+      elsif vreg == 22
+        result = 14              # r14
+      elsif vreg == 23
+        result = 15              # r15
       end
       result
     end
@@ -6895,7 +7535,103 @@ module Setsunaruby
           @jit_bytes.push(0x90)
           bi += 1
         end
+      elsif kind == LirOp::ADD_IMM
+        dst = x86_64_phys_reg(@lir_op0[lir_id])
+        src = x86_64_phys_reg(@lir_op1[lir_id])
+        if dst != src
+          x86_64_emit_mov_reg(dst, src)
+        end
+        x86_64_emit_alu_imm32(0, dst, @lir_op2[lir_id])
+      elsif kind == LirOp::SUB_IMM
+        dst = x86_64_phys_reg(@lir_op0[lir_id])
+        src = x86_64_phys_reg(@lir_op1[lir_id])
+        if dst != src
+          x86_64_emit_mov_reg(dst, src)
+        end
+        x86_64_emit_alu_imm32(5, dst, @lir_op2[lir_id])
+      elsif kind == LirOp::FRAME_ENTER
+        emit_x86_64_frame_enter(@lir_op0[lir_id])
+      elsif kind == LirOp::FRAME_LEAVE
+        emit_x86_64_frame_leave(@lir_op0[lir_id])
+      elsif kind == LirOp::LOAD_STACK
+        # mov R<dst>, [rbp - 8 - 8*saved - 8*slot]。disp32 で。
+        slot = @lir_op1[lir_id]
+        disp = -8 - 8 * @saved_reg_count - 8 * slot
+        x86_64_emit_mov_rbp_load(x86_64_phys_reg(@lir_op0[lir_id]), disp)
+      elsif kind == LirOp::STORE_STACK
+        slot = @lir_op0[lir_id]
+        disp = -8 - 8 * @saved_reg_count - 8 * slot
+        x86_64_emit_mov_rbp_store(x86_64_phys_reg(@lir_op1[lir_id]), disp)
       end
+      nil
+    end
+
+    # x86_64 prologue: push rbp ; mov rbp, rsp ; sub rsp, #frame_size ;
+    #                  callee-saved を [rbp-8*k] に save。
+    # frame_size は allocator が決めた値 (16-align)。
+    def emit_x86_64_frame_enter(frame_size)
+      # push rbp
+      @jit_bytes.push(0x55)
+      # mov rbp, rsp : 48 89 E5
+      @jit_bytes.push(0x48)
+      @jit_bytes.push(0x89)
+      @jit_bytes.push(0xE5)
+      # sub rsp, imm32 (= 81 /5)
+      x86_64_emit_alu_imm32(5, 4, frame_size)   # 4 = rsp (ModRM r/m)
+      # callee-saved を [rbp-8*(k+1)] へ store
+      k = 0
+      while k < @saved_reg_count
+        reg = REGALLOC_POOL_BASE + k
+        phys = x86_64_phys_reg(reg)
+        disp = -8 - 8 * k
+        x86_64_emit_mov_rbp_store(phys, disp)
+        k += 1
+      end
+      nil
+    end
+
+    # x86_64 epilogue: callee-saved restore ; add rsp, #frame_size ; pop rbp。
+    def emit_x86_64_frame_leave(frame_size)
+      k = 0
+      while k < @saved_reg_count
+        reg = REGALLOC_POOL_BASE + k
+        phys = x86_64_phys_reg(reg)
+        disp = -8 - 8 * k
+        x86_64_emit_mov_rbp_load(phys, disp)
+        k += 1
+      end
+      # add rsp, imm32 (= 81 /0)
+      x86_64_emit_alu_imm32(0, 4, frame_size)
+      # pop rbp
+      @jit_bytes.push(0x5D)
+      nil
+    end
+
+    # mov rdst, [rbp + disp32]
+    # REX.W + REX.R(dst>=8) + 8B + ModRM(mod=10, reg=dst, r/m=5=rbp) + disp32
+    def x86_64_emit_mov_rbp_load(dst, disp32)
+      rex_r = 0
+      if dst >= 8
+        rex_r = 1
+      end
+      @jit_bytes.push(x86_64_rex(1, rex_r, 0, 0))
+      @jit_bytes.push(0x8B)
+      @jit_bytes.push(0x85 | ((dst & 7) << 3))
+      x86_64_push_u32_le(disp32)
+      nil
+    end
+
+    # mov [rbp + disp32], rsrc
+    # REX.W + REX.R(src>=8) + 89 + ModRM(mod=10, reg=src, r/m=5=rbp) + disp32
+    def x86_64_emit_mov_rbp_store(src, disp32)
+      rex_r = 0
+      if src >= 8
+        rex_r = 1
+      end
+      @jit_bytes.push(x86_64_rex(1, rex_r, 0, 0))
+      @jit_bytes.push(0x89)
+      @jit_bytes.push(0x85 | ((src & 7) << 3))
+      x86_64_push_u32_le(disp32)
       nil
     end
 
@@ -6903,8 +7639,10 @@ module Setsunaruby
       STDERR.puts "ZJIT LIR for method idx=#{m_idx}:"
       # x86_64 では @lir_machine_code が空で @jit_bytes に byte 列が並ぶ。命令長が
       # 可変なので 32bit hex の 1:1 対応が無いため、x86_64 では asm のみ表示する。
+      # arm64 でも FRAME_ENTER / FRAME_LEAVE は複数 word に展開されるため、各 LIR の
+      # 機械語先頭 word を @lir_byte_offset から逆引きする。
       use_arm64_hex = 1
-      if @lir_machine_code.length == 0
+      if @lir_machine_code.length == 0 || @lir_byte_offset.length == 0
         use_arm64_hex = 0
       end
       i = 0
@@ -6917,7 +7655,8 @@ module Setsunaruby
         end
         asm = format_lir_asm(i)
         if use_arm64_hex == 1
-          hex = format_hex32(@lir_machine_code[i])
+          word_idx = @lir_byte_offset[i] / 4
+          hex = format_hex32(@lir_machine_code[word_idx])
           STDERR.puts "    #{asm}    ; #{hex}"
         else
           STDERR.puts "    #{asm}"
@@ -6998,6 +7737,18 @@ module Setsunaruby
         result = "ret"
       elsif kind == LirOp::TBZ
         result = "tbz x" + op0.to_s + ", #" + op1.to_s + ", side_exit"
+      elsif kind == LirOp::ADD_IMM
+        result = "add x" + op0.to_s + ", x" + op1.to_s + ", #" + op2.to_s
+      elsif kind == LirOp::SUB_IMM
+        result = "sub x" + op0.to_s + ", x" + op1.to_s + ", #" + op2.to_s
+      elsif kind == LirOp::LOAD_STACK
+        result = "ldr x" + op0.to_s + ", [sp, #slot " + op1.to_s + "]"
+      elsif kind == LirOp::STORE_STACK
+        result = "str x" + op1.to_s + ", [sp, #slot " + op0.to_s + "]"
+      elsif kind == LirOp::FRAME_ENTER
+        result = "frame_enter #" + op0.to_s
+      elsif kind == LirOp::FRAME_LEAVE
+        result = "frame_leave #" + op0.to_s
       end
       result
     end
