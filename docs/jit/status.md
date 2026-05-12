@@ -94,6 +94,25 @@ target がパッチ適用済みかを確認する。
 | ページサイズ | `sp_jit_page_size()` | `JIT.page_size` |
 | 定数 | `SP_JIT_PROT_*` / `SP_JIT_DARWIN_ARM64` / `SP_JIT_ARCH_ARM64` | `JIT::PROT_READ` / `JIT::PROT_WRITE` / `JIT::PROT_EXEC` / `JIT::DARWIN_ARM64` / `JIT::ARCH_ARM64` |
 
+## ベンチマーク (JIT vs no-JIT)
+
+`make bench-jit` で `benchmark/bench_jit_*.rb` を CRuby / AOT (no JIT) /
+AOT + JIT の 3 系統で計測 (5 回中央値、macOS arm64):
+
+| benchmark | CRuby | AOT no-JIT | AOT + JIT | JIT speedup (vs AOT) |
+|---|---:|---:|---:|---:|
+| `bench_jit_id` (id 5M 回) | 25370 ms | 449 ms | 333 ms | 1.35x |
+| `bench_jit_loop_add` (add 1M 回) | 6141 ms | 111 ms | 73 ms | 1.54x |
+| `bench_jit_chain` (4 算術 × 500k 回) | 5307 ms | 103 ms | 39 ms | 2.65x |
+| `bench_jit_count` (内部 while × 2k 回) | 5097 ms | 92 ms | 8 ms | **10.96x** |
+| `bench_jit_fib` (fib(28) 再帰) | 5189 ms | 107 ms | 4.6 ms | **23.26x** |
+
+- ホットメソッドの中身が薄いほど `JIT.callN` の dispatch コスト割合が増え JIT
+  speedup は小さい (`id` の 1.35x)
+- 内部ループや深い再帰でホット method の処理量が多い場合に bytecode dispatch
+  削減効果が大きく出る (`fib` で 23.26x、`count` で 10.96x)
+- `fib(28)` で CRuby → AOT + JIT は **約 1100x** (= 5189 ÷ 4.6)
+
 ## ロードマップ
 
 | 案 | 完了度 | 内容 |

@@ -60,6 +60,11 @@ test-all: test-cruby test-aot test-jit-x86-64 test-jit-recursion
 bench: build
 	ruby benchmark/run_bench.rb
 
+# JIT 有無のパフォーマンス比較 (CRuby / AOT / AOT+JIT の 3 系統)。
+# spinel fork が必要 (verify-spinel-jit 経由で確認)。
+bench-jit: build
+	ruby benchmark/run_bench_jit.rb
+
 bench-regen:
 	ruby benchmark/gen_benchmarks.rb
 
