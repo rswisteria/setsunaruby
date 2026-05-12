@@ -4071,31 +4071,31 @@ module Setsunaruby
     end
 
     # Stage 4e: byte (0..255) を 1 文字の heap String にする。範囲外は RangeError 相当。
-    # receiver が Fixnum 即値なので退避不要。
     def heap_string_from_byte(n)
       if n < 0 || n > 255
         raise "RangeError: #{n} out of char range (Stage 4e)"
       end
-      gc_check_threshold
-      new_start = @str_pool.length
-      @str_pool.push(n)
-      alloc_heap_slot(HEAP_KIND_STRING, new_start, 1, -1)
+      alloc_one_char_string(n)
     end
 
     # Stage 4e: `s.chr`。s の最初のバイトを 1 文字 String として返す。空文字列で raise。
-    # heap_string_from_byte と同じく GC 起動の可能性があるので receiver を退避する。
+    # `first` を GC 起動前に Integer 値として取得すれば、後続の alloc 中に @heap_starts が
+    # 動いても影響を受けないため receiver 退避は不要。
     def heap_string_first_char(str_id)
       s_idx = unbox_heap(str_id)
       if @heap_lens[s_idx] == 0
         raise "ArgumentError: empty string has no .chr (Stage 4e)"
       end
-      @stack.push(str_id)
+      first = @str_pool[@heap_starts[s_idx]]
+      alloc_one_char_string(first)
+    end
+
+    # 1 byte の heap String を新規確保する低レベル helper。pool 操作前の
+    # gc_check_threshold を含む。range check は呼び出し側の責務。
+    def alloc_one_char_string(byte)
       gc_check_threshold
-      str_id    = @stack.pop
-      s_idx     = unbox_heap(str_id)
-      first     = @str_pool[@heap_starts[s_idx]]
       new_start = @str_pool.length
-      @str_pool.push(first)
+      @str_pool.push(byte)
       alloc_heap_slot(HEAP_KIND_STRING, new_start, 1, -1)
     end
 
