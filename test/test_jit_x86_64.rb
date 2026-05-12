@@ -36,12 +36,11 @@ class X86Interp < Setsunaruby::Interp
   end
 end
 
-# private 修飾を外して外から呼べるようにする (assert で @jit_bytes を取り出せる
-# よう、initialize 後に instance_variable_get で参照する)。
-Setsunaruby::Interp.send(:public, :pass_encode_x86_64) if Setsunaruby::Interp.private_method_defined?(:pass_encode_x86_64)
-
-# 与えた src で `@jit_bytes` を作って返す。STDERR は黙らせる。
-# `@dump_hir` は run_string が ENV から再設定するため、ENV 経由で発火させる。
+# 与えた src で `@jit_bytes` を作って返す。
+# CRuby では `defined?(JIT)` が nil なので `jit_install_viable?` が false になり、
+# build_and_dump_hir を発火させるには `@dump_hir = true` が必要。`@dump_hir` は
+# run_string 冒頭で ENV から再読み込みされるため、ENV 経由でセットする。
+# 結果として HIR/LIR ダンプが STDERR に出るので tempfile に逃がす。
 def encode_x86_64_for(src)
   saved_stderr = STDERR.dup
   err_tmp = Tempfile.new('jit_x64_stderr')

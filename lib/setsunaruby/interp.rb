@@ -228,9 +228,8 @@ module Setsunaruby
       @lir_op2          = []
       @lir_bb           = []
       @lir_machine_code = []
-      # JIT-4c x86_64: 可変長命令の byte 並びと、各 LIR insn の機械語先頭 byte offset。
-      # pass_encode_x86_64 が build。arm64 は @lir_machine_code (固定 4 byte word) を使う。
-      @lir_byte_offset  = []
+      # JIT-4c x86_64: 可変長命令の byte 並び。pass_encode_x86_64 が build。
+      # arm64 は @lir_machine_code (固定 4 byte word) を使うので別。
       @jit_bytes        = []
       # spinel AOT で ENV が解釈されない場合は常に false 相当 (HIR ダンプは CRuby のみ)。
       @dump_hir      = ENV["SETSUNARUBY_DUMP_HIR"] == "1"
@@ -402,7 +401,6 @@ module Setsunaruby
       @lir_op2           = []
       @lir_bb            = []
       @lir_machine_code  = []
-      @lir_byte_offset   = []
       @jit_bytes         = []
       # @profile_fixnum_pc は bytecode コンパイル完了後に length 分一括確保するため、
       # 冒頭リセットには含めない (= run_string 後半で `[] + push` 経由で初期化)。
@@ -4578,7 +4576,6 @@ module Setsunaruby
       @lir_op2           = []
       @lir_bb            = []
       @lir_machine_code  = []
-      @lir_byte_offset   = []
       @jit_bytes         = []
 
       # JIT-3b3: BB0 先頭にメソッドパラメータの初期 reaching def (LoadParam) を arity 個 emit。
@@ -6404,9 +6401,9 @@ module Setsunaruby
       nil
     end
 
-    # アーキ別エンコーダの dispatcher。defined?(JIT) かつ JIT::ARCH_ARM64 == false の
-    # 環境 (= AOT バイナリ + x86_64 ホスト) で x86_64 を選ぶ。それ以外 (CRuby、AOT
-    # arm64、@dump_hir 用) は従来通り arm64 を生成し @lir_machine_code を埋める。
+    # アーキ別エンコーダの dispatcher。defined?(JIT) かつ JIT::ARCH_ARM64 == false
+    # (= AOT バイナリ + x86_64 ホスト) でのみ x86_64 を選ぶ。CRuby や AOT arm64 は
+    # 従来通り arm64 を生成し @lir_machine_code を埋める。
     def pass_encode_native
       if defined?(JIT) && JIT::ARCH_ARM64 == false
         pass_encode_x86_64
@@ -6417,14 +6414,12 @@ module Setsunaruby
     end
 
     # JIT-4c x86_64 (System V AMD64) エンコーダ。arm64 と違って可変長命令なので
-    # @jit_bytes IntArray に 1 byte ずつ push する。pass_encode_arm64 と違い 2 段階
-    # (encode + label fixup) で構成する。複数 BB / call を持つメソッドは encoder 側
-    # の未解決 task と同じく install_jit_for_method 側で弾く。
+    # @jit_bytes IntArray に 1 byte ずつ push する。複数 BB / call を持つメソッドは
+    # label fixup 未実装のため、install_jit_for_method 側で B/B.cond/BL/TBZ を検出
+    # して install をスキップする。
     def pass_encode_x86_64
-      @lir_byte_offset = []
       i = 0
       while i < @lir_kind.length
-        @lir_byte_offset.push(@jit_bytes.length)
         emit_x86_64_insn(i)
         i += 1
       end
@@ -6451,6 +6446,19 @@ module Setsunaruby
       if @method_arities[m_idx] > 8
         @jit_fn_addrs[m_idx] = -1
         return nil
+      end
+      # B / B.cond / BL / TBZ を含む LIR は target 解決が未実装 (= プレースホルダの
+      # offset=0 で emit されたまま)。install すると jmp/call 0x00000000 を踏んで
+      # SIGSEGV になるため、ここで弾いて bytecode 経路に流す。multi-BB / call / guard
+      # サポートが完成したら除去する。
+      j = 0
+      while j < @lir_kind.length
+        k = @lir_kind[j]
+        if k == LirOp::B || k == LirOp::B_EQ || k == LirOp::B_NE || k == LirOp::B_LT || k == LirOp::B_GT || k == LirOp::B_LE || k == LirOp::B_GE || k == LirOp::BL || k == LirOp::TBZ
+          @jit_fn_addrs[m_idx] = -1
+          return nil
+        end
+        j += 1
       end
       bytes = 0
       if JIT::ARCH_ARM64
@@ -6713,6 +6721,7 @@ module Setsunaruby
 
     # x86_64 reg 番号 (ModRM 用)。lower 3 bit が ModRM 内、上位 1 bit が REX.B/R 用。
     X64_RAX = 0
+    X64_RCX = 1
     X64_RDX = 2
     X64_RBX = 3
     X64_RSI = 6
@@ -6723,7 +6732,7 @@ module Setsunaruby
     # SysV AMD64 の引数 slot N (0..5) を x86_64 reg 番号に変換。arity > 6 は
     # install_jit_for_method 側で弾く。
     def x86_64_arg_reg(slot)
-      result = X64_RDI
+      result = 0
       if slot == 0
         result = X64_RDI
       elsif slot == 1
@@ -6731,7 +6740,7 @@ module Setsunaruby
       elsif slot == 2
         result = X64_RDX
       elsif slot == 3
-        result = 1            # RCX
+        result = X64_RCX
       elsif slot == 4
         result = X64_R8
       elsif slot == 5
