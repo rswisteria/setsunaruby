@@ -7,6 +7,15 @@ module Setsunaruby
     MOV_IMM = 0x01     # op0 = dst reg, op1 = 16bit 即値 (MOVZ)
     MOV_REG = 0x02     # op0 = dst reg, op1 = src reg (= ORR Rd, XZR, Rm)
 
+    # JIT-4c x86_64: arch 中立な引数/戻り値 MOV。arm64 と x86_64 で arg/return
+    # register 規約が異なるため汎用 MOV_REG とは別に持つ。arm64 では MOV_REG と
+    # 同じ encode に落ちる。x86_64 (SysV AMD64) では arg slot を RDI/RSI/RDX/RCX/
+    # R8/R9 に、return を RAX にマップする。
+    MOV_FROM_ARG = 0x03   # op0 = dst reg, op1 = arg slot (0..7)
+    MOV_TO_ARG   = 0x04   # op0 = arg slot, op1 = src reg
+    # NOTE: 他の LirOp と異なり op0 が src。dst は暗黙の戻り値レジスタ。
+    MOV_TO_RET   = 0x05   # op0 = src reg, dst は arch ごとに固定の戻り値 reg
+
     ADD  = 0x10        # op0 = dst reg, op1 = lhs reg, op2 = rhs reg
     SUB  = 0x11
     MUL  = 0x12

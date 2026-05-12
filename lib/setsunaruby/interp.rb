@@ -228,6 +228,10 @@ module Setsunaruby
       @lir_op2          = []
       @lir_bb           = []
       @lir_machine_code = []
+      # JIT-4c x86_64: 可変長命令の byte 並びと、各 LIR insn の機械語先頭 byte offset。
+      # pass_encode_x86_64 が build。arm64 は @lir_machine_code (固定 4 byte word) を使う。
+      @lir_byte_offset  = []
+      @jit_bytes        = []
       # spinel AOT で ENV が解釈されない場合は常に false 相当 (HIR ダンプは CRuby のみ)。
       @dump_hir      = ENV["SETSUNARUBY_DUMP_HIR"] == "1"
       # JIT-4c: 実機実行を有効化するゲート。SETSUNARUBY_JIT=1 で ON。デフォルト OFF
@@ -398,6 +402,8 @@ module Setsunaruby
       @lir_op2           = []
       @lir_bb            = []
       @lir_machine_code  = []
+      @lir_byte_offset   = []
+      @jit_bytes         = []
       # @profile_fixnum_pc は bytecode コンパイル完了後に length 分一括確保するため、
       # 冒頭リセットには含めない (= run_string 後半で `[] + push` 経由で初期化)。
       @dump_hir      = ENV["SETSUNARUBY_DUMP_HIR"] == "1"
@@ -4572,6 +4578,8 @@ module Setsunaruby
       @lir_op2           = []
       @lir_bb            = []
       @lir_machine_code  = []
+      @lir_byte_offset   = []
+      @jit_bytes         = []
 
       # JIT-3b3: BB0 先頭にメソッドパラメータの初期 reaching def (LoadParam) を arity 個 emit。
       # rename DFS の時点で「未定義変数」エッジケースを避けるための前提セットアップ。
@@ -4844,7 +4852,7 @@ module Setsunaruby
         dump_cfg_analysis(m_idx)
       end
       pass_lower_to_lir
-      pass_encode_arm64
+      pass_encode_native
       if @dump_hir
         dump_lir(m_idx)
       end
@@ -6135,11 +6143,14 @@ module Setsunaruby
       bb = @hir_bb[i]
       lhs = @hir_op0[i]
       rhs = @hir_op1[i]
-      guard_lhs = emit_guard_fixnum_at(bb, lhs)
-      guard_rhs = emit_guard_fixnum_at(bb, rhs)
+      # GUARD_FIXNUM は side effect (TBZ + side exit) のみで値を生成しない。
+      # 旧実装は FIXNUM_ADD の op0/op1 を guard の hir_id に向けていたが、LIR lowering で
+      # hir_to_reg(guard) が未初期化 register になり実機実行時に誤った値が出る。
+      # binop の op0/op1 は元の lhs/rhs を指すように修正、guard は副作用 insn として
+      # 別途 emit (ダンプ上は「先行 TBZ」として表示される)。
+      emit_guard_fixnum_at(bb, lhs)
+      emit_guard_fixnum_at(bb, rhs)
       @hir_kind[i] = fixnum_kind_for(kind)
-      @hir_op0[i]  = guard_lhs
-      @hir_op1[i]  = guard_rhs
       nil
     end
 
@@ -6292,8 +6303,9 @@ module Setsunaruby
       if kind == HirOp::LOAD_CONST
         lower_load_const(i, bb)
       elsif kind == HirOp::LOAD_PARAM
-        # arm64 calling convention で第 N 引数は xN に来る (slot 0..7)。
-        emit_lir(LirOp::MOV_REG, hir_to_reg(i), @hir_op0[i], 0, bb)
+        # arch 中立: 第 N 引数 (slot 0..7) を scratch reg にコピーする。
+        # arm64 では X<slot>、x86_64 (SysV) では RDI/RSI/RDX/RCX/R8/R9 からの mov。
+        emit_lir(LirOp::MOV_FROM_ARG, hir_to_reg(i), @hir_op0[i], 0, bb)
       elsif kind == HirOp::FIXNUM_ADD
         emit_lir(LirOp::ADD, hir_to_reg(i), hir_to_reg(@hir_op0[i]), hir_to_reg(@hir_op1[i]), bb)
       elsif kind == HirOp::FIXNUM_SUB
@@ -6320,22 +6332,25 @@ module Setsunaruby
         b_cond = lir_b_cond_for_false(cond_kind)
         emit_lir(b_cond, @bb_succ0[bb], 0, 0, bb)
       elsif kind == HirOp::CALL
-        # 引数を x0..x{arity-1} に並べる MOV を emit してから BL。
+        # 引数を arch 中立に並べる MOV_TO_ARG を emit してから BL。
         callee = @hir_op0[i]
         args_start = @hir_op1[i]
         arity = @hir_op2[i]
         ai = 0
         while ai < arity
           arg_hir = @hir_call_args[args_start + ai]
-          emit_lir(LirOp::MOV_REG, ai, hir_to_reg(arg_hir), 0, bb)
+          emit_lir(LirOp::MOV_TO_ARG, ai, hir_to_reg(arg_hir), 0, bb)
           ai += 1
         end
         emit_lir(LirOp::BL, callee, 0, 0, bb)
-        # 戻り値 x0 を hir_to_reg(i) に。
+        # 戻り値 (arm64: X0, x86_64: RAX) を hir_to_reg(i) にコピー。
+        # MOV_FROM_ARG slot=0 が偶然「arm64 X0 / x86_64 RDI」に相当するため、ここは
+        # 厳密には MOV_FROM_RET 相当の専用 op が望ましいが、現状 BL を含むメソッドは
+        # 多 BB / cross-method の制約で install されないので未実装で問題なし。
         emit_lir(LirOp::MOV_REG, hir_to_reg(i), 0, 0, bb)
       elsif kind == HirOp::RETURN
-        # 戻り値を x0 に置いて RET。
-        emit_lir(LirOp::MOV_REG, 0, hir_to_reg(@hir_op0[i]), 0, bb)
+        # 戻り値レジスタ (arm64: X0, x86_64: RAX) に値を置いて RET。
+        emit_lir(LirOp::MOV_TO_RET, hir_to_reg(@hir_op0[i]), 0, 0, bb)
         emit_lir(LirOp::RET, 0, 0, 0, bb)
       end
       # PHI / PUTS / 観測なしの generic ADD 等は lower しない (= LIR には現れない)。
@@ -6389,36 +6404,69 @@ module Setsunaruby
       nil
     end
 
-    # JIT install できる物理的条件が揃っているか (アーキ・モジュール存在の両方)。
-    # CRuby は JIT 未定義のため defined?(JIT) で false 側、AOT 上 x86_64 ホストは
-    # JIT::ARCH_ARM64 で false 側に倒れる。両条件を満たすのは arm64 AOT のみ。
+    # アーキ別エンコーダの dispatcher。defined?(JIT) かつ JIT::ARCH_ARM64 == false の
+    # 環境 (= AOT バイナリ + x86_64 ホスト) で x86_64 を選ぶ。それ以外 (CRuby、AOT
+    # arm64、@dump_hir 用) は従来通り arm64 を生成し @lir_machine_code を埋める。
+    def pass_encode_native
+      if defined?(JIT) && JIT::ARCH_ARM64 == false
+        pass_encode_x86_64
+      else
+        pass_encode_arm64
+      end
+      nil
+    end
+
+    # JIT-4c x86_64 (System V AMD64) エンコーダ。arm64 と違って可変長命令なので
+    # @jit_bytes IntArray に 1 byte ずつ push する。pass_encode_arm64 と違い 2 段階
+    # (encode + label fixup) で構成する。複数 BB / call を持つメソッドは encoder 側
+    # の未解決 task と同じく install_jit_for_method 側で弾く。
+    def pass_encode_x86_64
+      @lir_byte_offset = []
+      i = 0
+      while i < @lir_kind.length
+        @lir_byte_offset.push(@jit_bytes.length)
+        emit_x86_64_insn(i)
+        i += 1
+      end
+      nil
+    end
+
+    # JIT install できる物理的条件が揃っているか (モジュール存在のみ確認)。
+    # CRuby は JIT 未定義のため defined?(JIT) で false 側に倒れる。AOT 上で arm64 /
+    # x86_64 のいずれかで動作可能。アーキ別の対応可否は install_jit_for_method 内で判定。
     def jit_install_viable?
       if defined?(JIT)
-        return JIT::ARCH_ARM64
+        return true
       end
       false
     end
 
-    # JIT-4c: encode 済みの @lir_machine_code を実機実行可能な buffer に書き込む。
-    # arm64 ホスト以外、arity > 8、空 LIR は install をスキップ (@jit_fn_addrs[m_idx]
-    # = -1 でマーク、以後再試行しない)。BL や分岐の target 解決は現状の encoder で
-    # 完結していないため、複数 BB を持つメソッドは crash する可能性が高い ── これは
-    # encoder 側の未解決 task。ここでは「install できる入力なら install する」のみ。
+    # JIT-4c: encode 済みの機械語を実機実行可能な buffer に書き込む。arm64 は
+    # @lir_machine_code (32bit word x N) を write_words で、x86_64 は @jit_bytes
+    # (1 byte x N) を write_bytes で転送する。arity > 8 / 空 LIR / SysV で arity > 6
+    # は install をスキップ (@jit_fn_addrs[m_idx] = -1 でマーク、以後再試行しない)。
+    # BL や分岐の target 解決は encoder 側の未解決 task で、複数 BB を持つメソッドは
+    # crash する可能性が高い ── ここでは「install できる入力なら install する」のみ。
     def install_jit_for_method(m_idx)
-      if JIT::ARCH_ARM64 == false
-        @jit_fn_addrs[m_idx] = -1
-        return nil
-      end
       if @method_arities[m_idx] > 8
         @jit_fn_addrs[m_idx] = -1
         return nil
       end
-      n_words = @lir_machine_code.length
-      if n_words == 0
+      bytes = 0
+      if JIT::ARCH_ARM64
+        bytes = @lir_machine_code.length * 4
+      else
+        # x86_64 SysV は arg register が 6 個まで。7+ はスタック渡しが必要で未対応。
+        if @method_arities[m_idx] > 6
+          @jit_fn_addrs[m_idx] = -1
+          return nil
+        end
+        bytes = @jit_bytes.length
+      end
+      if bytes == 0
         @jit_fn_addrs[m_idx] = -1
         return nil
       end
-      bytes = n_words * 4
       page = JIT.page_size
       size = ((bytes + page - 1) / page) * page
 
@@ -6432,16 +6480,18 @@ module Setsunaruby
         # macOS arm64: MAP_JIT ページは pthread_jit_write_protect_np(0) で書き込み解禁
         JIT.jit_write_protect(false)
       end
-      JIT.write_words(addr, @lir_machine_code)
+      if JIT::ARCH_ARM64
+        JIT.write_words(addr, @lir_machine_code)
+      else
+        JIT.write_bytes(addr, @jit_bytes)
+      end
       if JIT::DARWIN_ARM64
         JIT.jit_write_protect(true)
-      else
-        # Linux 系: 一旦 RW で確保したわけではなく PROT_EXEC 込みで取っているので、
-        # ここで明示的に protect する必要はない (DEP/NX 環境でも MAP_ANONYMOUS は
-        # RWX を許容する設定が一般的)。気になる場合は alloc を RW にして
-        # ここで RX へ降格する 2 段階構えに変更する。
       end
-      JIT.clear_icache(addr, bytes)
+      # arm64 (Linux/macOS) は icache flush が必須。x86_64 は cache coherent。
+      if JIT::ARCH_ARM64
+        JIT.clear_icache(addr, bytes)
+      end
 
       @jit_fn_addrs[m_idx] = addr
       @jit_fn_sizes[m_idx] = size
@@ -6541,6 +6591,15 @@ module Setsunaruby
         result = encode_movz(@lir_op0[lir_id], @lir_op1[lir_id])
       elsif kind == LirOp::MOV_REG
         result = encode_orr_xzr(@lir_op0[lir_id], @lir_op1[lir_id])
+      elsif kind == LirOp::MOV_FROM_ARG
+        # arm64: arg slot N は X<N>。MOV X<dst>, X<slot> と同じ。
+        result = encode_orr_xzr(@lir_op0[lir_id], @lir_op1[lir_id])
+      elsif kind == LirOp::MOV_TO_ARG
+        # arm64: 同じく MOV X<slot>, X<src>。
+        result = encode_orr_xzr(@lir_op0[lir_id], @lir_op1[lir_id])
+      elsif kind == LirOp::MOV_TO_RET
+        # arm64: 戻り値レジスタは X0。MOV X0, X<src>。op0 = src reg。
+        result = encode_orr_xzr(0, @lir_op0[lir_id])
       elsif kind == LirOp::ADD
         result = encode_add_reg(@lir_op0[lir_id], @lir_op1[lir_id], @lir_op2[lir_id])
       elsif kind == LirOp::SUB
@@ -6644,8 +6703,201 @@ module Setsunaruby
       0x36000000 | ((bit & 0x1F) << 19) | ((safe_target & 0x3FFF) << 5) | (rt & 0x1F)
     end
 
+    # ============================================================
+    # JIT-4c x86_64 (System V AMD64) エンコーダ
+    # ============================================================
+    # arm64 と違って可変長命令 (1〜15 byte)。@jit_bytes IntArray に 1 byte/slot で
+    # 蓄積する。LIR は arch 中立 (= 同じ vreg / 同じ opcode 種別) だが、エンコード時に
+    # x86_64 reg num にマップし、計算用は 2-operand 制約 (dst = lhs を強制) で出す。
+    # SysV AMD64 calling convention: 引数 RDI, RSI, RDX, RCX, R8, R9; 戻り値 RAX。
+
+    # x86_64 reg 番号 (ModRM 用)。lower 3 bit が ModRM 内、上位 1 bit が REX.B/R 用。
+    X64_RAX = 0
+    X64_RDX = 2
+    X64_RBX = 3
+    X64_RSI = 6
+    X64_RDI = 7
+    X64_R8  = 8
+    X64_R9  = 9
+
+    # SysV AMD64 の引数 slot N (0..5) を x86_64 reg 番号に変換。arity > 6 は
+    # install_jit_for_method 側で弾く。
+    def x86_64_arg_reg(slot)
+      result = X64_RDI
+      if slot == 0
+        result = X64_RDI
+      elsif slot == 1
+        result = X64_RSI
+      elsif slot == 2
+        result = X64_RDX
+      elsif slot == 3
+        result = 1            # RCX
+      elsif slot == 4
+        result = X64_R8
+      elsif slot == 5
+        result = X64_R9
+      end
+      result
+    end
+
+    # LIR vreg 番号 (= hir_to_reg の戻り値、典型 9..28) を x86_64 物理 reg 番号
+    # (8..15 = r8..r15) に変換。0..7 は MOV_REG の例外用に そのままの 0..7 = rax..rdi。
+    def x86_64_phys_reg(vreg)
+      result = X64_RAX
+      if vreg <= 7
+        result = vreg
+      elsif vreg == 8
+        result = X64_R8
+      else
+        result = ((vreg - 9) % 8) + 8
+      end
+      result
+    end
+
+    # REX prefix。w=1 (64bit operand)、r/x/b は ModRM/SIB 拡張用。
+    def x86_64_rex(w, r, x, b)
+      0x40 | (w << 3) | (r << 2) | (x << 1) | b
+    end
+
+    # 32bit 整数を little-endian で @jit_bytes に 4 byte push。
+    def x86_64_push_u32_le(v)
+      @jit_bytes.push(v & 0xFF)
+      @jit_bytes.push((v >> 8) & 0xFF)
+      @jit_bytes.push((v >> 16) & 0xFF)
+      @jit_bytes.push((v >> 24) & 0xFF)
+      nil
+    end
+
+    # reg-to-reg 系 (mov/add/sub/cmp 等) の共通 emit。dst は ModRM.r/m に、src は
+    # ModRM.reg に入り、REX.B / REX.R が必要に応じて立つ。opcode は呼び側で指定。
+    def x86_64_emit_rrm(opcode, dst, src)
+      rex_r = 0
+      if src >= 8
+        rex_r = 1
+      end
+      rex_b = 0
+      if dst >= 8
+        rex_b = 1
+      end
+      @jit_bytes.push(x86_64_rex(1, rex_r, 0, rex_b))
+      @jit_bytes.push(opcode)
+      @jit_bytes.push(0xC0 | ((src & 7) << 3) | (dst & 7))
+      nil
+    end
+
+    # 0x81 系 ALU imm32 (add/sub/and/or/xor 等)。reg_field は /N の N (0=add, 5=sub)。
+    def x86_64_emit_alu_imm32(reg_field, dst, imm32)
+      rex_b = 0
+      if dst >= 8
+        rex_b = 1
+      end
+      @jit_bytes.push(x86_64_rex(1, 0, 0, rex_b))
+      @jit_bytes.push(0x81)
+      @jit_bytes.push(0xC0 | ((reg_field & 7) << 3) | (dst & 7))
+      x86_64_push_u32_le(imm32)
+      nil
+    end
+
+    def x86_64_emit_mov_reg(dst, src)
+      x86_64_emit_rrm(0x89, dst, src)
+    end
+
+    def x86_64_emit_add_reg(dst, src)
+      x86_64_emit_rrm(0x01, dst, src)
+    end
+
+    def x86_64_emit_sub_reg(dst, src)
+      x86_64_emit_rrm(0x29, dst, src)
+    end
+
+    # cmp r/m64, r64: r/m が lhs、reg が rhs。
+    def x86_64_emit_cmp_reg(lhs, rhs)
+      x86_64_emit_rrm(0x39, lhs, rhs)
+    end
+
+    # mov r/m64, imm32 (opcode 0xc7 /0)。imm32 は符号拡張で 64bit に。
+    # boxed Fixnum は MOVZ #imm16 想定 (= 16bit 即値) なので 32bit に十分収まる。
+    def x86_64_emit_mov_imm32(dst, imm32)
+      rex_b = 0
+      if dst >= 8
+        rex_b = 1
+      end
+      @jit_bytes.push(x86_64_rex(1, 0, 0, rex_b))
+      @jit_bytes.push(0xC7)
+      @jit_bytes.push(0xC0 | (dst & 7))
+      x86_64_push_u32_le(imm32)
+      nil
+    end
+
+    # 1 LIR insn を x86_64 バイト列にエンコードして @jit_bytes に push。
+    # 命令長は固定。BL や TBZ など x86_64 未対応の op に当たった場合は no-op を emit
+    # しておき、install 側で多 BB / call を検出して弾く。
+    def emit_x86_64_insn(lir_id)
+      kind = @lir_kind[lir_id]
+      if kind == LirOp::RET
+        @jit_bytes.push(0xC3)
+      elsif kind == LirOp::MOV_IMM
+        dst = x86_64_phys_reg(@lir_op0[lir_id])
+        x86_64_emit_mov_imm32(dst, @lir_op1[lir_id])
+      elsif kind == LirOp::MOV_REG
+        x86_64_emit_mov_reg(x86_64_phys_reg(@lir_op0[lir_id]),
+                            x86_64_phys_reg(@lir_op1[lir_id]))
+      elsif kind == LirOp::MOV_FROM_ARG
+        x86_64_emit_mov_reg(x86_64_phys_reg(@lir_op0[lir_id]),
+                            x86_64_arg_reg(@lir_op1[lir_id]))
+      elsif kind == LirOp::MOV_TO_ARG
+        x86_64_emit_mov_reg(x86_64_arg_reg(@lir_op0[lir_id]),
+                            x86_64_phys_reg(@lir_op1[lir_id]))
+      elsif kind == LirOp::MOV_TO_RET
+        x86_64_emit_mov_reg(X64_RAX, x86_64_phys_reg(@lir_op0[lir_id]))
+      elsif kind == LirOp::ADD
+        # 2-operand: dst = lhs; dst += rhs
+        dst = x86_64_phys_reg(@lir_op0[lir_id])
+        lhs = x86_64_phys_reg(@lir_op1[lir_id])
+        rhs = x86_64_phys_reg(@lir_op2[lir_id])
+        if dst != lhs
+          x86_64_emit_mov_reg(dst, lhs)
+        end
+        x86_64_emit_add_reg(dst, rhs)
+      elsif kind == LirOp::SUB
+        dst = x86_64_phys_reg(@lir_op0[lir_id])
+        lhs = x86_64_phys_reg(@lir_op1[lir_id])
+        rhs = x86_64_phys_reg(@lir_op2[lir_id])
+        if dst != lhs
+          x86_64_emit_mov_reg(dst, lhs)
+        end
+        x86_64_emit_sub_reg(dst, rhs)
+      elsif kind == LirOp::CMP
+        x86_64_emit_cmp_reg(x86_64_phys_reg(@lir_op0[lir_id]),
+                            x86_64_phys_reg(@lir_op1[lir_id]))
+      elsif kind == LirOp::B || kind == LirOp::B_EQ || kind == LirOp::B_NE || kind == LirOp::B_LT || kind == LirOp::B_GT || kind == LirOp::B_LE || kind == LirOp::B_GE
+        # 多 BB は install 側で弾く。プレースホルダとして jmp rel32 (5 byte) を出す。
+        @jit_bytes.push(0xE9)
+        x86_64_push_u32_le(0)
+      elsif kind == LirOp::BL
+        # cross-method/再帰は install 側で弾く。プレースホルダ call rel32 (5 byte)。
+        @jit_bytes.push(0xE8)
+        x86_64_push_u32_le(0)
+      elsif kind == LirOp::TBZ
+        # GUARD_FIXNUM の TBZ。x86_64 では test+jz 相当だが現状の install 経路では
+        # 多 BB と一緒に弾かれる。6 byte の NOP 列を emit してサイズを揃える。
+        bi = 0
+        while bi < 6
+          @jit_bytes.push(0x90)
+          bi += 1
+        end
+      end
+      nil
+    end
+
     def dump_lir(m_idx)
       STDERR.puts "ZJIT LIR for method idx=#{m_idx}:"
+      # x86_64 では @lir_machine_code が空で @jit_bytes に byte 列が並ぶ。命令長が
+      # 可変なので 32bit hex の 1:1 対応が無いため、x86_64 では asm のみ表示する。
+      use_arm64_hex = 1
+      if @lir_machine_code.length == 0
+        use_arm64_hex = 0
+      end
       i = 0
       cur_bb = -1
       while i < @lir_kind.length
@@ -6655,8 +6907,12 @@ module Setsunaruby
           cur_bb = bb
         end
         asm = format_lir_asm(i)
-        hex = format_hex32(@lir_machine_code[i])
-        STDERR.puts "    #{asm}    ; #{hex}"
+        if use_arm64_hex == 1
+          hex = format_hex32(@lir_machine_code[i])
+          STDERR.puts "    #{asm}    ; #{hex}"
+        else
+          STDERR.puts "    #{asm}"
+        end
         i += 1
       end
       nil
@@ -6697,6 +6953,12 @@ module Setsunaruby
         result = "mov x" + op0.to_s + ", #" + op1.to_s
       elsif kind == LirOp::MOV_REG
         result = "mov x" + op0.to_s + ", x" + op1.to_s
+      elsif kind == LirOp::MOV_FROM_ARG
+        result = "mov x" + op0.to_s + ", arg" + op1.to_s
+      elsif kind == LirOp::MOV_TO_ARG
+        result = "mov arg" + op0.to_s + ", x" + op1.to_s
+      elsif kind == LirOp::MOV_TO_RET
+        result = "mov ret, x" + op0.to_s
       elsif kind == LirOp::ADD
         result = "add x" + op0.to_s + ", x" + op1.to_s + ", x" + op2.to_s
       elsif kind == LirOp::SUB

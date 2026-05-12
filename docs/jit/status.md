@@ -36,9 +36,11 @@ JIT は **案 A (機械語ダンプまで) で完成**、**案 C (実機実行) 
   `encode_b_cond` / `encode_bl` が BB id / method idx を imm26 / imm19 に
   リテラル埋めしているだけで、PC 相対 offset への解決が未実装。単一 BB
   (= 制御フロー無し) でかつ method 呼出無しのメソッドのみ安全。
-- **arm64 ホスト以外では install しない**: x86_64 ホストでは setsunaruby JIT
-  が x86_64 emitter を持たないため、SETSUNARUBY_JIT=1 を設定しても install は
-  skip され、インタプリタで完走する。
+- **x86_64 ホスト**: encoder は実装済 (`pass_encode_x86_64`)。`install_jit_for_method`
+  も write_bytes 経由でディスパッチする。SysV AMD64 で arity > 6 は弾く (arg
+  register が 6 個まで)。実機実行は x86_64 Linux 環境で確認できていないため
+  「encode は正しい byte 列、実機で動くかは未検証」状態。byte 列の単体検証は
+  `test/test_jit_x86_64.rb` で確認 (`make test-jit-x86-64`)。
 - **CRuby + SETSUNARUBY_JIT=1 は自動 OFF**: `defined?(JIT)` が CRuby では nil
   を返すので、shim 無しでも自動的にインタプリタ実行になる。
 
@@ -57,7 +59,8 @@ target がパッチ適用済みかを確認する。
 | 解放 | `sp_jit_free(addr, size)` | `JIT.free(addr, size)` |
 | W^X 切替 (Darwin arm64) | `sp_jit_write_protect(bool)` | `JIT.jit_write_protect(bool)` |
 | 1 word 書き込み | `sp_jit_write_u32(addr, off, v)` | `JIT.write_u32(addr, off, v)` |
-| 一括書き込み | `sp_jit_write_words(addr, ia)` | `JIT.write_words(addr, int_array)` |
+| 一括 word 書き込み (arm64) | `sp_jit_write_words(addr, ia)` | `JIT.write_words(addr, int_array)` |
+| 一括 byte 書き込み (x86_64) | `sp_jit_write_bytes(addr, ia)` | `JIT.write_bytes(addr, int_array)` |
 | icache flush | `sp_jit_clear_icache(addr, size)` | `JIT.clear_icache(addr, size)` |
 | 関数ポインタ呼び | `sp_jit_call0..call8(addr, ...)` | `JIT.call0..call8(addr, ...)` |
 | ページサイズ | `sp_jit_page_size()` | `JIT.page_size` |
@@ -71,7 +74,7 @@ target がパッチ適用済みかを確認する。
 | B: dlopen 経由 | — | 採用せず (`spinel-jit-primitives.patch` で直接 mmap する案 C に進んだため) |
 | C: 実機実行 (1 BB) | ✅ 経路完成 | mmap + W^X + 関数ポインタ呼び + icache flush 全て実装 |
 | C': 実機実行 (多 BB / call) | ❌ 未着手 | encode_b / b_cond / bl の PC-relative 解決が必要 |
-| C'': x86_64 emitter | ❌ 未着手 | x86_64 ホスト上でも実機実行できるようにする |
+| C'': x86_64 emitter | ✅ encoder のみ | `pass_encode_x86_64` で SysV AMD64 の byte 列生成。byte 列単体テストで検証 (`make test-jit-x86-64`)。x86_64 Linux での実機実行確認は環境待ち |
 
 ## CRuby と AOT での挙動差
 
@@ -85,7 +88,7 @@ AOT でも動作している** (test_aot.rb で副作用がないことは確認
 | 環境 | `SETSUNARUBY_JIT=1` の挙動 |
 |---|---|
 | CRuby (どんなホストでも) | `defined?(JIT)` が nil → 自動 OFF、インタプリタ実行 |
-| AOT バイナリ + x86_64 ホスト | `JIT::ARCH_ARM64 == false` で install skip、インタプリタ実行 |
+| AOT バイナリ + x86_64 ホスト | x86_64 byte 列を生成、`JIT.write_bytes` で install 試行 (実機検証は未) |
 | AOT バイナリ + arm64 ホスト (Linux/Darwin) | install 試行、成功すれば JIT 経由実行 |
 
 ## なぜ「個人フォーク」方針を採るか
