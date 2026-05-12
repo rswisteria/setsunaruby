@@ -58,6 +58,11 @@ module Setsunaruby
     ARRAY_GET = 0x45
     ARRAY_SET = 0x46
     ARRAY_LEN = 0x47
+    # Stage 4d: Array#pop / Array#last の builtin method 本体で使う。スタック top の
+    # Array (heap obj) を pop し、末尾要素を push する (空配列なら nil)。
+    # ARRAY_POP は @heap_lens を 1 減らす破壊操作、ARRAY_LAST は読み取り専用。
+    ARRAY_POP  = 0x5C
+    ARRAY_LAST = 0x5D
 
     # Stage 3c.2: 一般ブロック付きメソッド呼び出しと yield。
     # CALL_WITH_BLOCK は CALL と同じだが、メソッドフレームに block_pc と block_arity を

@@ -35,8 +35,9 @@ heap slot が単調に積み上がっていた。短命オブジェクトを大�
 線形に膨張し、長時間実行・自己ホストで実用にならなかった。
 
 更に `@str_pool` と `@heap_arr_pool` は relocate-and-grow を採用しており
-(`heap_str_concat` / `heap_array_push_bang` の旧領域は abandon)、slot を回収しても
-pool バイトは積もり続ける。GC-2 はこの pool 側の積み上がりを解消する。
+(`heap_str_concat` / `heap_array_push_bang` の旧領域は abandon。Stage 4d の
+`heap_array_pop_bang` も `@heap_lens` を 1 減らすだけで pool 末尾は abandon)、
+slot を回収しても pool バイトは積もり続ける。GC-2 はこの pool 側の積み上がりを解消する。
 
 ## アルゴリズム
 

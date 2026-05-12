@@ -356,6 +356,21 @@ assert_output(File.read(File.expand_path('../examples/loop.rb', __dir__)),
 assert_fails("break\n", "LOOP: break outside loop")
 assert_fails("next\n",  "LOOP: next outside loop")
 
+# ---- Stage 4d: Array#pop / Array#last ----
+assert_output("a = [1, 2, 3]\nputs a.pop\nputs a.length\n",
+              "3\n2\n", "POP: 末尾を返して長さ減")
+assert_output("a = [1, 2, 3]\nputs a.last\nputs a.length\n",
+              "3\n3\n", "LAST: 末尾を返すが長さ不変")
+assert_output("a = []\nputs a.pop\nputs a.last\n", "\n\n", "POP/LAST: 空配列は nil")
+assert_output("a = []\na << 1\na << 2\nputs a.pop + a.pop\n",
+              "3\n", "STACK: << と pop で LIFO")
+assert_output(File.read(File.expand_path('../examples/array_pop.rb', __dir__)),
+              "4\n3\n2\n2\n2\n2\n1\n1\n0\n\n\n0\n30\n20\n10\n0\n",
+              "examples/array_pop.rb")
+assert_fails("puts 1.pop\n",       "POP: Integer#pop は TypeError")
+assert_fails("puts \"x\".pop\n",   "POP: String#pop は TypeError")
+assert_fails("puts 1.last\n",      "LAST: Integer#last は TypeError")
+
 # ---- Stage GC-1: GC 動作下での examples 不変 ----
 assert_output(File.read(File.expand_path('../examples/gc.rb', __dir__)),
               "done: xy\nxy\nxy\n",

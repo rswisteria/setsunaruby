@@ -236,6 +236,24 @@ ZeroDivisionError。
 - Stack: `[..., arr]` → `[..., box_int(len)]`
 - Stage: 3b
 
+### `ARRAY_POP` (0x5C)
+
+- Operand: なし
+- Stack: `[..., arr]` → `[..., last_or_nil]`
+- Stage: 4d
+- `@heap_lens[arr_idx]` を 1 減らし、末尾要素を push する (空配列なら NIL_VAL)。
+  `@heap_arr_pool` の中身は触らない (relocate しない abandoned 領域)。次の GC pool 圧縮で消える。
+- builtin method `Array#pop` の本体専用 (LOAD_SELF; ARRAY_POP; RETURN)。
+  ユーザコードからは直接 emit されないため JIT-2 HIR builder の dispatch にも乗らない。
+
+### `ARRAY_LAST` (0x5D)
+
+- Operand: なし
+- Stack: `[..., arr]` → `[..., last_or_nil]`
+- Stage: 4d
+- 配列を変更せず末尾要素を返す (空配列なら NIL_VAL)。
+- builtin method `Array#last` の本体専用 (LOAD_SELF; ARRAY_LAST; RETURN)。
+
 ---
 
 ## ブロックと yield (Stage 3c.2)

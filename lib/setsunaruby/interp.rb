@@ -98,7 +98,9 @@ module Setsunaruby
     PREFIX_EACH_OFFSET     = PREFIX_INIT_OFFSET + 10                          # "each" (Stage 3d.5)
     PREFIX_MAP_OFFSET      = PREFIX_EACH_OFFSET + 4                           # "map"
     PREFIX_TIMES_OFFSET    = PREFIX_MAP_OFFSET + 3                            # "times"
-    PREFIX_TOTAL_LEN       = PREFIX_TIMES_OFFSET + 5
+    PREFIX_POP_OFFSET      = PREFIX_TIMES_OFFSET + 5                          # "pop" (Stage 4d)
+    PREFIX_LAST_OFFSET     = PREFIX_POP_OFFSET + 3                            # "last" (Stage 4d)
+    PREFIX_TOTAL_LEN       = PREFIX_LAST_OFFSET + 4
 
     # キーワードバイト列。spinel の sp_String / const char* 不整合を避けるため
     # 文字列ではなくバイト配列で直接比較する。
@@ -126,6 +128,8 @@ module Setsunaruby
     KW_EACH_BYTES   = [101, 97, 99, 104].freeze               # "each"
     KW_TIMES_BYTES  = [116, 105, 109, 101, 115].freeze        # "times"
     KW_MAP_BYTES    = [109, 97, 112].freeze                   # "map" (Stage 3c.3)
+    KW_POP_BYTES    = [112, 111, 112].freeze                  # "pop" (Stage 4d)
+    KW_LAST_BYTES   = [108, 97, 115, 116].freeze              # "last" (Stage 4d)
     # Stage 3c.3: block_given? は識別子として lex され、compile 時に名前判定する。
     KW_BLOCK_GIVEN_BYTES = [98, 108, 111, 99, 107, 95, 103, 105, 118, 101, 110, 63].freeze   # "block_given?"
     # Stage 3e: 例外処理キーワード。
@@ -2584,6 +2588,8 @@ module Setsunaruby
       append_bytes(KW_EACH_BYTES)
       append_bytes(KW_MAP_BYTES)
       append_bytes(KW_TIMES_BYTES)
+      append_bytes(KW_POP_BYTES)
+      append_bytes(KW_LAST_BYTES)
       src_bytes = src.bytes
       i = 0
       while i < src_bytes.length
@@ -2655,6 +2661,13 @@ module Setsunaruby
       register_builtin_method_array_map(map_packed)
       register_builtin_method_integer_times(times_packed)
 
+      # Stage 4d: Array#pop / Array#last。ARRAY_POP / ARRAY_LAST opcode は builtin method
+      # 本体専用でユーザコードからは emit されない (= JIT-2 HIR builder の dispatch にも乗らない)。
+      pop_packed  = pack_prefix_name(PREFIX_POP_OFFSET,  KW_POP_BYTES.length)
+      last_packed = pack_prefix_name(PREFIX_LAST_OFFSET, KW_LAST_BYTES.length)
+      register_builtin_method_array_pop(pop_packed)
+      register_builtin_method_array_last(last_packed)
+
       @cur_class = saved_class
       patch_jump(skip, @bytecode.length)
       nil
@@ -2670,6 +2683,28 @@ module Setsunaruby
       m_idx = declare_method(name_packed, method_pc, 0)
       @bytecode.push(Op::LOAD_SELF)
       @bytecode.push(Op::ARRAY_LEN)
+      @bytecode.push(Op::RETURN)
+      finalize_builtin_method(m_idx, BUILTIN_CLASS_ARRAY, 0)
+      nil
+    end
+
+    def register_builtin_method_array_pop(name_packed)
+      @cur_class = BUILTIN_CLASS_ARRAY
+      method_pc = @bytecode.length
+      m_idx = declare_method(name_packed, method_pc, 0)
+      @bytecode.push(Op::LOAD_SELF)
+      @bytecode.push(Op::ARRAY_POP)
+      @bytecode.push(Op::RETURN)
+      finalize_builtin_method(m_idx, BUILTIN_CLASS_ARRAY, 0)
+      nil
+    end
+
+    def register_builtin_method_array_last(name_packed)
+      @cur_class = BUILTIN_CLASS_ARRAY
+      method_pc = @bytecode.length
+      m_idx = declare_method(name_packed, method_pc, 0)
+      @bytecode.push(Op::LOAD_SELF)
+      @bytecode.push(Op::ARRAY_LAST)
       @bytecode.push(Op::RETURN)
       finalize_builtin_method(m_idx, BUILTIN_CLASS_ARRAY, 0)
       nil
@@ -3310,6 +3345,10 @@ module Setsunaruby
           exec_array_set
         elsif op == Op::ARRAY_LEN
           exec_array_len
+        elsif op == Op::ARRAY_POP
+          exec_array_pop
+        elsif op == Op::ARRAY_LAST
+          exec_array_last
         elsif op == Op::PUTS
           v = @stack.pop
           # Ruby の puts は配列の各要素を別行で出力 (空配列なら何も出力しない)。
@@ -3929,6 +3968,31 @@ module Setsunaruby
       @heap_lens[unbox_heap(arr_id)]
     end
 
+    # Stage 4d: `a.pop`。空配列なら nil、それ以外は @heap_lens を 1 減らして末尾要素を返す。
+    # @heap_arr_pool の中身は触らない (relocate しない)。これは heap_array_push_bang と対称で、
+    # 次の GC pool 圧縮で abandoned 領域として回収される。共有参照に変更が反映される
+    # Ruby 互換セマンティクス。
+    def heap_array_pop_bang(arr_id)
+      arr_idx = unbox_heap(arr_id)
+      l = @heap_lens[arr_idx]
+      if l == 0
+        return ObjectVal::NIL_VAL
+      end
+      val = @heap_arr_pool[@heap_starts[arr_idx] + l - 1]
+      @heap_lens[arr_idx] = l - 1
+      val
+    end
+
+    # Stage 4d: `a.last`。空配列なら nil、それ以外は末尾要素を返す (破壊しない)。
+    def heap_array_last(arr_id)
+      arr_idx = unbox_heap(arr_id)
+      l = @heap_lens[arr_idx]
+      if l == 0
+        return ObjectVal::NIL_VAL
+      end
+      @heap_arr_pool[@heap_starts[arr_idx] + l - 1]
+    end
+
     # @heap_arr_pool[src..src+len-1] を末尾に append する追記専用コピー。
     # str_pool_copy の配列版 (両者とも追記専用 IntArray アリーナ)。
     def arr_pool_copy(src, len)
@@ -4134,6 +4198,24 @@ module Setsunaruby
         raise "TypeError: .length の receiver は Array 必須 (Stage 3b)"
       end
       @stack.push(box_int(heap_array_len(arr)))
+      nil
+    end
+
+    def exec_array_pop
+      arr = @stack.pop
+      if !heap_array?(arr)
+        raise "TypeError: .pop の receiver は Array 必須 (Stage 4d)"
+      end
+      @stack.push(heap_array_pop_bang(arr))
+      nil
+    end
+
+    def exec_array_last
+      arr = @stack.pop
+      if !heap_array?(arr)
+        raise "TypeError: .last の receiver は Array 必須 (Stage 4d)"
+      end
+      @stack.push(heap_array_last(arr))
       nil
     end
 
