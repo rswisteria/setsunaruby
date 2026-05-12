@@ -64,6 +64,15 @@ module Setsunaruby
     ARRAY_POP  = 0x5C
     ARRAY_LAST = 0x5D
 
+    # Stage 4e: String#bytes / Integer#chr / String#chr の builtin method 本体で使う。
+    # いずれも receiver を 1 つ pop し新しい heap obj を push する (= alloc を伴う)。
+    # STRING_TO_BYTES: 各 byte を box_int した heap Array を返す
+    # INT_CHR:         Fixnum (0..255) → 1 文字 heap String。範囲外で raise
+    # STR_CHR:         heap String の最初のバイト → 1 文字 heap String。空文字列で raise
+    STRING_TO_BYTES = 0x5E
+    INT_CHR         = 0x5F
+    STR_CHR         = 0x60
+
     # Stage 3c.2: 一般ブロック付きメソッド呼び出しと yield。
     # CALL_WITH_BLOCK は CALL と同じだが、メソッドフレームに block_pc と block_arity を
     # 関連付ける。block_arity は yield argc とのランタイム不一致を検出するため。

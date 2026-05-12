@@ -254,6 +254,31 @@ ZeroDivisionError。
 - 配列を変更せず末尾要素を返す (空配列なら NIL_VAL)。
 - builtin method `Array#last` の本体専用 (LOAD_SELF; ARRAY_LAST; RETURN)。
 
+### `STRING_TO_BYTES` (0x5E)
+
+- Operand: なし
+- Stack: `[..., str]` → `[..., arr]`
+- Stage: 4e
+- `@str_pool[start..start+len-1]` の各バイトを `box_int` して新規 Array slot に格納し push する。
+- builtin method `String#bytes` の本体専用 (LOAD_SELF; STRING_TO_BYTES; RETURN)。
+- pool 操作前に `gc_check_threshold` を呼ぶため、receiver は事前に `@stack` に退避してから GC を起動し、復帰後に `@heap_starts` を再取得する (`heap_str_concat` と同じパターン)。
+
+### `INT_CHR` (0x5F)
+
+- Operand: なし
+- Stack: `[..., n]` → `[..., 1-char-str]`
+- Stage: 4e
+- Fixnum 即値を 0..255 の範囲チェックの後、`@str_pool` に 1 バイト push して新規 String slot を返す。範囲外は `RangeError` 相当の raise。
+- builtin method `Integer#chr` の本体専用 (LOAD_SELF; INT_CHR; RETURN)。receiver は即値なので退避不要。
+
+### `STR_CHR` (0x60)
+
+- Operand: なし
+- Stack: `[..., str]` → `[..., 1-char-str]`
+- Stage: 4e
+- 受信者 String の最初のバイトを 1 文字 String として新規確保。空文字列は `ArgumentError` 相当の raise。
+- builtin method `String#chr` の本体専用 (LOAD_SELF; STR_CHR; RETURN)。pool 操作前の GC 起動に備え receiver を退避する。
+
 ---
 
 ## ブロックと yield (Stage 3c.2)
@@ -321,11 +346,15 @@ ZeroDivisionError。
 実行詳細:
 
 1. `recv` をスタック (top - argc) 位置から取得
-2. `class_idx = class_of_value(recv)`
-3. `m_idx = find_method_in_class(class_idx, name_packed)` (見つからなければ
+2. **Stage 4e**: `name_packed` が prefix 内の `"nil?"` (`PREFIX_NIL_Q_OFFSET` / `KW_NIL_Q_BYTES.length`)
+   と `bytes_eq` で一致するなら、class 解決を skip して `recv == NIL_VAL` を `box_bool` で push し
+   即 return する (`Object#nil?` の特殊先取り)。class_of_value が -1 を返す値
+   (nil / true / false / Symbol) でも nil? を呼べるようにするための専用パス
+3. `class_idx = class_of_value(recv)`
+4. `m_idx = find_method_in_class(class_idx, name_packed)` (見つからなければ
    parent chain を walk、それでも無ければ NoMethodError)
-4. 通常の CALL と同じ frame setup + `@cur_self = recv`
-5. recv をスタックから除去 (call フレームに移った)
+5. 通常の CALL と同じ frame setup + `@cur_self = recv`
+6. recv をスタックから除去 (call フレームに移った)
 
 ### `LOAD_SELF` (0x4E)
 

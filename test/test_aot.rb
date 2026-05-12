@@ -371,6 +371,28 @@ assert_fails("puts 1.pop\n",       "POP: Integer#pop は TypeError")
 assert_fails("puts \"x\".pop\n",   "POP: String#pop は TypeError")
 assert_fails("puts 1.last\n",      "LAST: Integer#last は TypeError")
 
+# ---- Stage 4e: String#bytes / Integer#chr / String#chr / Object#nil? ----
+assert_output("puts \"abc\".bytes\n", "97\n98\n99\n", "BYTES: ASCII 文字列")
+assert_output("puts \"\".bytes.length\n", "0\n",      "BYTES: 空文字列は長さ 0")
+assert_output("puts 97.chr\n",        "a\n",          "INT_CHR: 97 → 'a'")
+assert_output("puts 0.chr.bytes\n",   "0\n",          "INT_CHR: NUL")
+assert_output("puts 255.chr.bytes\n", "255\n",        "INT_CHR: 上限 255")
+assert_output("puts \"hello\".chr\n", "h\n",          "STR_CHR: 最初の文字")
+assert_output("puts \"X\".bytes[0].chr\n", "X\n",     "ROUND: bytes[0].chr")
+assert_output("puts nil.nil?\n",      "true\n",       "NIL_Q: nil は true")
+assert_output("puts 1.nil?\n",        "false\n",      "NIL_Q: Fixnum は false")
+assert_output("puts true.nil?\n",     "false\n",      "NIL_Q: true は false")
+assert_output("puts false.nil?\n",    "false\n",      "NIL_Q: false は false")
+assert_output("puts :foo.nil?\n",     "false\n",      "NIL_Q: Symbol は false")
+assert_output("puts [].nil?\n",       "false\n",      "NIL_Q: 空 Array も false")
+assert_output(File.read(File.expand_path('../examples/byteops.rb', __dir__)),
+              "97\n98\n99\n48\n97\n57\nA\n32\nh\nXyz\ntrue\nfalse\nfalse\nfalse\n3\n999\n",
+              "examples/byteops.rb")
+assert_fails("puts (-1).chr\n",       "INT_CHR: 負数で raise")
+assert_fails("puts 256.chr\n",        "INT_CHR: 256 で raise")
+assert_fails("puts \"\".chr\n",       "STR_CHR: 空文字列で raise")
+assert_fails("puts 1.bytes\n",        "BYTES: Integer 受信で TypeError")
+
 # ---- Stage GC-1: GC 動作下での examples 不変 ----
 assert_output(File.read(File.expand_path('../examples/gc.rb', __dir__)),
               "done: xy\nxy\nxy\n",
