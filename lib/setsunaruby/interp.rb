@@ -100,7 +100,10 @@ module Setsunaruby
     PREFIX_TIMES_OFFSET    = PREFIX_MAP_OFFSET + 3                            # "times"
     PREFIX_POP_OFFSET      = PREFIX_TIMES_OFFSET + 5                          # "pop" (Stage 4d)
     PREFIX_LAST_OFFSET     = PREFIX_POP_OFFSET + 3                            # "last" (Stage 4d)
-    PREFIX_TOTAL_LEN       = PREFIX_LAST_OFFSET + 4
+    PREFIX_BYTES_OFFSET    = PREFIX_LAST_OFFSET + 4                           # "bytes" (Stage 4e)
+    PREFIX_CHR_OFFSET      = PREFIX_BYTES_OFFSET + 5                          # "chr" (Stage 4e)
+    PREFIX_NIL_Q_OFFSET    = PREFIX_CHR_OFFSET + 3                            # "nil?" (Stage 4e)
+    PREFIX_TOTAL_LEN       = PREFIX_NIL_Q_OFFSET + 4
 
     # キーワードバイト列。spinel の sp_String / const char* 不整合を避けるため
     # 文字列ではなくバイト配列で直接比較する。
@@ -130,6 +133,9 @@ module Setsunaruby
     KW_MAP_BYTES    = [109, 97, 112].freeze                   # "map" (Stage 3c.3)
     KW_POP_BYTES    = [112, 111, 112].freeze                  # "pop" (Stage 4d)
     KW_LAST_BYTES   = [108, 97, 115, 116].freeze              # "last" (Stage 4d)
+    KW_BYTES_BYTES  = [98, 121, 116, 101, 115].freeze         # "bytes" (Stage 4e)
+    KW_CHR_BYTES    = [99, 104, 114].freeze                   # "chr" (Stage 4e)
+    KW_NIL_Q_BYTES  = [110, 105, 108, 63].freeze              # "nil?" (Stage 4e)
     # Stage 3c.3: block_given? は識別子として lex され、compile 時に名前判定する。
     KW_BLOCK_GIVEN_BYTES = [98, 108, 111, 99, 107, 95, 103, 105, 118, 101, 110, 63].freeze   # "block_given?"
     # Stage 3e: 例外処理キーワード。
@@ -2590,6 +2596,9 @@ module Setsunaruby
       append_bytes(KW_TIMES_BYTES)
       append_bytes(KW_POP_BYTES)
       append_bytes(KW_LAST_BYTES)
+      append_bytes(KW_BYTES_BYTES)
+      append_bytes(KW_CHR_BYTES)
+      append_bytes(KW_NIL_Q_BYTES)
       src_bytes = src.bytes
       i = 0
       while i < src_bytes.length
@@ -2668,6 +2677,15 @@ module Setsunaruby
       register_builtin_method_array_pop(pop_packed)
       register_builtin_method_array_last(last_packed)
 
+      # Stage 4e: String#bytes / Integer#chr / String#chr。新規 opcode は builtin method
+      # 本体専用 (Stage 4d と同じく JIT-2 HIR builder には乗らない)。
+      # "chr" は Integer / String の両方に同名 method として登録する (class_idx 経由で別 dispatch)。
+      bytes_packed = pack_prefix_name(PREFIX_BYTES_OFFSET, KW_BYTES_BYTES.length)
+      chr_packed   = pack_prefix_name(PREFIX_CHR_OFFSET,   KW_CHR_BYTES.length)
+      register_builtin_method_string_bytes(bytes_packed)
+      register_builtin_method_integer_chr(chr_packed)
+      register_builtin_method_string_chr(chr_packed)
+
       @cur_class = saved_class
       patch_jump(skip, @bytecode.length)
       nil
@@ -2707,6 +2725,39 @@ module Setsunaruby
       @bytecode.push(Op::ARRAY_LAST)
       @bytecode.push(Op::RETURN)
       finalize_builtin_method(m_idx, BUILTIN_CLASS_ARRAY, 0)
+      nil
+    end
+
+    def register_builtin_method_string_bytes(name_packed)
+      @cur_class = BUILTIN_CLASS_STRING
+      method_pc = @bytecode.length
+      m_idx = declare_method(name_packed, method_pc, 0)
+      @bytecode.push(Op::LOAD_SELF)
+      @bytecode.push(Op::STRING_TO_BYTES)
+      @bytecode.push(Op::RETURN)
+      finalize_builtin_method(m_idx, BUILTIN_CLASS_STRING, 0)
+      nil
+    end
+
+    def register_builtin_method_integer_chr(name_packed)
+      @cur_class = BUILTIN_CLASS_INTEGER
+      method_pc = @bytecode.length
+      m_idx = declare_method(name_packed, method_pc, 0)
+      @bytecode.push(Op::LOAD_SELF)
+      @bytecode.push(Op::INT_CHR)
+      @bytecode.push(Op::RETURN)
+      finalize_builtin_method(m_idx, BUILTIN_CLASS_INTEGER, 0)
+      nil
+    end
+
+    def register_builtin_method_string_chr(name_packed)
+      @cur_class = BUILTIN_CLASS_STRING
+      method_pc = @bytecode.length
+      m_idx = declare_method(name_packed, method_pc, 0)
+      @bytecode.push(Op::LOAD_SELF)
+      @bytecode.push(Op::STR_CHR)
+      @bytecode.push(Op::RETURN)
+      finalize_builtin_method(m_idx, BUILTIN_CLASS_STRING, 0)
       nil
     end
 
@@ -3349,6 +3400,12 @@ module Setsunaruby
           exec_array_pop
         elsif op == Op::ARRAY_LAST
           exec_array_last
+        elsif op == Op::STRING_TO_BYTES
+          exec_string_to_bytes
+        elsif op == Op::INT_CHR
+          exec_int_chr
+        elsif op == Op::STR_CHR
+          exec_str_chr
         elsif op == Op::PUTS
           v = @stack.pop
           # Ruby の puts は配列の各要素を別行で出力 (空配列なら何も出力しない)。
@@ -3993,6 +4050,55 @@ module Setsunaruby
       @heap_arr_pool[@heap_starts[arr_idx] + l - 1]
     end
 
+    # Stage 4e: `s.bytes`。@str_pool のバイト列を各要素 box_int した heap Array に変換。
+    # GC ルート保護のため receiver を @stack に push してから gc_check_threshold する。
+    # GC で @heap_starts[s_idx] が更新される可能性があるため、@heap_starts の参照は
+    # GC 後に再取得する。
+    def heap_string_to_byte_array(str_id)
+      @stack.push(str_id)
+      gc_check_threshold
+      str_id  = @stack.pop
+      s_idx   = unbox_heap(str_id)
+      start   = @heap_starts[s_idx]
+      l       = @heap_lens[s_idx]
+      new_pool_start = @heap_arr_pool.length
+      i = 0
+      while i < l
+        @heap_arr_pool.push(box_int(@str_pool[start + i]))
+        i += 1
+      end
+      alloc_heap_slot(HEAP_KIND_ARRAY, new_pool_start, l, -1)
+    end
+
+    # Stage 4e: byte (0..255) を 1 文字の heap String にする。範囲外は RangeError 相当。
+    # receiver が Fixnum 即値なので退避不要。
+    def heap_string_from_byte(n)
+      if n < 0 || n > 255
+        raise "RangeError: #{n} out of char range (Stage 4e)"
+      end
+      gc_check_threshold
+      new_start = @str_pool.length
+      @str_pool.push(n)
+      alloc_heap_slot(HEAP_KIND_STRING, new_start, 1, -1)
+    end
+
+    # Stage 4e: `s.chr`。s の最初のバイトを 1 文字 String として返す。空文字列で raise。
+    # heap_string_from_byte と同じく GC 起動の可能性があるので receiver を退避する。
+    def heap_string_first_char(str_id)
+      s_idx = unbox_heap(str_id)
+      if @heap_lens[s_idx] == 0
+        raise "ArgumentError: empty string has no .chr (Stage 4e)"
+      end
+      @stack.push(str_id)
+      gc_check_threshold
+      str_id    = @stack.pop
+      s_idx     = unbox_heap(str_id)
+      first     = @str_pool[@heap_starts[s_idx]]
+      new_start = @str_pool.length
+      @str_pool.push(first)
+      alloc_heap_slot(HEAP_KIND_STRING, new_start, 1, -1)
+    end
+
     # @heap_arr_pool[src..src+len-1] を末尾に append する追記専用コピー。
     # str_pool_copy の配列版 (両者とも追記専用 IntArray アリーナ)。
     def arr_pool_copy(src, len)
@@ -4216,6 +4322,33 @@ module Setsunaruby
         raise "TypeError: .last の receiver は Array 必須 (Stage 4d)"
       end
       @stack.push(heap_array_last(arr))
+      nil
+    end
+
+    def exec_string_to_bytes
+      s = @stack.pop
+      if !heap_str?(s)
+        raise "TypeError: .bytes の receiver は String 必須 (Stage 4e)"
+      end
+      @stack.push(heap_string_to_byte_array(s))
+      nil
+    end
+
+    def exec_int_chr
+      n_val = @stack.pop
+      if !fixnum?(n_val)
+        raise "TypeError: .chr の receiver は Integer 必須 (Stage 4e)"
+      end
+      @stack.push(heap_string_from_byte(unbox_int(n_val)))
+      nil
+    end
+
+    def exec_str_chr
+      s = @stack.pop
+      if !heap_str?(s)
+        raise "TypeError: .chr の receiver は String 必須 (Stage 4e)"
+      end
+      @stack.push(heap_string_first_char(s))
       nil
     end
 
@@ -4471,6 +4604,21 @@ module Setsunaruby
     def exec_dispatch_method(name_packed, argc, block_pc, block_arity)
       self_pos  = @stack.length - argc - 1
       receiver  = @stack[self_pos]
+      # Stage 4e: Object#nil? は class_of_value が -1 を返す値 (nil/true/false/Symbol) でも
+      # 通る必要があるため、class 解決の前に名前先取り dispatch する。argc は 0 必須。
+      # name_packed は user source 内 offset を指すので、prefix 内の "nil?" バイト列とは
+      # find_method_in_class 同様 bytes_eq で比較する (整数一致では match しない)。
+      n_start = name_packed >> 16
+      n_len   = name_packed & 0xffff
+      if n_len == KW_NIL_Q_BYTES.length &&
+         bytes_eq(n_start, PREFIX_NIL_Q_OFFSET, KW_NIL_Q_BYTES.length)
+        if argc != 0
+          raise "ArgumentError: nil? takes no arguments (got #{argc})"
+        end
+        @stack.pop   # discard self
+        @stack.push(box_bool(receiver == ObjectVal::NIL_VAL))
+        return nil
+      end
       class_idx = class_of_value(receiver)
       if class_idx < 0
         # nil / true / false 等の class が未対応の値。Stage 3d.3 から Fixnum/Array/String は
