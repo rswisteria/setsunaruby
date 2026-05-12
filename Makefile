@@ -47,7 +47,11 @@ test-cruby:
 test-aot: build
 	ruby test/test_aot.rb
 
-test-all: test-cruby test-aot
+# x86_64 エンコーダの byte 列単体テスト (CRuby 上、macOS arm64 でも検証可)。
+test-jit-x86-64:
+	ruby test/test_jit_x86_64.rb
+
+test-all: test-cruby test-aot test-jit-x86-64
 
 bench: build
 	ruby benchmark/run_bench.rb
