@@ -2661,9 +2661,8 @@ module Setsunaruby
       register_builtin_method_array_map(map_packed)
       register_builtin_method_integer_times(times_packed)
 
-      # Stage 4d: Array#pop / Array#last。pop は末尾要素を削除して返し、last は読み取り専用。
-      # 両者とも空配列なら nil。ARRAY_POP / ARRAY_LAST opcode は builtin method 本体専用で
-      # ユーザコードからは出ない (JIT-2 builder の dispatch にも乗らない)。
+      # Stage 4d: Array#pop / Array#last。ARRAY_POP / ARRAY_LAST opcode は builtin method
+      # 本体専用でユーザコードからは emit されない (= JIT-2 HIR builder の dispatch にも乗らない)。
       pop_packed  = pack_prefix_name(PREFIX_POP_OFFSET,  KW_POP_BYTES.length)
       last_packed = pack_prefix_name(PREFIX_LAST_OFFSET, KW_LAST_BYTES.length)
       register_builtin_method_array_pop(pop_packed)
@@ -2689,8 +2688,6 @@ module Setsunaruby
       nil
     end
 
-    # Stage 4d: Array#pop。空配列なら nil、それ以外は末尾要素を返して @heap_lens を 1 減らす。
-    # body は LOAD_SELF; ARRAY_POP; RETURN の 3 命令で Array#length と対称。
     def register_builtin_method_array_pop(name_packed)
       @cur_class = BUILTIN_CLASS_ARRAY
       method_pc = @bytecode.length
@@ -2702,7 +2699,6 @@ module Setsunaruby
       nil
     end
 
-    # Stage 4d: Array#last。pop と異なり配列を変更しない。空配列なら nil。
     def register_builtin_method_array_last(name_packed)
       @cur_class = BUILTIN_CLASS_ARRAY
       method_pc = @bytecode.length
@@ -4205,8 +4201,6 @@ module Setsunaruby
       nil
     end
 
-    # Stage 4d: a.pop。@heap_lens を 1 減らすだけで @heap_arr_pool 末尾は触らない
-    # (= relocate しない abandoned 領域、heap_array_push_bang と対称)。次の GC で pool 圧縮時に消える。
     def exec_array_pop
       arr = @stack.pop
       if !heap_array?(arr)
@@ -4216,7 +4210,6 @@ module Setsunaruby
       nil
     end
 
-    # Stage 4d: a.last。配列は変更せず末尾要素を返す。
     def exec_array_last
       arr = @stack.pop
       if !heap_array?(arr)
