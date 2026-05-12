@@ -306,10 +306,10 @@ module Setsunaruby
       @strlit_lens   = []
       # Stage 4c: Symbol intern table (parallel IntArray、spinel ルール 3 遵守)。
       # @sym_name_starts[sym_id] / @sym_name_lens[sym_id] が @bytes 上の名前範囲を指す。
-      # sym_id = 0 は使わない (obj_id 0 = NIL_VAL との衝突回避)。initialize 時点でダミーを
-      # 入れることはせず、run_string の頭で 1 件 push する。
-      @sym_name_starts = []
-      @sym_name_lens   = []
+      # sym_id = 0 はダミー (obj_id 0 = NIL_VAL との衝突回避)。intern_symbol が i=1 から
+      # 払い出すので、初期状態でも length >= 1 という不変条件を initialize 時点で確立する。
+      @sym_name_starts = [0]
+      @sym_name_lens   = [0]
       # Stage 3b: 配列要素プール (要素は obj_id = tagged value)。
       @heap_arr_pool = []
       # Stage 3d.1: ユーザ定義クラスとインスタンス状態。
@@ -3452,32 +3452,22 @@ module Setsunaruby
       end
     end
 
-    # Symbol の名前バイト範囲を Ruby String に再構築する (puts 出力経路)。
-    # `:foo` → "foo"。@bytes は GC 対象外で常に存在する。
+    # Symbol の名前バイト範囲を Ruby String に再構築する (puts 出力経路、`:foo` → "foo")。
+    # 名前は @bytes 上にあり (lexer が prefix 後ろの src 領域を指す)、@bytes は run_string の
+    # 寿命で不変なので、class 名表示と同じ bytes_to_ruby を再利用できる。
     def sym_name_to_ruby_string(obj_id)
       sym_id = unbox_sym(obj_id)
-      s = @sym_name_starts[sym_id]
-      l = @sym_name_lens[sym_id]
-      result = ""
-      i = 0
-      while i < l
-        result = result + @bytes[s + i].chr
-        i += 1
-      end
-      result
+      bytes_to_ruby(@sym_name_starts[sym_id], @sym_name_lens[sym_id])
     end
 
-    # 同名 Symbol を同じ sym_id に正規化 (compile 時に呼ぶ)。`bytes_eq` 同等の
-    # 線形探索で既存エントリを探す (Symbol 数は実用上少数なので O(n) で十分)。
-    # spinel ルール 3 (parallel IntArray) と 11 (Integer 識別) を遵守。
+    # 同名 Symbol を同じ sym_id に正規化 (compile 時に呼ぶ)。Symbol 名と既存エントリは
+    # ともに @bytes 上のオフセットで保持されるため、汎用 find_in_table の packed lookup を
+    # そのまま流用できる。i=1 から探索することでダミー sym_id 0 をスキップする。
     def intern_symbol(name_start, name_len)
-      i = 1   # sym_id 0 はダミー
-      while i < @sym_name_starts.length
-        if @sym_name_lens[i] == name_len &&
-           bytes_eq(@sym_name_starts[i], name_start, name_len)
-          return i
-        end
-        i += 1
+      packed = (name_start << 16) | name_len
+      found = find_in_table(@sym_name_starts, @sym_name_lens, 1, packed)
+      if found >= 0
+        return found
       end
       new_id = @sym_name_starts.length
       @sym_name_starts.push(name_start)
