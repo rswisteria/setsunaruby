@@ -59,6 +59,7 @@ spinel が配列を扱いやすくするための工夫。
 |---|---|---|
 | `:int_lit` | `42` | `node_int_value` = 整数値 |
 | `:str_lit` | `"hello"` | `node_int_value` = strlit_idx |
+| `:sym_lit` | `:foo` / `:foo?` / `:bar!` | `node_int_value` = 名前 packed `(start \<\< 16) \| len` (Stage 4c)。intern は compile 時 |
 | `:bool_lit` | `true` / `false` | `node_bool_value` = true/false |
 | `:nil_lit` | `nil` | (なし) |
 | `:self_lit` | `self` | (なし) |

@@ -36,11 +36,13 @@ end
 |---|---|---|---|
 | `INT` | `42` | 整数値そのもの | 10 進整数のみ。負号は単項マイナスとして parser 側で扱う |
 | `STR` | `"hello\n"` | strlit_idx | 文字列はリテラル idx で参照 (実体は `@str_pool`) |
+| `SYM` | `:foo` `:foo?` `:bar!` | `(start \<\< 16) | len` | `:` を含まない名前部分の `@bytes` 範囲 (Stage 4c) |
 | `IDENT` | `foo` `bar?` `baz!` | `(start \<\< 16) | len` | `@bytes` 上の (start, len) を pack |
 | `IVAR` | `@count` | `(start \<\< 16) | len` | `@` の次のバイトから始まる名前 |
 
 識別子は末尾 `?` / `!` を 1 byte 取り込む (`block_given?`、`destructive!` 等)。
-取り込み済みの場合はキーワード判定を skip する (Stage 3c.3)。
+取り込み済みの場合はキーワード判定を skip する (Stage 3c.3)。Symbol literal も
+同じ規則で末尾 `?` / `!` を 1 byte 取り込む (`:ready?` `:flush!`)。
 
 ### キーワード
 
@@ -124,6 +126,21 @@ int_value = (start \<\< 16) | len
 識別子の最大長は 2^16。Symbol を経由しないことで spinel ルール 11 に従う。
 名前比較は `bytes_eq` (start/len のペアで `@bytes` 上を直接比較)。
 
+### Symbol literal の lex (Stage 4c)
+
+`:` バイトを検出したら `read_symbol` で 1 個の `SYM` トークンを返す:
+
+1. `:` を 1 byte 消費
+2. 次のバイトが `ident_start?` でなければ字句エラー (現状 `?:` 三項演算子は未実装)
+3. `ident_cont?` が続く間バイトを読み進める
+4. 末尾の 1 byte が `?` または `!` なら識別子末尾と同じ規則で取り込む
+5. `int_value = (name_start \<\< 16) | name_len` を載せた `SYM` を返す
+   (`:` 自身は packed の範囲に含めない)
+
+intern (= 同名を同 ID に正規化) は **lexer ではなく compiler が** 行う
+(`intern_symbol`)。詳細は [bytecode/opcodes.md](../bytecode/opcodes.md) の
+`PUSH_SYM` 節を参照。
+
 ### 演算子の 2 文字対応
 
 `read_punct` 内で先頭バイトと次バイトを 2 文字 lookahead して合成トークンを生成する:
@@ -144,6 +161,7 @@ int_value = (start \<\< 16) | len
 | `!` | (他) | `NOT` | Stage 4a |
 | `^` | — | `BXOR` | Stage 4a |
 | `~` | — | `BNOT` | Stage 4a |
+| `:` | identifier | `SYM` (`read_symbol` 経由) | Stage 4c |
 
 ## ストリーミング消費
 

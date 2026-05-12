@@ -439,6 +439,43 @@ emit している)。
 
 ---
 
+## Symbol (Stage 4c)
+
+### `PUSH_SYM` (0x5B)
+
+- Operand: SLEB128 sym_id
+- Stack: `[...]` → `[..., (sym_id \<\< 3)]`
+- Stage: 4c
+
+`:foo` literal を実行時に push する。`sym_id` は compile 時に `intern_symbol` で
+確定し (同名 Symbol は同 id)、SLEB128 で operand に埋め込む。
+
+Symbol 値の表現:
+
+- `obj_id = sym_id \<\< 3` (LSB 3 bit が 0)
+- `sym_id` は 1 始まり (`sym_id = 0` は obj_id = 0 = NIL_VAL と衝突するため使わない)
+- 判定: `symbol?(v) = v != NIL_VAL && (v & 7) == 0`
+- 既存タグとの排他性: Fixnum (LSB=1)、FALSE_VAL=2、TRUE_VAL=4、HEAP_TAG=6、NIL_VAL=0
+  のいずれとも `(v & 7)` で区別可能
+
+`==` `!=` は通常の obj_id 同値比較として動作する (intern により同名 Symbol は
+同 obj_id を持つため)。`:foo == "foo"` のような異型比較は obj_id が異なるので
+常に `false`。
+
+intern table は parallel IntArray:
+
+- `@sym_name_starts[sym_id]` / `@sym_name_lens[sym_id]`: `@bytes` 上の名前範囲
+- `sym_id = 0` はダミーエントリ (`@sym_name_starts = [0]`、`@sym_name_lens = [0]` で
+  初期化)
+
+`puts <symbol>` は `to_puts_string` の `symbol?` 分岐で名前バイト列を chr 連結して
+出力する (`:foo` → "foo"。`:` 自身は出力しない)。
+
+JIT (HIR/LIR) は `PUSH_SYM` 未対応のため、Symbol literal を含む method は
+`mark_current_method_jit_unsafe` で JIT 対象外扱いになる。
+
+---
+
 ## HALT (0xFF)
 
 - Operand: なし

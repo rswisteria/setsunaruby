@@ -110,6 +110,11 @@ module Setsunaruby
     # スタックには CALL_SUPER 命令直前に self → args の順で push 済みである必要がある。
     CALL_SUPER            = 0x5A
 
+    # Stage 4c: Symbol literal。VM では `(sym_id << 3)` を push する (sym_id >= 1)。
+    # operand は intern 済み sym_id (= @sym_name_starts/@sym_name_lens 上の idx)。
+    # tag は (v & 7) == 0 かつ v != 0 で判定 (NIL_VAL = 0 / HEAP_TAG = 6 / Fixnum LSB=1 と排他)。
+    PUSH_SYM              = 0x5B
+
     HALT = 0xFF
   end
 end
