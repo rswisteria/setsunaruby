@@ -106,6 +106,29 @@ CRuby 版 (`ruby bin/setsunaruby.rb`) と AOT 版 (`./setsunaruby`) で実行し
 特に再帰深度が大きい `fib` / `nqueens` で spinel の関数呼び出し最適化が効く。
 GC を多用する `string_gc` / `linked_list` でも 20x 以上の speedup を維持。
 
+### JIT-4c 実機実行 (arm64 + spinel fork)
+
+`SETSUNARUBY_JIT=1` で ホット化したメソッドを arm64 機械語で実機実行。
+`make bench-jit` で `benchmark/bench_jit_*.rb` を CRuby / AOT (no JIT) /
+AOT + JIT の 3 系統で計測 (5 回中央値、macOS arm64)。
+
+| benchmark | 概要 | CRuby | AOT no-JIT | AOT + JIT | JIT speedup |
+|---|---|---:|---:|---:|---:|
+| `bench_jit_id` | 恒等関数 5M 回呼出 | 25370 ms | 449 ms | 333 ms | 1.35x |
+| `bench_jit_loop_add` | 2 引数加算 1M 回呼出 | 6141 ms | 111 ms | 73 ms | 1.54x |
+| `bench_jit_chain` | 4 ローカル変数 + 算術 4 つ × 500k 回 | 5307 ms | 103 ms | 39 ms | 2.65x |
+| `bench_jit_count` | 内部 while + phi な method × 2000 回 | 5097 ms | 92 ms | 8 ms | **10.96x** |
+| `bench_jit_fib` | `fib(28)` 再帰 (明示ローカル) | 5189 ms | 107 ms | 4.6 ms | **23.26x** |
+
+ホットメソッドの中身が少ないほど JIT のオーバヘッド (`JIT.callN` で関数ポインタ
+呼び出し) に時間が食われ、speedup は控えめ (`id` の 1.35x)。逆に、内部に
+while ループや深い再帰を持つ method は bytecode dispatch が支配的だったぶん
+JIT 化のリターンが大きく、`fib` で **23.26x**、`count` で **10.96x** の追加加速。
+
+CRuby vs AOT+JIT の合計加速は `fib` で **約 1100x** (= 5189 ÷ 4.6)。AOT 単体でも
+ホット method を持つ典型的なループは数十倍速いが、JIT がここに乗ると更に
+1 桁加速できる場合がある。
+
 ## アーキテクチャ
 
 ```

@@ -8,7 +8,10 @@
 
 require 'open3'
 
-BENCHMARKS = Dir["benchmark/bench*.rb"].sort
+# bench_jit_*.rb は make bench-jit (run_bench_jit.rb) 側の 3 軸計測専用で、
+# 本 runner には載せない (各 bench が JIT 効果を見るためループ回数が大きく、
+# CRuby で数秒〜数十秒かかるため)。bench1..bench10 を [0-9] で絞り込む。
+BENCHMARKS = Dir["benchmark/bench[0-9]*.rb"].sort
 RUNS       = 5
 AOT_BIN    = './setsunaruby'
 

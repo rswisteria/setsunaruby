@@ -12,6 +12,7 @@ make test-aot          # spinel ビルド済みバイナリでテスト (build �
 make test-all          # 上記両方
 make build             # ~/spinel/spinel で ./setsunaruby を生成
 make bench             # AOT vs CRuby 性能比較 (build 必須)
+make bench-jit         # CRuby / AOT / AOT+JIT の 3 系統比較 (build + spinel fork 必須)
 make bench-regen       # benchmark/bench*.rb を seed 固定で再生成
 
 ruby bin/setsunaruby.rb <file>    # CRuby で実行
