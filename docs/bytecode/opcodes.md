@@ -279,6 +279,46 @@ ZeroDivisionError。
 - 受信者 String の最初のバイトを 1 文字 String として新規確保。空文字列は `ArgumentError` 相当の raise。
 - builtin method `String#chr` の本体専用 (LOAD_SELF; STR_CHR; RETURN)。pool 操作前の GC 起動に備え receiver を退避する。
 
+### `FILE_READ` (0x61)
+
+- Operand: なし
+- Stack: `[..., path]` → `[..., contents]`
+- Stage: 4f
+- `File.read(path)` の compile-time 特殊形式 (`compile_method_call_on` が var_ref="File" + method="read" + argc=1 を検出して emit)。
+- path は heap String 必須、戻り値はファイル全体を含む heap String。CRuby ではエラー時 `Errno::ENOENT` 等が raise、AOT バイナリでは spinel の `File.read` 翻訳が例外を伝播せず空 String を返す。
+
+### `LOAD_ARGV` (0x62)
+
+- Operand: なし
+- Stack: `[...]` → `[..., argv_obj_id]`
+- Stage: 4f
+- 起動時に `prepare_for_run` で確保された `@argv_obj_id` (Array of heap String) を push する。
+- `compile_var_ref` が IDENT="ARGV" を検出して emit。
+
+### `LOAD_STDERR` (0x63)
+
+- Operand: なし
+- Stack: `[...]` → `[..., stderr_obj_id]`
+- Stage: 4f
+- 起動時に `register_builtin_classes_and_methods` で確保された `@stderr_obj_id` (BUILTIN_CLASS_IO instance, `@fd = 2`) を push する。
+- `compile_var_ref` が IDENT="STDERR" を検出して emit。
+
+### `IO_PUTS` (0x64)
+
+- Operand: なし
+- Stack: `[..., io, arg]` → `[..., nil]`
+- Stage: 4f
+- `IO#puts(arg)` の本体専用 (LOAD_SELF; LOAD_LOCAL 0; IO_PUTS; RETURN)。受信者 io の `@fd` (slot 0、Integer) を見て対応 IO に arg を 1 行出力する。現状は fd=2 (STDERR) のみ対応、他の fd は raise。
+- CRuby では `$stderr.puts` 経由で StringIO テストもキャプチャ可能。AOT バイナリは spinel の翻訳警告 `puts on int` が出るが実行は機能する。
+
+### `EXIT` (0x65)
+
+- Operand: なし
+- Stack: `[..., status]` → (return しない)
+- Stage: 4f
+- stack top の Integer を pop して `exit(n)` (no receiver、Kernel#exit private singleton) を呼ぶ。VM ループに戻らないため、後続 PUSH_NIL (compile_exit の死コード) は到達しない。
+- `Kernel.exit(n)` (明示 receiver) は spinel が解決できないため、no-receiver 版を使う。
+
 ---
 
 ## ブロックと yield (Stage 3c.2)

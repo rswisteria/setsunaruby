@@ -26,6 +26,7 @@ module Setsunaruby
     KW_LOOP    = :kw_loop    # `loop` (Stage 4b 無限ループ = while true 構文糖)
     KW_BREAK   = :kw_break   # `break` (Stage 4b 最内側 loop/while を抜ける)
     KW_NEXT    = :kw_next    # `next` (Stage 4b 最内側 loop/while の先頭へ)
+    KW_EXIT    = :kw_exit    # `exit [n]` (Stage 4f プロセス終了)
     HASH_ROCKET = :hash_rocket   # `=>` (Stage 3e: rescue Class => e の束縛)
     IVAR     = :ivar       # `@var` インスタンス変数 (Stage 3d.1)。int_value = (start<<16)|len (start は @ の次)
     STR      = :str        # 文字列リテラル (Stage 3a)。int_value = strlit_idx

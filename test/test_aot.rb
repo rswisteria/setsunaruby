@@ -393,6 +393,26 @@ assert_fails("puts 256.chr\n",        "INT_CHR: 256 で raise")
 assert_fails("puts \"\".chr\n",       "STR_CHR: 空文字列で raise")
 assert_fails("puts 1.bytes\n",        "BYTES: Integer 受信で TypeError")
 
+# ---- Stage 4f: File.read / ARGV / STDERR / exit ----
+# AOT バイナリでは ARGV は空のまま (bin/setsunaruby.rb が argv をブリッジしない)。
+assert_output("puts ARGV.length\n", "0\n", "ARGV: AOT バイナリでは empty")
+# File.read で実在ファイルを読む。examples/hello.rb は AOT バイナリの相対 path で読める。
+assert_output("puts File.read(\"examples/hello.rb\").bytes.length > 0\n", "true\n",
+              "FILE_READ: hello.rb は非空")
+# exit は status を返す (assert_output で受け取れないので別の assert を作ってもよいが、
+# ここでは exit 0 が後続コード到達せず正常終了することだけ確認する)。
+assert_output("puts \"before\"\nexit 0\nputs \"after\"\n", "before\n",
+              "EXIT: status 0 で後続が走らない")
+# 存在しないファイルは CRuby で raise、AOT バイナリでは spinel の File.read 翻訳が
+# 例外を伝播しないため空 String を返す (= status 0)。ここでは出力差で確認する。
+assert_output("puts File.read(\"/nonexistent/path/zzz.rb\").bytes.length\n", "0\n",
+              "FILE_READ: 存在しないファイルは AOT で空 String 扱い (= bytes.length 0)")
+# examples/cli.rb は ARGV 空ケースで動く。aot_run は stdout のみ取得するため
+# STDERR.puts は比較対象外で、hello.rb 全文だけが actual に乗る。
+assert_output(File.read(File.expand_path('../examples/cli.rb', __dir__)),
+              File.read(File.expand_path('../examples/hello.rb', __dir__)),
+              "examples/cli.rb (ARGV 空 → hello.rb を stdout に出力)")
+
 # ---- Stage GC-1: GC 動作下での examples 不変 ----
 assert_output(File.read(File.expand_path('../examples/gc.rb', __dir__)),
               "done: xy\nxy\nxy\n",
