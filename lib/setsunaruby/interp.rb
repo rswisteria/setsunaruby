@@ -86,6 +86,11 @@ module Setsunaruby
     # declare_class)、idx は BUILTIN_CLASS_COUNT (= 3) に固定される。`raise "msg"` の文字列
     # 自動ラップと、user-defined error class の親 lookup の両方で参照する。
     BUILTIN_CLASS_STDERR  = 3
+    # Stage 4f: File は `File.read(path)` の compile-time 特殊形式の受信者識別、
+    # IO は STDERR インスタンスの class で @fd ivar (slot 0) に fd 番号 (Integer) を持つ。
+    # 両者とも StandardError の後ろに named で登録するため idx が連番で固定される。
+    BUILTIN_CLASS_FILE    = 4
+    BUILTIN_CLASS_IO      = 5
 
     # Stage 3e: @bytes prefix のレイアウト。register_builtin_classes_and_methods が
     # 各 builtin method 名/クラス名/ivar 名を ここに置かれた byte 列として参照する。
@@ -103,7 +108,13 @@ module Setsunaruby
     PREFIX_BYTES_OFFSET    = PREFIX_LAST_OFFSET + 4                           # "bytes" (Stage 4e)
     PREFIX_CHR_OFFSET      = PREFIX_BYTES_OFFSET + 5                          # "chr" (Stage 4e)
     PREFIX_NIL_Q_OFFSET    = PREFIX_CHR_OFFSET + 3                            # "nil?" (Stage 4e)
-    PREFIX_TOTAL_LEN       = PREFIX_NIL_Q_OFFSET + 4
+    PREFIX_FILE_OFFSET     = PREFIX_NIL_Q_OFFSET + 4                          # "File" (Stage 4f)
+    PREFIX_READ_OFFSET     = PREFIX_FILE_OFFSET + 4                           # "read" (Stage 4f)
+    PREFIX_IO_OFFSET       = PREFIX_READ_OFFSET + 4                           # "IO" (Stage 4f)
+    PREFIX_FD_OFFSET       = PREFIX_IO_OFFSET + 2                             # "@fd" (Stage 4f)
+    PREFIX_ARGV_OFFSET     = PREFIX_FD_OFFSET + 3                             # "ARGV" (Stage 4f)
+    PREFIX_PUTS_OFFSET     = PREFIX_ARGV_OFFSET + 4                           # "puts" (Stage 4f, .puts dispatch 用)
+    PREFIX_TOTAL_LEN       = PREFIX_PUTS_OFFSET + 4
 
     # キーワードバイト列。spinel の sp_String / const char* 不整合を避けるため
     # 文字列ではなくバイト配列で直接比較する。
@@ -136,6 +147,14 @@ module Setsunaruby
     KW_BYTES_BYTES  = [98, 121, 116, 101, 115].freeze         # "bytes" (Stage 4e)
     KW_CHR_BYTES    = [99, 104, 114].freeze                   # "chr" (Stage 4e)
     KW_NIL_Q_BYTES  = [110, 105, 108, 63].freeze              # "nil?" (Stage 4e)
+    # Stage 4f: 標準ライブラリ最低限。
+    KW_FILE_BYTES   = [70, 105, 108, 101].freeze              # "File" (Stage 4f)
+    KW_READ_BYTES   = [114, 101, 97, 100].freeze              # "read" (Stage 4f)
+    KW_IO_BYTES     = [73, 79].freeze                         # "IO" (Stage 4f)
+    KW_FD_BYTES     = [64, 102, 100].freeze                   # "@fd" (Stage 4f)
+    KW_ARGV_BYTES   = [65, 82, 71, 86].freeze                 # "ARGV" (Stage 4f)
+    KW_STDERR_NAME_BYTES = [83, 84, 68, 69, 82, 82].freeze    # "STDERR" (Stage 4f) — class "StandardError" とは別
+    KW_EXIT_BYTES   = [101, 120, 105, 116].freeze             # "exit" (Stage 4f, lex keyword)
     # Stage 3c.3: block_given? は識別子として lex され、compile 時に名前判定する。
     KW_BLOCK_GIVEN_BYTES = [98, 108, 111, 99, 107, 95, 103, 105, 118, 101, 110, 63].freeze   # "block_given?"
     # Stage 3e: 例外処理キーワード。
@@ -353,6 +372,11 @@ module Setsunaruby
       # rescue で CLEAR_EXCEPTION することでハンドル済みにする。RERAISE_OR_END は ensure 末尾で
       # まだ NIL_VAL でなければ再 unwind する。
       @exception = ObjectVal::NIL_VAL
+      # Stage 4f: STDERR インスタンス (BUILTIN_CLASS_IO) と ARGV (Array of heap String)。
+      # register_builtin_classes_and_methods / run_string 冒頭で実体を alloc し ID を保持する。
+      # gc_collect の root として扱う必要があるため、ivar として保持する。
+      @stderr_obj_id = ObjectVal::NIL_VAL
+      @argv_obj_id   = ObjectVal::NIL_VAL
       # ハンドラスタック (parallel IntArray)。PUSH_HANDLER/POP_HANDLER で push/pop する。
       # 各エントリは catch_pc / 当時の stack 深さ / cfp 深さ / yield 深さ を記録し、
       # RAISE で unwind する際これらを使って状態を巻き戻す。ensure は catch_pc 経由で
@@ -379,7 +403,17 @@ module Setsunaruby
       run_string(File.read(path))
     end
 
+    # Stage 4f: 上位 wrapper。テストや埋め込み利用は prepare_for_run +
+    # (internal helper で ARGV 構築) + execute_loaded_program を直接呼ぶことで ARGV を構築できる。
     def run_string(src)
+      prepare_for_run(src)
+      execute_loaded_program
+    end
+
+    # Stage 4f: 2 段階 API の前半。`src` をセットし、すべての ivar IntArray をリセットして
+    # builtin class/method を登録、ARGV を空配列で確保する。VM 実行 (parse + compile + run_vm)
+    # は execute_loaded_program で行う。
+    def prepare_for_run(src)
       @src          = src
       # Stage 3d.3: builtin method 名 (= "length" など) のバイト列を @bytes 先頭に
       # prepend する。lex_pos はこの prefix 後ろから開始するので、lexer は user source
@@ -520,6 +554,16 @@ module Setsunaruby
 
       register_builtin_classes_and_methods
 
+      # Stage 4f: ARGV を空配列で確保。CRuby テストや埋め込み利用から `push_argv_bytes` で
+      # 要素を後追い登録できる (run_string が呼ぶこの 2 段階 API では prepare 後の機会がないため、
+      # テストは run_string ではなく prepare_for_run + execute_loaded_program を直接呼ぶ)。
+      @argv_obj_id = heap_array_alloc(0)
+    end
+
+    # Stage 4f: 2 段階 API の後半。reset/register/ARGV alloc 済みの状態から VM 実行までを
+    # 担当する。run_string は prepare_for_run と execute_loaded_program を順に呼び、テストは
+    # 間に push_argv_bytes を挟むためにこれらを直接呼ぶ。
+    def execute_loaded_program
       @cur_token = next_token
       while !at_end?
         skip_newlines
@@ -782,6 +826,8 @@ module Setsunaruby
         result = TokenKind::KW_BREAK
       elsif match_bytes(start, len, KW_NEXT_BYTES)
         result = TokenKind::KW_NEXT
+      elsif match_bytes(start, len, KW_EXIT_BYTES)
+        result = TokenKind::KW_EXIT
       end
       result
     end
@@ -971,6 +1017,8 @@ module Setsunaruby
       elsif k == TokenKind::KW_NEXT
         @cur_token = next_token
         return ASTNode.new(:next_stmt, 0, false, :nop, nil, nil, nil)
+      elsif k == TokenKind::KW_EXIT
+        return parse_exit
       elsif k == TokenKind::KW_DEF
         return parse_def
       elsif k == TokenKind::KW_RETURN
@@ -1093,10 +1141,16 @@ module Setsunaruby
           end
         else
           @cur_token = next_token   # consume `.`
-          if @cur_token.kind != TokenKind::IDENT
+          # Stage 4f: `.puts` (例: STDERR.puts "x") は KW_PUTS で lex されるが、
+          # `.` の後では method 名として扱うため prefix 内 "puts" を指す packed を生成する。
+          name_packed = 0
+          if @cur_token.kind == TokenKind::IDENT
+            name_packed = @cur_token.int_value
+          elsif @cur_token.kind == TokenKind::KW_PUTS
+            name_packed = (PREFIX_PUTS_OFFSET << 16) | KW_PUTS_BYTES.length
+          else
             raise "Parse error: line #{@cur_token.line}: . の後にメソッド名が必要です"
           end
-          name_packed = @cur_token.int_value
           @cur_token = next_token
           args = nil
           if @cur_token.kind == TokenKind::LPAREN
@@ -1447,6 +1501,23 @@ module Setsunaruby
         val = parse_expression
       end
       ASTNode.new(:return_stmt, 0, false, :nop, nil, nil, val)
+    end
+
+    # Stage 4f: `exit` または `exit <expr>` (LPAREN なしの 1 引数)。
+    # `exit` 単独は status 0、`exit n` は n を Integer status code として終了する。
+    # spinel の whole-program 推論を安定させるため、val は最初から ASTNode * 型として
+    # 初期化する (parse_return の val = nil パターンを踏襲すると ASTNode フィールドが
+    # sp_RbVal poly に推論されることがある)。
+    def parse_exit
+      @cur_token = next_token  # consume `exit`
+      k = @cur_token.kind
+      val = ASTNode.new(:int_lit, 0, false, :nop, nil, nil, nil)
+      if !(k == TokenKind::NEWLINE || k == TokenKind::EOF ||
+           k == TokenKind::KW_END  || k == TokenKind::KW_ELSE ||
+           k == TokenKind::KW_ELSIF)
+        val = parse_expression
+      end
+      ASTNode.new(:exit_stmt, 0, false, :nop, nil, nil, val)
     end
 
     def skip_then_or_newlines
@@ -1829,6 +1900,8 @@ module Setsunaruby
         compile_break
       elsif k == :next_stmt
         compile_next
+      elsif k == :exit_stmt
+        compile_exit(node)
       else
         compile_expr(node)
       end
@@ -1913,6 +1986,12 @@ module Setsunaruby
         elsif method_name_is_block_given?(pkt)
           # Stage 3c.3: block_given? は組み込み 0-arg method として opcode 直接 emit。
           @bytecode.push(Op::BLOCK_GIVEN_P)
+        elsif builtin_const_name_is_argv?(pkt)
+          # Stage 4f: ARGV は VM 起動時に確保された Array of heap String。
+          @bytecode.push(Op::LOAD_ARGV)
+        elsif builtin_const_name_is_stderr?(pkt)
+          # Stage 4f: STDERR は VM 起動時に確保された BUILTIN_CLASS_IO インスタンス。
+          @bytecode.push(Op::LOAD_STDERR)
         else
           # Ruby と同様、ローカルとして未定義なら 0 引数メソッド呼び出しに解決する。
           m_idx = find_method(pkt)
@@ -2218,6 +2297,22 @@ module Setsunaruby
         end
       end
 
+      # Stage 4f: `File.read(path)` は compile-time special form。`Foo.new` と同じく
+      # receiver が :var_ref かつ "File"、method 名が "read"、argc=1 の組み合わせのみ受理し、
+      # FILE_READ opcode を emit する。それ以外の File.xxx は通常の method dispatch に流す。
+      if method_name_is_read?(name_packed) && node.node_left.node_kind == :var_ref &&
+         method_name_is_file?(node.node_left.node_int_value)
+        if argc != 1
+          raise "Compile error: line #{@cur_token.line}: File.read は 1 引数必須 (Stage 4f)"
+        end
+        if block != nil
+          raise "Compile error: line #{@cur_token.line}: File.read にブロックは渡せません (Stage 4f)"
+        end
+        compile_expr(node.node_operand.node_left)   # path 引数を 1 つだけ push
+        @bytecode.push(Op::FILE_READ)
+        return nil
+      end
+
       # ブロックなしの dispatch (Stage 3b/3d.1)。
       compile_expr(node.node_left)   # receiver
       cur = node.node_operand
@@ -2242,6 +2337,23 @@ module Setsunaruby
 
     def method_name_is_new?(packed)
       method_name_match?(packed, KW_NEW_BYTES)
+    end
+
+    # Stage 4f: var_ref の名前が ARGV / STDERR の特殊定数か判定。
+    def builtin_const_name_is_argv?(packed)
+      method_name_match?(packed, KW_ARGV_BYTES)
+    end
+
+    def builtin_const_name_is_stderr?(packed)
+      method_name_match?(packed, KW_STDERR_NAME_BYTES)
+    end
+
+    def method_name_is_file?(packed)
+      method_name_match?(packed, KW_FILE_BYTES)
+    end
+
+    def method_name_is_read?(packed)
+      method_name_match?(packed, KW_READ_BYTES)
     end
 
     # Stage 3d.2/3d.4: クラスの initialize method を検索。見つからなければ -1。
@@ -2445,6 +2557,16 @@ module Setsunaruby
       nil
     end
 
+    # Stage 4f: `exit [status]` を bytecode に展開。status (Integer) を push してから EXIT。
+    # EXIT は VM ループから抜けてプロセス終了するため、後続コードは到達しないが、
+    # compile_stmt の「常に 1 値を残す」契約のため死コード PUSH_NIL を残す。
+    def compile_exit(node)
+      compile_expr(node.node_operand)
+      @bytecode.push(Op::EXIT)
+      @bytecode.push(Op::PUSH_NIL)
+      nil
+    end
+
     # arg_cons / param_cons リンクリストの長さを数える。
     # spinel が `cur = node` の代入で型推論を壊すため、別ローカル変数を作らず
     # パラメータ自身を再代入してループする。
@@ -2599,6 +2721,12 @@ module Setsunaruby
       append_bytes(KW_BYTES_BYTES)
       append_bytes(KW_CHR_BYTES)
       append_bytes(KW_NIL_Q_BYTES)
+      append_bytes(KW_FILE_BYTES)
+      append_bytes(KW_READ_BYTES)
+      append_bytes(KW_IO_BYTES)
+      append_bytes(KW_FD_BYTES)
+      append_bytes(KW_ARGV_BYTES)
+      append_bytes(KW_PUTS_BYTES)
       src_bytes = src.bytes
       i = 0
       while i < src_bytes.length
@@ -2686,6 +2814,28 @@ module Setsunaruby
       register_builtin_method_integer_chr(chr_packed)
       register_builtin_method_string_chr(chr_packed)
 
+      # Stage 4f: File / IO class を named pre-register、STDERR を IO の builtin インスタンスとして
+      # alloc し @fd = 2 を set。IO#puts を builtin method として登録、`.puts` dispatch で参照される。
+      # File は `File.read(path)` の compile-time 特殊形式 (Foo.new と同じ枠組み) で受信者識別される。
+      file_packed = pack_prefix_name(PREFIX_FILE_OFFSET, KW_FILE_BYTES.length)
+      declare_class(file_packed, -1)   # BUILTIN_CLASS_FILE (= 4) に対応
+
+      io_packed = pack_prefix_name(PREFIX_IO_OFFSET, KW_IO_BYTES.length)
+      declare_class(io_packed, -1)     # BUILTIN_CLASS_IO (= 5) に対応
+      # IO の @fd ivar (slot 0) を登録。
+      @class_ivar_name_starts.push(PREFIX_FD_OFFSET)
+      @class_ivar_name_lens.push(KW_FD_BYTES.length)
+      @class_ivar_counts[BUILTIN_CLASS_IO] = 1
+
+      # IO#puts: builtin method として登録。LOAD_SELF; LOAD_LOCAL 0 (arg); IO_PUTS; RETURN
+      puts_method_packed = pack_prefix_name(PREFIX_PUTS_OFFSET, KW_PUTS_BYTES.length)
+      register_builtin_method_io_puts(puts_method_packed)
+
+      # STDERR インスタンス: BUILTIN_CLASS_IO の instance を alloc、@fd (slot 0) = 2 を set。
+      # `wrap_str_in_stderr` と同じく initialize 呼び出しを省略し、ivar pool に直接書き込む。
+      @stderr_obj_id = alloc_instance(BUILTIN_CLASS_IO)
+      @instance_ivar_pool[@heap_starts[@stderr_obj_id >> 3]] = box_int(2)
+
       @cur_class = saved_class
       patch_jump(skip, @bytecode.length)
       nil
@@ -2758,6 +2908,20 @@ module Setsunaruby
       @bytecode.push(Op::STR_CHR)
       @bytecode.push(Op::RETURN)
       finalize_builtin_method(m_idx, BUILTIN_CLASS_STRING, 0)
+      nil
+    end
+
+    # Stage 4f: IO#puts(arg)。stack 上 [self, arg] を IO_PUTS が受け取り、self の @fd
+    # (slot 0 / Integer) と arg を見て対応 IO に出力する。引数 1 個固定。
+    def register_builtin_method_io_puts(name_packed)
+      @cur_class = BUILTIN_CLASS_IO
+      method_pc = @bytecode.length
+      m_idx = declare_method(name_packed, method_pc, 1)
+      @bytecode.push(Op::LOAD_SELF)
+      @bytecode.push(Op::LOAD_LOCAL); encode_signed(0)
+      @bytecode.push(Op::IO_PUTS)
+      @bytecode.push(Op::RETURN)
+      finalize_builtin_method(m_idx, BUILTIN_CLASS_IO, 1)
       nil
     end
 
@@ -3406,6 +3570,16 @@ module Setsunaruby
           exec_int_chr
         elsif op == Op::STR_CHR
           exec_str_chr
+        elsif op == Op::FILE_READ
+          exec_file_read
+        elsif op == Op::LOAD_ARGV
+          @stack.push(@argv_obj_id)
+        elsif op == Op::LOAD_STDERR
+          @stack.push(@stderr_obj_id)
+        elsif op == Op::IO_PUTS
+          exec_io_puts
+        elsif op == Op::EXIT
+          exec_exit
         elsif op == Op::PUTS
           v = @stack.pop
           # Ruby の puts は配列の各要素を別行で出力 (空配列なら何も出力しない)。
@@ -3642,6 +3816,22 @@ module Setsunaruby
       nil
     end
 
+    # Stage 4f: Ruby Integer 配列 (`s.bytes` 相当) から新しい heap String を確保する。
+    # File.read / ARGV / IO_PUTS のように VM-internal で Ruby native の文字列を heap に
+    # 移すパスで使う。GC-2 の relocate 中に source が動くことはない (@strlit_pool は対象外、
+    # Ruby native byte 配列も対象外) ため GC 起動は alloc 前の 1 回で足りる。
+    def alloc_string_from_ruby_string(s)
+      bytes = s.bytes
+      gc_check_threshold
+      new_start = @str_pool.length
+      i = 0
+      while i < bytes.length
+        @str_pool.push(bytes[i])
+        i = i + 1
+      end
+      alloc_heap_slot(HEAP_KIND_STRING, new_start, bytes.length, -1)
+    end
+
     # リテラル idx から新しいヒープ String を確保する。実行のたびに新スロットを
     # 確保することで、Ruby のリテラル独立性 (`a = "x"; b = "x"; a.equal?(b) == false`) を
     # 自然に得る (== は値比較として別実装)。
@@ -3713,6 +3903,9 @@ module Setsunaruby
       # 2. ルート 5 種を mark stack に積む
       gc_push_root(@cur_self)
       gc_push_root(@exception)
+      # Stage 4f: ARGV / STDERR は global 定数として参照され続けるためルート扱い。
+      gc_push_root(@stderr_obj_id)
+      gc_push_root(@argv_obj_id)
       i = 0
       while i < @stack.length
         gc_push_root(@stack[i])
@@ -4350,6 +4543,60 @@ module Setsunaruby
       end
       @stack.push(heap_string_first_char(s))
       nil
+    end
+
+    # Stage 4f: `File.read(path)`。stack top の heap String を pop し、ファイル全体を
+    # heap String にして push する。CRuby native の File.read を経由するので、エラーは
+    # Errno::ENOENT 等の例外でそのまま伝播する。
+    def exec_file_read
+      path_id = @stack.pop
+      if !heap_str?(path_id)
+        raise "TypeError: File.read の path は String 必須 (Stage 4f)"
+      end
+      path = heap_str_to_ruby(path_id)
+      contents = File.read(path)
+      @stack.push(alloc_string_from_ruby_string(contents))
+      nil
+    end
+
+    # Stage 4f: IO#puts(arg)。stack 上 [io, arg] を pop し、io の @fd (slot 0) を見て
+    # 対応 IO (現状は fd=2 の STDERR のみ) に arg を to_puts_string 化して 1 行出力する。
+    # 戻り値は nil (Ruby の Kernel#puts と同じ仕様)。
+    def exec_io_puts
+      arg = @stack.pop
+      io  = @stack.pop
+      if class_of_value(io) != BUILTIN_CLASS_IO
+        raise "TypeError: receiver は IO インスタンス必須 (Stage 4f)"
+      end
+      fd_val = @instance_ivar_pool[@heap_starts[io >> 3]]
+      if !fixnum?(fd_val)
+        raise "TypeError: @fd は Integer 必須 (Stage 4f)"
+      end
+      fd = unbox_int(fd_val)
+      line = to_puts_string(arg)
+      if fd == 2
+        # CRuby は `$stderr` をテストで StringIO に差し替えできる (STDERR 定数は不可)。
+        # spinel AOT は `$stderr` を解決できず no-op になる ── これは元の STDERR.puts と同じ
+        # 既存挙動 (`cannot resolve call to 'puts' on int`)。
+        $stderr.puts line
+      else
+        # 1 や他の fd は現状未サポート (STDOUT は puts 構文で対応)。
+        raise "RuntimeError: unsupported fd #{fd} for IO#puts (Stage 4f)"
+      end
+      @stack.push(ObjectVal::NIL_VAL)
+      nil
+    end
+
+    # Stage 4f: `exit [status]`。stack top の Integer を pop して exit を呼ぶ。
+    # spinel の whole-program 推論は `Kernel.exit(n)` (明示 receiver) を解決できないが、
+    # `exit(n)` (no receiver, Kernel#exit private singleton) は組み込みとして翻訳される。
+    # VM ループに戻らないので、後続 PUSH_NIL (compile_exit の死コード) は到達しない。
+    def exec_exit
+      status_val = @stack.pop
+      if !fixnum?(status_val)
+        raise "TypeError: exit の status は Integer 必須 (Stage 4f)"
+      end
+      exit(unbox_int(status_val))
     end
 
     def exec_call

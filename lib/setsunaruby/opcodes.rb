@@ -73,6 +73,20 @@ module Setsunaruby
     INT_CHR         = 0x5F
     STR_CHR         = 0x60
 
+    # Stage 4f: 標準ライブラリ最低限。
+    # FILE_READ:    `File.read(path)` の compile-time 特殊形式。stack top の heap String
+    #               (path) を pop し、ファイル全体を heap String にして push する。
+    # LOAD_ARGV:    起動時に確保された ARGV (Array of heap String) を push する。
+    # LOAD_STDERR:  起動時に確保された STDERR インスタンスを push する。
+    # IO_PUTS:      IO#puts の本体専用。stack 上 [io, arg] を pop し、io の @fd に
+    #               引数を to_s 化して書き出す (改行付き)。引数 1 個固定。
+    # EXIT:         stack top の status を pop して Kernel.exit を呼ぶ (VM ループから脱出)。
+    FILE_READ    = 0x61
+    LOAD_ARGV    = 0x62
+    LOAD_STDERR  = 0x63
+    IO_PUTS      = 0x64
+    EXIT         = 0x65
+
     # Stage 3c.2: 一般ブロック付きメソッド呼び出しと yield。
     # CALL_WITH_BLOCK は CALL と同じだが、メソッドフレームに block_pc と block_arity を
     # 関連付ける。block_arity は yield argc とのランタイム不一致を検出するため。
