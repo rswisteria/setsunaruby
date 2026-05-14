@@ -4565,8 +4565,7 @@ module Setsunaruby
     def exec_io_puts
       arg = @stack.pop
       io  = @stack.pop
-      if (io & 7) != HEAP_TAG || @heap_kind[io >> 3] != HEAP_KIND_INSTANCE ||
-         @heap_instance_class[io >> 3] != BUILTIN_CLASS_IO
+      if class_of_value(io) != BUILTIN_CLASS_IO
         raise "TypeError: receiver は IO インスタンス必須 (Stage 4f)"
       end
       fd_val = @instance_ivar_pool[@heap_starts[io >> 3]]
