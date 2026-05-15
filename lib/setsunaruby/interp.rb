@@ -24,6 +24,7 @@ module Setsunaruby
     NUL_B = 0        # '\0'
     SP    = 32
     DQUOTE_B  = 34   # '"'
+    SQUOTE_B  = 39   # '\'' (Stage 5a シングルクォート文字列)
     HASH  = 35
     LP    = 40
     RP    = 41
@@ -619,6 +620,8 @@ module Setsunaruby
           end
         elsif b == DQUOTE_B
           return read_string
+        elsif b == SQUOTE_B
+          return read_sstring
         elsif b == AT_B
           return read_ivar
         elsif b == COLON_B
@@ -681,6 +684,38 @@ module Setsunaruby
         raise "Lexer error: line #{@line}: 文字列の終端 \" が見つかりません"
       end
       @lex_pos += 1   # consume closing "
+      lit_idx = @strlit_starts.length
+      @strlit_starts.push(pool_start)
+      @strlit_lens.push(@strlit_pool.length - pool_start)
+      Token.new(TokenKind::STR, lit_idx, "", @line)
+    end
+
+    # Stage 5a: シングルクォート文字列 `'...'` を読む。
+    # escape は Ruby 仕様に合わせて `\\` (= `\`) と `\'` (= `'`) のみ解釈する。
+    # それ以外の `\X` はバックスラッシュ自身を含めてそのまま 2 byte 残す
+    # (例: `'\n'` は `\` と `n` の 2 byte で、改行 1 byte ではない)。
+    # 生成 token は read_string と同じ STR token なので parser / VM 側は共用される。
+    def read_sstring
+      @lex_pos += 1   # consume opening '
+      pool_start = @strlit_pool.length
+      while @lex_pos < @bytes.length && @bytes[@lex_pos] != SQUOTE_B
+        b = @bytes[@lex_pos]
+        if b == BSLASH_B && @lex_pos + 1 < @bytes.length &&
+           (@bytes[@lex_pos + 1] == BSLASH_B || @bytes[@lex_pos + 1] == SQUOTE_B)
+          @strlit_pool.push(@bytes[@lex_pos + 1])
+          @lex_pos += 2
+        else
+          if b == NL
+            @line += 1
+          end
+          @strlit_pool.push(b)
+          @lex_pos += 1
+        end
+      end
+      if @lex_pos >= @bytes.length
+        raise "Lexer error: line #{@line}: 文字列の終端 ' が見つかりません"
+      end
+      @lex_pos += 1   # consume closing '
       lit_idx = @strlit_starts.length
       @strlit_starts.push(pool_start)
       @strlit_lens.push(@strlit_pool.length - pool_start)

@@ -42,6 +42,7 @@ test-cruby:
 	ruby test/test_stage4a.rb
 	ruby test/test_stage4b.rb
 	ruby test/test_stage4c.rb
+	ruby test/test_stage5a.rb
 	ruby test/test_stage_jit.rb
 	ruby test/test_gc.rb
 
