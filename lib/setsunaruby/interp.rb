@@ -24,6 +24,7 @@ module Setsunaruby
     NUL_B = 0        # '\0'
     SP    = 32
     DQUOTE_B  = 34   # '"'
+    SQUOTE_B  = 39   # '\''
     HASH  = 35
     LP    = 40
     RP    = 41
@@ -619,6 +620,8 @@ module Setsunaruby
           end
         elsif b == DQUOTE_B
           return read_string
+        elsif b == SQUOTE_B
+          return read_sstring
         elsif b == AT_B
           return read_ivar
         elsif b == COLON_B
@@ -681,6 +684,48 @@ module Setsunaruby
         raise "Lexer error: line #{@line}: 文字列の終端 \" が見つかりません"
       end
       @lex_pos += 1   # consume closing "
+      commit_strlit(pool_start)
+    end
+
+    # シングルクォート文字列 `'...'` を読む。Ruby 仕様に合わせて escape は
+    # `\\` (= `\`) と `\'` (= `'`) のみ解釈し、それ以外の `\X` はバックスラッシュ
+    # 自身を含めて 2 byte そのまま残す (例: `'\n'` は `\` と `n` の 2 byte)。
+    # 末尾の `\` 単体は `read_string` と同じく escape の後がない unterminated エラー。
+    def read_sstring
+      @lex_pos += 1
+      pool_start = @strlit_pool.length
+      while @lex_pos < @bytes.length && @bytes[@lex_pos] != SQUOTE_B
+        b = @bytes[@lex_pos]
+        if b == BSLASH_B
+          if @lex_pos + 1 >= @bytes.length
+            raise "Lexer error: line #{@line}: 文字列の終端が見つかりません (escape の後)"
+          end
+          nb = @bytes[@lex_pos + 1]
+          if nb == BSLASH_B || nb == SQUOTE_B
+            @strlit_pool.push(nb)
+          else
+            @strlit_pool.push(b)
+            @strlit_pool.push(nb)
+          end
+          @lex_pos += 2
+        else
+          if b == NL
+            @line += 1
+          end
+          @strlit_pool.push(b)
+          @lex_pos += 1
+        end
+      end
+      if @lex_pos >= @bytes.length
+        raise "Lexer error: line #{@line}: 文字列の終端 ' が見つかりません"
+      end
+      @lex_pos += 1
+      commit_strlit(pool_start)
+    end
+
+    # `read_string` / `read_sstring` 共通の終端処理。pool_start からの追記範囲を
+    # `@strlit_starts` / `@strlit_lens` に登録し、その idx を持つ STR token を返す。
+    def commit_strlit(pool_start)
       lit_idx = @strlit_starts.length
       @strlit_starts.push(pool_start)
       @strlit_lens.push(@strlit_pool.length - pool_start)

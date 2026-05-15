@@ -57,7 +57,7 @@ assert_raises("puts y\n",                            "未定義変数の参照")
 # ---- if 式 ----
 assert_output("if true\n  puts 1\nend\n",                       "1\n",     "if true 単純")
 assert_output("if false\n  puts 1\nend\n",                       "",        "if false 単純")
-assert_output("if 1 == 1\n  puts 'OK'\nend\n",                   "",        "if cond でブロック内 puts (文字列リテラル未対応なのでブロックは puts なし式)") rescue nil
+assert_output("if 1 == 1\n  puts 'OK'\nend\n",                   "OK\n",    "if cond でブロック内 puts (Stage 5a でシングルクォート対応済み)")
 
 # 文字列リテラル未対応のため整数で代用
 assert_output("if true\n  puts 1\nelse\n  puts 2\nend\n",        "1\n",     "if/else then 側")

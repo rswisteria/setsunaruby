@@ -110,11 +110,22 @@ end
 ### 文字列リテラル
 
 `read_string` で `"..."` を読む。escape: `\n` `\t` `\r` `\\` `\"` `\0` のみ対応。
-escape 解決後のバイト列を **`@str_pool` に直接追記**し、`@strlit_starts` /
+escape 解決後のバイト列を **`@strlit_pool` に直接追記**し、`@strlit_starts` /
 `@strlit_lens` に新規エントリを追加。Token の `int_value` にそのリテラル idx を入れる。
 
 UTF-8 透過 (escape は 1 バイトずつ処理、それ以外は無加工)。生改行入り文字列リテラルも
 許容する (`@line` を更新する)。
+
+#### シングルクォート文字列 (Stage 5a)
+
+`read_sstring` で `'...'` を読む。Ruby 仕様に合わせ escape は `\\` (= `\` 1 byte) と
+`\'` (= `'` 1 byte) のみ解釈する。それ以外の `\X` は **バックスラッシュ自身を含めて
+そのまま 2 byte 残す** (例: `'\n'` は改行 1 byte ではなく `\` と `n` の 2 byte)。
+
+`read_string` と同じ `STR` token を返す (`int_value` は `@strlit_starts` の idx)。
+Parser / Compiler / VM は STR token を区別せず共用するので、heap String 化や `==` /
+`<<` / `bytes` 等の既存 String API はそのまま使える。文字列補間 `#{...}` には対応
+していない (将来 Stage 5i で追加予定)。
 
 ### 識別子の packed 表現
 
