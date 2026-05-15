@@ -24,7 +24,7 @@ module Setsunaruby
     NUL_B = 0        # '\0'
     SP    = 32
     DQUOTE_B  = 34   # '"'
-    SQUOTE_B  = 39   # '\'' (Stage 5a シングルクォート文字列)
+    SQUOTE_B  = 39   # '\''
     HASH  = 35
     LP    = 40
     RP    = 41
@@ -684,25 +684,29 @@ module Setsunaruby
         raise "Lexer error: line #{@line}: 文字列の終端 \" が見つかりません"
       end
       @lex_pos += 1   # consume closing "
-      lit_idx = @strlit_starts.length
-      @strlit_starts.push(pool_start)
-      @strlit_lens.push(@strlit_pool.length - pool_start)
-      Token.new(TokenKind::STR, lit_idx, "", @line)
+      commit_strlit(pool_start)
     end
 
-    # Stage 5a: シングルクォート文字列 `'...'` を読む。
-    # escape は Ruby 仕様に合わせて `\\` (= `\`) と `\'` (= `'`) のみ解釈する。
-    # それ以外の `\X` はバックスラッシュ自身を含めてそのまま 2 byte 残す
-    # (例: `'\n'` は `\` と `n` の 2 byte で、改行 1 byte ではない)。
-    # 生成 token は read_string と同じ STR token なので parser / VM 側は共用される。
+    # シングルクォート文字列 `'...'` を読む。Ruby 仕様に合わせて escape は
+    # `\\` (= `\`) と `\'` (= `'`) のみ解釈し、それ以外の `\X` はバックスラッシュ
+    # 自身を含めて 2 byte そのまま残す (例: `'\n'` は `\` と `n` の 2 byte)。
+    # 末尾の `\` 単体は `read_string` と同じく escape の後がない unterminated エラー。
     def read_sstring
-      @lex_pos += 1   # consume opening '
+      @lex_pos += 1
       pool_start = @strlit_pool.length
       while @lex_pos < @bytes.length && @bytes[@lex_pos] != SQUOTE_B
         b = @bytes[@lex_pos]
-        if b == BSLASH_B && @lex_pos + 1 < @bytes.length &&
-           (@bytes[@lex_pos + 1] == BSLASH_B || @bytes[@lex_pos + 1] == SQUOTE_B)
-          @strlit_pool.push(@bytes[@lex_pos + 1])
+        if b == BSLASH_B
+          if @lex_pos + 1 >= @bytes.length
+            raise "Lexer error: line #{@line}: 文字列の終端が見つかりません (escape の後)"
+          end
+          nb = @bytes[@lex_pos + 1]
+          if nb == BSLASH_B || nb == SQUOTE_B
+            @strlit_pool.push(nb)
+          else
+            @strlit_pool.push(b)
+            @strlit_pool.push(nb)
+          end
           @lex_pos += 2
         else
           if b == NL
@@ -715,7 +719,13 @@ module Setsunaruby
       if @lex_pos >= @bytes.length
         raise "Lexer error: line #{@line}: 文字列の終端 ' が見つかりません"
       end
-      @lex_pos += 1   # consume closing '
+      @lex_pos += 1
+      commit_strlit(pool_start)
+    end
+
+    # `read_string` / `read_sstring` 共通の終端処理。pool_start からの追記範囲を
+    # `@strlit_starts` / `@strlit_lens` に登録し、その idx を持つ STR token を返す。
+    def commit_strlit(pool_start)
       lit_idx = @strlit_starts.length
       @strlit_starts.push(pool_start)
       @strlit_lens.push(@strlit_pool.length - pool_start)

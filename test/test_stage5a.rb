@@ -93,6 +93,8 @@ assert_output("s = 'x'\nif s == 'x'\n  puts 'match'\nelse\n  puts 'no'\nend\n",
 
 # ---- 終端なしエラー ----
 assert_raises("puts 'abc\n", "ERR: 終端 ' がない場合は raise")
+# escape の途中で source が終わるケース (read_string と一貫したエラー)
+assert_raises("puts 'a\\", "ERR: 末尾 \\ 単体は escape の後がない unterminated エラー")
 
 puts ""
 puts "#{$pass} passed, #{$fail} failed (Stage 5a)"
